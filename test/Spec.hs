@@ -14,6 +14,7 @@ import {-@ HTF_TESTS @-} Control.Computations.CompEngine.Tests.TestOutputs
 import {-@ HTF_TESTS @-} Control.Computations.CompEngine.Tests.TestRevive
 import {-@ HTF_TESTS @-} Control.Computations.CompEngine.Tests.TestRun
 import {-@ HTF_TESTS @-} Control.Computations.CompEngine.Tests.TestStateIf
+import {-@ HTF_TESTS @-} Control.Computations.CompEngine.Utils.DefTable
 import {-@ HTF_TESTS @-} Control.Computations.CompEngine.Utils.Intern
 import {-@ HTF_TESTS @-} Control.Computations.CompEngine.Utils.OutputsMap
 import {-@ HTF_TESTS @-} Control.Computations.CompEngine.Utils.PriorityAgingQueue
