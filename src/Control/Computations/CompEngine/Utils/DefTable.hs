@@ -16,18 +16,27 @@
  just reinterpreted: what used to be an arbitrary dense counter is now
  @(defIndex \<\< rowBits) .|. row@.
 
- = This increment
+ = Columns (so far)
 
- This is the row-identity/lifecycle skeleton only: a table's per-row state
- is, for now, entirely "is this row currently allocated" -- tracked by
- whether its param hash is present in 'dt_index' and, dually, whether its
- row number is on the free list. No data columns (hash/flags/param/value/
- edges) exist yet; those arrive in later increments of the columnar
- rewrite. A row's identity is looked up/created by an already-computed
- 'Hash128' (the param hash callers derive the same way the old intern table
- did) and freed by the caller supplying that same hash back (mirroring
- Stage 1's intern table, which also required the key on release since there
- was no separate reverse index for it).
+ @param_hash@/@result_hash@ (each two 'Word64's, since 'Hash128' itself has
+ no 'Unbox' instance and splitting it avoids needing to write one) and
+ @flags@ are genuinely unboxed columns ('Data.Vector.Unboxed.Mutable').
+ Typed param/value columns and edge columns are later increments.
+
+ A freshly grown region of an unboxed column is normally left as garbage
+ bytes (cheap, and safe because every column here is read only behind a
+ flags check) -- except @flags@ itself, whose growth is explicitly zeroed:
+ a stray nonzero garbage byte there would silently read as an occupied
+ row, the one column that can't rely on "gated behind a flags check"
+ because it *is* the flags check.
+
+ = Row lifecycle and reuse
+
+ A freed row is pushed onto a free list and its 'Flags' cleared
+ (not-alive, no result, not pending); every other column is left
+ untouched. This is safe under the invariant every read of a possibly-
+ stale column is gated behind a flags check ('flagsAlive' or the result-
+ state bits), unconditionally cleared before the row can be reused.
 -}
 module Control.Computations.CompEngine.Utils.DefTable (
   -- * Row identity
@@ -37,6 +46,14 @@ module Control.Computations.CompEngine.Utils.DefTable (
   refDefIdx,
   refRow,
 
+  -- * Flags
+  Flags,
+  ResultState (..),
+  flagsAlive,
+  flagsPending,
+  flagsResultState,
+  mkFlags,
+
   -- * The table
   DefTable,
   new,
@@ -45,6 +62,19 @@ module Control.Computations.CompEngine.Utils.DefTable (
   -- * Row lifecycle
   lookupOrInsertRow,
   freeRow,
+  isAlive,
+
+  -- * Column access
+  readFlags,
+  writeFlags,
+  setPending,
+  readParamHash,
+  readResultHash,
+  writeResultHash,
+  clearResultHash,
+  hashToPair,
+  pairToHash,
+  noResultSentinel,
   htf_thisModulesTests,
 )
 where
@@ -53,7 +83,7 @@ where
 -- LOCAL
 ----------------------------------------
 
-import Control.Computations.Utils.Hash (Hash128, largeHash128)
+import Control.Computations.Utils.Hash (Hash128 (..), largeHash128)
 
 ----------------------------------------
 -- EXTERNAL
@@ -63,6 +93,10 @@ import Data.Bits
 import Data.HashMap.Strict (HashMap)
 import qualified Data.HashMap.Strict as HashMap
 import Data.IORef
+import qualified Data.LargeHashable as LH
+import qualified Data.Vector.Generic.Mutable as GM
+import qualified Data.Vector.Unboxed.Mutable as VUM
+import Data.Word (Word64, Word8)
 import Test.Framework hiding ((.&.))
 
 --
@@ -98,25 +132,124 @@ refRow = snd . unpackRef
 {-# INLINE refRow #-}
 
 --
--- The table (skeleton: row lifecycle only, no data columns yet)
+-- Flags
+--
+
+-- | Packed per-row state: bit 0 alive, bit 1 pending (mid-evaluation),
+-- bits 2-3 result state (see 'ResultState').
+type Flags = Word8
+
+data ResultState = NoResult | ResultFailure | ResultValue | ResultMetaOnly
+  deriving (Eq, Show, Enum, Bounded)
+
+bitAlive, bitPending :: Int
+bitAlive = 0
+bitPending = 1
+
+flagsAlive :: Flags -> Bool
+flagsAlive f = testBit f bitAlive
+{-# INLINE flagsAlive #-}
+
+flagsPending :: Flags -> Bool
+flagsPending f = testBit f bitPending
+{-# INLINE flagsPending #-}
+
+flagsResultState :: Flags -> ResultState
+flagsResultState f = toEnum (fromIntegral ((f `shiftR` 2) .&. 0x3))
+{-# INLINE flagsResultState #-}
+
+mkFlags :: Bool -> Bool -> ResultState -> Flags
+mkFlags alive pending rs =
+  (if alive then bit bitAlive else 0)
+    .|. (if pending then bit bitPending else 0)
+    .|. (fromIntegral (fromEnum rs) `shiftL` 2)
+{-# INLINE mkFlags #-}
+
+--
+-- Hash128 <-> unboxed pair
+--
+
+hashToPair :: Hash128 -> (Word64, Word64)
+hashToPair (Hash128 w) = (LH.w128_first w, LH.w128_second w)
+{-# INLINE hashToPair #-}
+
+pairToHash :: (Word64, Word64) -> Hash128
+pairToHash (a, b) = Hash128 (LH.Word128 a b)
+{-# INLINE pairToHash #-}
+
+-- | Sentinel pair for "observed no result" (a failed dependency), used by
+-- later increments' comp-dep edge column. Colliding with this via a real
+-- MD5-derived 'Hash128' is not a realistic concern.
+noResultSentinel :: (Word64, Word64)
+noResultSentinel = (maxBound, maxBound)
+
+--
+-- Generic growable-vector helpers, unboxed columns only so far
+--
+
+-- | Grow an unboxed column so it has room for at least @needed@ rows.
+-- Freshly grown capacity is unspecified garbage bytes -- safe only because
+-- every unboxed column here is read strictly behind a flags check.
+growUnboxed :: VUM.Unbox e => IORef (VUM.IOVector e) -> Int -> IO ()
+growUnboxed ref needed = do
+  vec <- readIORef ref
+  let cap = GM.length vec
+  when (needed > cap) $ do
+    vec' <- GM.unsafeGrow vec (max (needed - cap) (max 4 cap))
+    writeIORef ref vec'
+ where
+  when b act = if b then act else pure ()
+
+-- | Like 'growUnboxed', but explicitly zeroes the freshly grown region.
+-- Used only for @flags@: a stray nonzero garbage byte there would
+-- silently read as an occupied row, unlike every other unboxed column,
+-- which is read only after a flags check has already gated it.
+growUnboxedZeroed :: IORef (VUM.IOVector Word8) -> Int -> IO ()
+growUnboxedZeroed ref needed = do
+  vec <- readIORef ref
+  let cap = GM.length vec
+  when (needed > cap) $ do
+    let extra = max (needed - cap) (max 4 cap)
+    vec' <- GM.unsafeGrow vec extra
+    GM.set (GM.unsafeSlice cap extra vec') 0
+    writeIORef ref vec'
+ where
+  when b act = if b then act else pure ()
+
+--
+-- The table
 --
 
 data DefTable = DefTable
-  { dt_index :: !(IORef (HashMap Hash128 Int))
+  { dt_paramHash :: !(IORef (VUM.IOVector (Word64, Word64)))
+  , dt_resultHash :: !(IORef (VUM.IOVector (Word64, Word64)))
+  , dt_flags :: !(IORef (VUM.IOVector Word8))
+  , dt_index :: !(IORef (HashMap Hash128 Int))
   -- ^ this def's own param-hash -> row index (its share of what used to be
   -- one global intern table)
   , dt_free :: !(IORef [Int])
   , dt_len :: !(IORef Int)
-  -- ^ logical row count (rows below this are either live, indexed by
-  -- 'dt_index', or free, tracked by 'dt_free')
+  -- ^ logical row count (<= every column's current capacity)
   }
 
 new :: IO DefTable
-new = DefTable <$> newIORef HashMap.empty <*> newIORef [] <*> newIORef 0
+new = do
+  ph <- newIORef =<< VUM.new 0
+  rh <- newIORef =<< VUM.new 0
+  fl <- newIORef =<< VUM.new 0
+  ix <- newIORef HashMap.empty
+  fr <- newIORef []
+  ln <- newIORef 0
+  pure DefTable{dt_paramHash = ph, dt_resultHash = rh, dt_flags = fl, dt_index = ix, dt_free = fr, dt_len = ln}
+
+growAllTo :: DefTable -> Int -> IO ()
+growAllTo dt needed = do
+  growUnboxed (dt_paramHash dt) needed
+  growUnboxed (dt_resultHash dt) needed
+  growUnboxedZeroed (dt_flags dt) needed
 
 -- | The table's current logical row count (rows @0@ until this are valid
--- row numbers, though not all are necessarily allocated -- some may be on
--- the free list).
+-- row numbers, though not all are necessarily alive -- see 'isAlive').
 rowCount :: DefTable -> IO Int
 rowCount dt = readIORef (dt_len dt)
 
@@ -129,12 +262,13 @@ allocRow dt = do
       pure r
     [] -> do
       len <- readIORef (dt_len dt)
+      growAllTo dt (len + 1)
       writeIORef (dt_len dt) (len + 1)
       pure len
 
--- | Get-or-create the row for a given param hash. Returns 'True' as the
--- second component on a fresh row (newly allocated, possibly a recycled
--- row number from the free list), 'False' on a hit.
+-- | Get-or-create the row for a given param hash. On a fresh row, writes
+-- the param hash and initializes flags to alive/not-pending/no-result.
+-- Returns 'True' as the second component on a fresh row, 'False' on a hit.
 lookupOrInsertRow :: DefTable -> Hash128 -> IO (Int, Bool)
 lookupOrInsertRow dt h = do
   idx <- readIORef (dt_index dt)
@@ -143,14 +277,62 @@ lookupOrInsertRow dt h = do
     Nothing -> do
       row <- allocRow dt
       modifyIORef' (dt_index dt) (HashMap.insert h row)
+      writeHash (dt_paramHash dt) row h
+      writeFlags dt row (mkFlags True False NoResult)
       pure (row, True)
 
--- | Remove a row's hash-index entry and push its row number onto the free
--- list, making it available for reuse by a later 'lookupOrInsertRow'.
+-- | Remove a row's hash-index entry and push it onto the free list,
+-- clearing flags (not-alive, not-pending, no-result). Every other column
+-- is left untouched -- see the module haddock's "Row lifecycle and reuse"
+-- section for why that's safe.
 freeRow :: DefTable -> Hash128 -> Int -> IO ()
 freeRow dt h row = do
   modifyIORef' (dt_index dt) (HashMap.delete h)
   modifyIORef' (dt_free dt) (row :)
+  writeFlags dt row 0
+
+isAlive :: DefTable -> Int -> IO Bool
+isAlive dt row = flagsAlive <$> readFlags dt row
+
+--
+-- Column access. All of these assume `row` is < the table's current
+-- logical length; callers only ever get a `row` from `lookupOrInsertRow`
+-- or from a `DefRef` that was itself minted that way, so this holds by
+-- construction.
+--
+
+readFlags :: DefTable -> Int -> IO Flags
+readFlags dt row = readIORef (dt_flags dt) >>= \v -> VUM.read v row
+
+writeFlags :: DefTable -> Int -> Flags -> IO ()
+writeFlags dt row f = readIORef (dt_flags dt) >>= \v -> VUM.write v row f
+
+setPending :: DefTable -> Int -> Bool -> IO ()
+setPending dt row p = do
+  f <- readFlags dt row
+  writeFlags dt row (mkFlags (flagsAlive f) p (flagsResultState f))
+
+readHash :: IORef (VUM.IOVector (Word64, Word64)) -> Int -> IO Hash128
+readHash ref row = pairToHash <$> (readIORef ref >>= \v -> VUM.read v row)
+
+writeHash :: IORef (VUM.IOVector (Word64, Word64)) -> Int -> Hash128 -> IO ()
+writeHash ref row hv = readIORef ref >>= \v -> VUM.write v row (hashToPair hv)
+
+readParamHash :: DefTable -> Int -> IO Hash128
+readParamHash dt = readHash (dt_paramHash dt)
+
+readResultHash :: DefTable -> Int -> IO Hash128
+readResultHash dt = readHash (dt_resultHash dt)
+
+writeResultHash :: DefTable -> Int -> Hash128 -> IO ()
+writeResultHash dt = writeHash (dt_resultHash dt)
+
+-- | Zero out the result-hash slot. Not required for correctness (every
+-- read is gated behind the result-state flag bits), but avoids a
+-- changed-bit false-negative from comparing against an ancient hash if a
+-- future column dump/debug tool ever reads it unconditionally.
+clearResultHash :: DefTable -> Int -> IO ()
+clearResultHash dt row = writeHash (dt_resultHash dt) row (pairToHash (0, 0))
 
 --
 -- Tests
@@ -223,3 +405,79 @@ test_manyRowsAreAllDistinctAndCounted = do
   assertEqual 200 (length (HashMap.toList (toSet rows)))
  where
   toSet = HashMap.fromList . map (\r -> (r, ()))
+
+test_freshRowIsAliveWithNoResult :: IO ()
+test_freshRowIsAliveWithNoResult = do
+  dt <- new
+  (r, _) <- lookupOrInsertRow dt (h 1)
+  alive <- isAlive dt r
+  assertBool alive
+  f <- readFlags dt r
+  assertEqual NoResult (flagsResultState f)
+  assertBool (not (flagsPending f))
+
+test_freeRowIsNoLongerAlive :: IO ()
+test_freeRowIsNoLongerAlive = do
+  dt <- new
+  (r, _) <- lookupOrInsertRow dt (h 1)
+  freeRow dt (h 1) r
+  alive <- isAlive dt r
+  assertBool (not alive)
+
+test_paramHashRoundTripsThroughLookupOrInsertRow :: IO ()
+test_paramHashRoundTripsThroughLookupOrInsertRow = do
+  dt <- new
+  (r, _) <- lookupOrInsertRow dt (h 42)
+  got <- readParamHash dt r
+  assertEqual (h 42) got
+
+test_resultHashRoundTrips :: IO ()
+test_resultHashRoundTrips = do
+  dt <- new
+  (r, _) <- lookupOrInsertRow dt (h 1)
+  writeResultHash dt r (h 99)
+  got <- readResultHash dt r
+  assertEqual (h 99) got
+
+test_setPendingTogglesFlagWithoutDisturbingOthers :: IO ()
+test_setPendingTogglesFlagWithoutDisturbingOthers = do
+  dt <- new
+  (r, _) <- lookupOrInsertRow dt (h 1)
+  writeFlags dt r (mkFlags True False ResultValue)
+  setPending dt r True
+  f <- readFlags dt r
+  assertBool (flagsAlive f)
+  assertBool (flagsPending f)
+  assertEqual ResultValue (flagsResultState f)
+  setPending dt r False
+  f' <- readFlags dt r
+  assertBool (not (flagsPending f'))
+
+test_mkFlagsResultStateRoundTripsForEveryValue :: IO ()
+test_mkFlagsResultStateRoundTripsForEveryValue =
+  mapM_
+    ( \rs -> do
+        let f = mkFlags True True rs
+        assertEqual rs (flagsResultState f)
+        assertBool (flagsAlive f)
+        assertBool (flagsPending f)
+    )
+    [minBound .. maxBound]
+
+test_hashPairRoundTrips :: IO ()
+test_hashPairRoundTrips = do
+  assertEqual (h 7) (pairToHash (hashToPair (h 7)))
+
+test_growthAcrossManyInsertsPreservesAllData :: IO ()
+test_growthAcrossManyInsertsPreservesAllData = do
+  dt <- new
+  -- force several regrowths (initial/step capacity starts at 4)
+  rows <- mapM (\i -> fst <$> lookupOrInsertRow dt (h i)) [1 .. 500]
+  mapM_
+    ( \(i, r) -> do
+        ph <- readParamHash dt r
+        assertEqual (h i) ph
+        alive <- isAlive dt r
+        assertBool alive
+    )
+    (zip [1 .. 500] rows)

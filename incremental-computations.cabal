@@ -139,6 +139,7 @@ library
     , megaparsec
     , monad-control
     , mtl
+    , primitive
     , psqueues
     , quickcheck-instances
     , random
@@ -153,6 +154,7 @@ library
     , transformers-base
     , unix
     , unordered-containers
+    , vector
   default-language: Haskell2010
 
 executable incremental-computations-exe
@@ -228,6 +230,7 @@ executable incremental-computations-exe
     , monad-control
     , mtl
     , optparse-applicative
+    , primitive
     , process
     , psqueues
     , quickcheck-instances
@@ -243,6 +246,7 @@ executable incremental-computations-exe
     , transformers-base
     , unix
     , unordered-containers
+    , vector
     , wai
     , wai-extra
     , warp
@@ -301,6 +305,7 @@ test-suite incremental-computations-test
     , megaparsec
     , monad-control
     , mtl
+    , primitive
     , psqueues
     , quickcheck-instances
     , random
@@ -315,4 +320,5 @@ test-suite incremental-computations-test
     , transformers-base
     , unix
     , unordered-containers
+    , vector
   default-language: Haskell2010

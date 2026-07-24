@@ -37,6 +37,7 @@ dependencies:
   - megaparsec
   - monad-control
   - mtl
+  - primitive
   - psqueues
   - quickcheck-instances
   - random
@@ -51,6 +52,7 @@ dependencies:
   - transformers-base
   - unix
   - unordered-containers
+  - vector
 
 ghc-options:
   - -O2
