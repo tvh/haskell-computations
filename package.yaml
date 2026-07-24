@@ -53,6 +53,7 @@ dependencies:
   - unordered-containers
 
 ghc-options:
+  - -O2
   - -Wall
   - -Wcompat
   - -Widentities
@@ -97,7 +98,7 @@ executables:
     ghc-options:
     - -threaded
     - -rtsopts
-    - -with-rtsopts=-N
+    - -with-rtsopts=-N2
     dependencies:
     - HTF
     - binary
