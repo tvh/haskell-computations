@@ -306,6 +306,35 @@ waitForRunAtLeast runVar n = atomically $ do
     Some rs | rs_run rs >= n -> pure rs
     _ -> retry
 
+{- | Waits until propagation has genuinely finished, not merely until the
+ run counter has ticked forward once. The reference driver (see
+ 'benchCompDriver' \/ 'Control.Computations.CompEngine.Run.runCompEngine')
+ processes at most 'Control.Computations.Utils.TimeSpan.seconds' 10 worth
+ of stale caps per @loop'@ iteration before yielding back to check in --
+ so a single incremental update whose cascade exceeds that budget spans
+ *multiple* run numbers, each carrying a nonzero leftover 'rs_staleCaps'
+ into the next. A single 'waitForRunAtLeast' after a mutation can
+ therefore observe only a time-sliced partial round: confirmed at
+ @PERSIST_BENCH_SCALE=1.0@, where mutating key @\"0\"@ enqueued 684 stale
+ caps, the first run processed 34356 reruns before hitting the 10s budget
+ with 19258 still queued, and a naive single-run wait would have reported
+ the 10-second partial figure as if it were the full settle time.
+
+ The queue is only certifiably empty once a freshly-observed run reports
+ an *incoming* backlog ('rs_staleCaps') of zero -- i.e. the run
+ immediately prior fully drained everything it saw with nothing carried
+ over. This polls forward run by run (each an efficient STM 'retry', not
+ a busy loop) until that happens.
+-}
+waitForFullSettle :: TVar (Option RunStats) -> Int -> IO RunStats
+waitForFullSettle runVar startRun = go startRun
+ where
+  go n = do
+    rs <- waitForRunAtLeast runVar n
+    if rs_staleCaps rs == 0
+      then pure rs
+      else go (rs_run rs + 1)
+
 benchMain :: IO ()
 benchMain = do
   scale <- readScale
@@ -372,10 +401,10 @@ benchMain = do
   -- loop's first real iteration drains them. Everything that read those
   -- keys during the cold eval recorded exactly the version now being
   -- reported as "changed", so this drains as a strictly version-matching
-  -- no-op (0 reruns expected) -- but we still wait for it to fully
-  -- complete before mutating, so the live-update measurement below is
-  -- attributable to *only* our mutation.
-  rs2 <- waitForRunAtLeast runVar (rs_run rs1 + 1)
+  -- no-op (0 reruns expected) -- but we still wait for it to *fully*
+  -- complete (see 'waitForFullSettle') before mutating, so the live-update
+  -- measurement below is attributable to *only* our mutation.
+  rs2 <- waitForFullSettle runVar (rs_run rs1 + 1)
   preLiveReruns <- readIORef counterRef
   when (preLiveReruns /= coldReruns) $
     putStrLn
@@ -386,10 +415,12 @@ benchMain = do
 
   -- 2. Live incremental update: mutate exactly one source key on the
   -- still-running engine and time until the driver's next propagation
-  -- round completes.
+  -- round *fully* completes (see 'waitForFullSettle' -- at large scale a
+  -- single mutation's cascade can exceed the driver's per-iteration
+  -- 'rcif_maxLoopRunTime' budget and span several run numbers).
   tBeforeMutate <- getCurrentTime
   hmfInsert kv "0" "13371337"
-  _rs3 <- waitForRunAtLeast runVar (rs_run rs2 + 1)
+  _rs3 <- waitForFullSettle runVar (rs_run rs2 + 1)
   tAfterMutate <- getCurrentTime
   liveReruns <- readIORef counterRef
   let liveWallTime = realToFrac (diffUTCTime tAfterMutate tBeforeMutate) :: Double
