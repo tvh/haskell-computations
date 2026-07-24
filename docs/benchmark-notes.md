@@ -238,6 +238,51 @@ large share of (a) is *hashing to support the union* (derived-Generic
 2. The MD5→xxh3 swap and the `show` drop are real but second-order
    (~5% and ~3%); do them opportunistically, not first.
 
+## Stage 0.6 — hand-rolled Hashable for the DepSet types (commit `84915c7`)
+
+The "10-line quick win" from Stage 0.5's verdict, tried first as planned:
+replaced Generic-derived `Hashable` with hand-written `hashWithSalt` on
+`CompEngDep`/`CompEngDepKey`/`CompEngDepVer` (Types.hs), `Dep` (CompSrc.hs
+— found on the hot path via `CompDep`'s newtype-deriving chain),
+and `Word128`/`Hash128` (Utils/Hash.hs, now feeding the two `Word64`s
+straight into the salt). `Eq`/`Ord` untouched;
+`AnyCompSrcDep`/`ForAnyCompFlow` were already hand-written.
+
+Result: **the targeted mechanism died; the wall clock didn't care.**
+
+- Re-profile: hash-*computation* cost centers (`ghashWithSalt`,
+  generic `hashWithSalt`, `hashSum`, the `Hash128` hashUsing wrappers)
+  went **~14.0% → ~2.5%** of profiled time (~25% → ~7% of alloc) — an
+  ~82% reduction in exactly what Stage 0.5's profile named.
+- Scale 0.1 wall clock: cold flat within noise (avg 2.72 → 2.66 s);
+  live *worse* by ~7% at default RTS (0.460 → 0.493 s avg, consistent
+  across 3 trials), flat at `-A64m`.
+- What grew to fill the pie: the *structural* costs — `$mCompAp` pattern
+  matcher 7.7→9.0%, SifCache `Map` traversal 5.6→6.1%, `HashSet`/`HashMap`
+  trie walks, `eqT` compare flat at 3.8%.
+
+Lesson: bucket (a)'s cost was never mainly *computing* hashes — it's the
+set/map structural work and the `AnyCompAp` dispatch around them. The
+interning + dense-lookup step is confirmed as the real lever; hashing was
+the cheap-but-thin slice. Keeping the change (strictly less work per op,
+clear alloc win, and it simplifies the interning diff to come).
+
+Fresh scale-1.0 numbers on the -O2/-N2 build (one run each), replacing the
+Stage 0 headline figures for time comparisons going forward:
+
+| Config | cold | live | GCs |
+|---|---|---|---|
+| default RTS | 48.75 s | 24.80 s | 18,486 |
+| `-A64m` | **37.50 s** | **37.93 s** | 596 |
+
+⚠ New surprise: at scale 1.0 under `-N2`, `-A64m` *reverses* on the live
+update (37.9 s vs 24.8 s default — the opposite of every scale-0.1
+measurement). Unexplained; needs its own investigation before `-A64m`
+becomes a recommendation at production scale. (Also note cold at 1.0 got
+slower vs the -O1 Stage 0 runs (42.8 → 48.75 s default RTS) — consistent
+with Stage 0.5's finding that -O2 costs time here, and those Stage 0 runs
+used `-N` all-cores.)
+
 ## Not tried yet / open items
 
 - **The Interlude-2 diet, measured.** The Rust notes list a ranked, concrete
