@@ -24,11 +24,17 @@ import GHC.Generics (Generic)
 
 newtype Hash128 = Hash128 {unHash128 :: LH.Word128}
   deriving stock (Typeable, Generic)
-  deriving newtype (Eq, Ord)
+  deriving newtype (Eq, Ord, Hashable)
 
-instance Hashable LH.Word128
+-- Hand-rolled rather than Generic-derived: cap_hash (Hash128) is compared
+-- and hashed on essentially every cache lookup/CompAp dispatch, and
+-- profiling showed the Generic-derived default walking Word128's
+-- representation was a measurable cost. Word128 is just two Word64s, so
+-- hash them directly -- equal values still hash equal.
+instance Hashable LH.Word128 where
+  hashWithSalt s w =
+    s `hashWithSalt` LH.w128_first w `hashWithSalt` LH.w128_second w
 instance LH.LargeHashable LH.Word128
-instance Hashable Hash128
 instance LH.LargeHashable Hash128
 
 largeHash128 :: LH.LargeHashable a => a -> Hash128

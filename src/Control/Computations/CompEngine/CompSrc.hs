@@ -53,7 +53,14 @@ data Dep a b = Dep
   { dep_key :: a
   , dep_ver :: b
   }
-  deriving (Eq, Ord, Data, Typeable, Generic, Hashable)
+  deriving (Eq, Ord, Data, Typeable, Generic)
+
+-- Hand-rolled rather than Generic-derived (anyclass): CompDep = Dep
+-- CompDepKey CompDepVer sits on the DepSet hot path (CompEngDepComp wraps
+-- CompDep, and CompDep's own Hashable instance newtype-delegates straight
+-- to this one), so the Generic-representation walk here mattered too.
+instance (Hashable a, Hashable b) => Hashable (Dep a b) where
+  hashWithSalt s (Dep k v) = s `hashWithSalt` k `hashWithSalt` v
 
 instance (Show k, Show v) => Show (Dep k v) where
   showsPrec p (Dep k v) = showHelper2 p "Dep" k v

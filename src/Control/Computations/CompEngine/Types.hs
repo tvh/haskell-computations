@@ -418,9 +418,31 @@ data CompEngDepVer
   | CompEngDepVerComp CompDepVer
   deriving (Show, Eq, Typeable, Generic)
 
-instance Hashable CompEngDep
-instance Hashable CompEngDepKey
-instance Hashable CompEngDepVer
+-- These instances are hand-rolled rather than Generic-derived: DepSet (a
+-- HashSet CompEngDep) is hashed on every compMBind/compMAp union, and
+-- profiling showed the Generic-derived default (walking the GHC.Generics
+-- representation via ghashWithSalt/hashSum) was a significant cost. Hashing
+-- a small constructor tag plus the payload (itself already Hashable, and
+-- cheap -- see CompDep/CompDepKey/CompDepVer's newtype-derived instances)
+-- is semantically equivalent -- equal values still hash equal -- and skips
+-- the generic-representation walk entirely.
+instance Hashable CompEngDep where
+  hashWithSalt s dep =
+    case dep of
+      CompEngDepSrc x -> s `hashWithSalt` (0 :: Int) `hashWithSalt` x
+      CompEngDepComp x -> s `hashWithSalt` (1 :: Int) `hashWithSalt` x
+
+instance Hashable CompEngDepKey where
+  hashWithSalt s key =
+    case key of
+      CompEngDepKeySrc x -> s `hashWithSalt` (0 :: Int) `hashWithSalt` x
+      CompEngDepKeyComp x -> s `hashWithSalt` (1 :: Int) `hashWithSalt` x
+
+instance Hashable CompEngDepVer where
+  hashWithSalt s ver =
+    case ver of
+      CompEngDepVerSrc x -> s `hashWithSalt` (0 :: Int) `hashWithSalt` x
+      CompEngDepVerComp x -> s `hashWithSalt` (1 :: Int) `hashWithSalt` x
 
 instance IsDep CompEngDep where
   type DepKey CompEngDep = CompEngDepKey
