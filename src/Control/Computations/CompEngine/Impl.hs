@@ -36,7 +36,10 @@ import Control.Computations.Utils.Types
 ----------------------------------------
 import Control.Monad
 import Control.Monad.Reader
-import Control.Monad.State
+-- Strict, not the mtl default (Control.Monad.State re-exports the Lazy
+-- variant) -- see CompEngineM's Monad instance below for why this matters
+-- on the suspend/resume hot path.
+import Control.Monad.State.Strict
 import qualified Data.Foldable as F
 import qualified Data.HashMap.Strict as HashMap
 import qualified Data.HashSet as HashSet
@@ -99,7 +102,40 @@ garbage (GenDel gen (Garbage garbage_caps garbage_deps garbage_outputs)) =
         else pureDebug ("Returning garbage: " ++ show result) result
 
 newtype CompEngineM a = CompEngineM {unCompEngineM :: StateT GenDel (ReaderT CompEngine IO) a}
-  deriving (Functor, Applicative, Monad, MonadIO)
+
+{- | Hand-written rather than @deriving (Functor, Applicative, Monad,
+ MonadIO)@ (via GeneralizedNewtypeDeriving): profiling after the CompM-over-
+ IO rewrite (docs/benchmark-notes.md, Stage 2) found a live, allocating
+ `$fMonadCompEngineM_$s$fMonadStateT_$c>>=` cost center on the suspend/
+ resume hot path (`loop`/`doSuspended` now do a real monadic bind on every
+ round trip, where the old pure representation didn't need one at all) --
+ i.e. the derived instance's dictionary-passing wasn't fully specializing
+ away even under -O2. Each method here is a one-line unwrap-delegate-
+ rewrap around the identical underlying `StateT`/`ReaderT`/`IO` operation
+ (so this is representationally a no-op, same as what deriving generated),
+ but the explicit INLINE pragma gives GHC's simplifier a direct mandate to
+ substitute the body at every call site and keep specializing through
+ `mtl`'s own (also INLINE-marked) StateT/ReaderT instances down to concrete
+ IO, rather than leaving a standalone dictionary method for the profiler
+ (and the runtime) to keep finding.
+-}
+instance Functor CompEngineM where
+  fmap f (CompEngineM m) = CompEngineM (fmap f m)
+  {-# INLINE fmap #-}
+
+instance Applicative CompEngineM where
+  pure = CompEngineM . pure
+  {-# INLINE pure #-}
+  CompEngineM mf <*> CompEngineM mx = CompEngineM (mf <*> mx)
+  {-# INLINE (<*>) #-}
+
+instance Monad CompEngineM where
+  CompEngineM m >>= f = CompEngineM (m >>= unCompEngineM . f)
+  {-# INLINE (>>=) #-}
+
+instance MonadIO CompEngineM where
+  liftIO = CompEngineM . liftIO
+  {-# INLINE liftIO #-}
 
 {- | Here we remove the cap that generated the garbage from the
  total garbage cap set in the state
@@ -123,6 +159,7 @@ tellGarbage mKey g =
       modify' removeCapFromGarbage
       let logFun = if mempty == g then logNoLog else logDebug
       logFun ("Collected garbage " ++ show g)
+{-# INLINE tellGarbage #-}
 
 tellOutputs :: AnyCompAp -> AnyCompSinkOutsMap -> CompEngineM ()
 tellOutputs key outputs =
@@ -131,12 +168,15 @@ tellOutputs key outputs =
       modify' (\genDel -> genDel `mappend` generated key outputs)
       let logFun = if nullAnyOutsMap outputs then logNoLog else logDebug
       logFun ("Outputs generated " ++ show outputs)
+{-# INLINE tellOutputs #-}
 
 runCompEngineM :: CompEngineM a -> CompEngine -> GenDel -> IO (a, GenDel)
 runCompEngineM cet ce g = runReaderT (runStateT (unCompEngineM cet) g) ce
+{-# INLINE runCompEngineM #-}
 
 runCompEngineM' :: CompEngineM a -> CompEngine -> IO (a, GenDel)
 runCompEngineM' cet ce = runCompEngineM cet ce mempty
+{-# INLINE runCompEngineM' #-}
 
 evalCompEngineM :: CompEngineM a -> CompEngine -> IO a
 evalCompEngineM cet env =
@@ -145,6 +185,7 @@ evalCompEngineM cet env =
     when (garbage g /= mempty) $
       fail ("evalCompEngineM produced garbage that would be ignored: " ++ show g)
     return x
+{-# INLINE evalCompEngineM #-}
 
 initCompAp
   :: CompAp a
@@ -164,6 +205,7 @@ withCompState mkAction =
     do
       action <- asks (mkAction . ce_stateIf . ce_compEngineIfs)
       lift (lift action)
+{-# INLINE withCompState #-}
 
 doCompAp
   :: IsCompResult a

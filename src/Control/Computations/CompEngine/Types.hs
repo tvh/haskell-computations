@@ -327,13 +327,17 @@ contToCompM m =
 
 instance Applicative CompM where
   pure = compMFinished . CompResultOk
+  {-# INLINE pure #-}
   (<*>) = compMAp
+  {-# INLINE (<*>) #-}
 
 instance Monad CompM where
   (>>=) = compMBind
+  {-# INLINE (>>=) #-}
 
 instance MonadFail CompM where
   fail = compMFinished . CompResultFail
+  {-# INLINE fail #-}
 
 compMAp
   :: CompM (a -> b)
@@ -383,9 +387,11 @@ compMBind m f =
 
 compMFinished :: CompResult a -> CompM a
 compMFinished ev = compMYield (CompFinished ev)
+{-# INLINE compMFinished #-}
 
 compMYield :: CompYield a -> CompM a
 compMYield ret = CompM $ \_env -> return ret
+{-# INLINE compMYield #-}
 
 doAnyRequest :: CompReq a -> CompM a
 doAnyRequest req =
