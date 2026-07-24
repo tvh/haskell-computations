@@ -477,6 +477,51 @@ investigation (deliberately not attempted inside the resolver-bump
 change). **Benchmark policy until fixed: `-A64m` is the standard config
 on 9.10.3; default-RTS rows can't be collected.**
 
+## Interlude — the STM deadlock, root-caused (commit `a1c5933`)
+
+Resolved before resuming any optimization work. **The engine is
+exonerated: this was a benchmark-harness bug**, and every prior mention of
+a "driver race" (Stage 0.5's `-N1` crash, the compiler interlude's
+headline) should be read as retracted in favor of this diagnosis.
+
+Mechanism, from a captured failing trace (in-memory buffered tracing,
+dumped on exception — stdout logging perturbed timing enough to hide the
+race): `compDriver'`'s `shouldStartNextRun` posts each run's `RunStats`
+*eagerly*, tagged with the **upcoming** run number, before that run has
+attempted its blocking wait. So `waitForRunAtLeast n` only ever guaranteed
+`rs_run >= n` — and the bench's post-cold-settle wait broke that contract
+by unconditionally asking for `rs_run rs1 + 1`. When the engine raced
+ahead and `rs1` overshot to an already-settled run, the requested run
+number could never be posted until a source mutation — which the bench
+only performs *after* the wait returns. Both threads park; GHC's GC-based
+deadlock detector converts the hang into `BlockedIndefinitelyOnSTM` only
+when a GC happens to run in the window. That explains everything
+observed: fires at cold settle (where the window opens), nursery-size
+dependence (fewer GCs → fewer interleavings → and no detector runs),
+`-N1` near-certainty (coarser scheduling → overshoot every time), and
+9.4.5's apparent cleanliness (same latent bug, luckier cadence).
+`HashMapFlow.waitChangesImpl`'s destructive-read-then-retry — the prime
+suspect — was checked structurally and empirically: **not guilty**, no
+lost wakeup.
+
+Fix (root, not mitigation): seed the settle-wait with `rs1`'s own run
+number (`waitForFullSettle` already re-checks `rs_staleCaps` before
+advancing, so this is sufficient); `waitForRunAtLeast`/`waitForFullSettle`
+promoted into `Driver.hs` proper with the "at least" contract documented,
+since every `compDriver'` caller faces the same hazard; a deterministic
+regression test (`TestDriver.hs`) proves the buggy pattern hangs and the
+fixed one returns. Tests now 74/74.
+
+Verification: 0.1 default RTS **10/10** (was 6/6 failing); 1.0 default
+**3/3**; `-N1` **3/3** — confirming the Stage 0.5 `-N1` crash was the
+same bug; `-A64m` sanity matches the doc's numbers within noise.
+
+**Benchmark policy update**: the "`-A64m` only" restriction is lifted.
+Default-RTS scale-1.0 rows are collectable again; for the record, on the
+current build (GHC 9.10.3, post-fix): **cold 22.5–23.6 s, live
+14.0–14.7 s, 80,767 reruns** — previously uncollectable on this
+toolchain.
+
 ## Memory roadmap — the path to Rust parity ("nothing off the table")
 
 Where we stand at 1M caps (Stage 1/2 measurements): `max_live_bytes`
