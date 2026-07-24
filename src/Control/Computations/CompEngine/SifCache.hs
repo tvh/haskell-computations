@@ -49,12 +49,10 @@ import Control.Computations.Utils.Types
 -- EXTERNAL
 ----------------------------------------
 
-import Control.Monad.Identity
 import Data.Int
 import Data.IntMap.Strict (IntMap)
 import qualified Data.IntMap.Strict as IntMap
 import Data.IntSet (IntSet)
-import Data.List (foldl')
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Test.Framework

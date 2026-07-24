@@ -30,6 +30,7 @@ import Control.Computations.Utils.Types
 -- EXTERNAL
 ----------------------------------------
 
+import Control.Monad (replicateM, unless)
 import Control.Monad.Reader
 import Data.Char
 import Data.HashMap.Strict (HashMap)

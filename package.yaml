@@ -64,6 +64,7 @@ ghc-options:
   - -Wno-name-shadowing
   - -Wpartial-fields
   - -Wredundant-constraints
+  - -Wno-x-partial
   - -Werror
 
 default-extensions:

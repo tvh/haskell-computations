@@ -33,7 +33,8 @@ import Control.Computations.Utils.Types
 -- EXTERNAL
 ----------------------------------------
 
-import Control.Monad.Reader
+import Control.Monad (liftM)
+import Control.Monad.Fix (MonadFix, mfix)
 import Control.Monad.State.Lazy
 import Data.LargeHashable
 import qualified Data.Map.Strict as Map

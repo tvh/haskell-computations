@@ -101,7 +101,7 @@ import Control.Computations.Utils.Types
 -- EXTERNAL
 ----------------------------------------
 
-import Control.Monad.Reader
+import Control.Monad ((>=>))
 import Data.Function (on)
 import Data.HashSet (HashSet)
 import Data.Hashable
