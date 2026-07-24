@@ -114,6 +114,83 @@ noisier RSS basis. Per-node timing: cold ~43 µs/instance; live ~300–390
   Rust's phase-7 setup, but not to its isolated process-per-phase RSS figures
   except phase 7's own.
 
+## Runtime research — where the time goes (reasoning + one probe, before touching code)
+
+Question: can the 14× cold / 50–60× live-update gap vs. the Rust port be
+closed without abandoning the architecture? Findings, in order of confidence:
+
+### Build/RTS configuration was leaving easy money on the table
+
+- The build is stack's default `-O1`; `-O2` is set nowhere.
+- The executable hardcodes `-with-rtsopts=-N`: every benchmark number above
+  ran with all-cores parallel GC and the default 4 MB nursery — hence the
+  18,516 GCs at scale 1.0. Probed at scale 0.1 (same build, `5e4ab4c`):
+
+| RTS flags | cold eval | live update | GCs | RSS after settle |
+|---|---|---|---|---|
+| default (`-A4m -N`) | 2.48 s | 0.367 s | 1,043 | 447 MB |
+| `-A16m` | 2.14 s | 0.359 s | 24 | 560 MB |
+| `-A64m` | **1.65 s** | **0.306 s** | **4** | 1,122 MB |
+| `-N1` | — | — | — | crashes |
+
+  **−33% cold / −17% live from a nursery flag alone**, at a real memory
+  price (nurseries are per-capability under `-N`; `-n` chunking or a small
+  fixed `-N` would moderate it). The `-N1` crash is a genuine finding:
+  "thread blocked indefinitely in an STM transaction" right after cold
+  settle — the driver deadlocks on a single capability.
+
+### The monad is not naively slow — the classic fixes are already in
+
+`CompM` is a Haxl-shaped resumption monad: `CompFinished`/`CompSuspended`
+mirror Haxl's `Done`/`Blocked` ("There is no Fork", ICFP'14), including the
+applicative `CompReqCombined` batching; and `ContCompM` (`Types.hs`) already
+implements the Jaskelioff/Rivas "smart view" — the same fix family as
+"Reflection without Remorse" and the FTCQueue in "Freer Monads, More
+Extensible Effects". The quadratic left-bind pathology that literature
+addresses is already solved here; switching encodings (freer, Church/
+Codensity à la "Free Monads for Less") would shave constants, not close a
+50× gap.
+
+### What actually looks structurally slow (unmeasured — profile first)
+
+1. **A `HashSet` union per bind.** `compMBind`/`compMAp` thread the `DepSet`
+   as a writer monoid (`w <> w'`, `Types.hs`) — every bind in every rerun
+   allocates and unions. Haxl's lesson applies: `GenHaxl` is a monad *over
+   IO* with mutable state; deps could accumulate into a per-cap mutable ref
+   (the state-if is already `IO`), deleting per-bind unions outright.
+2. **Every child eval is a suspend→engine→resume round trip, even on a
+   cache hit**, and the cache lookup is `Data.Map` keyed by `AnyCompAp`
+   whose `Ord` pays an `eqT` fingerprint comparison per step — ~3M edges ×
+   ~20 comparisons at scale 1.0. Interning (Interlude 2's big item) is a
+   *time* win too, not just memory.
+3. **MD5 per `mkCompAp`** — every parent eval call MD5-hashes
+   `(name, param)` via large-hashable; ~3M+ hashes on a cold eval. A
+   non-crypto 128-bit hash (e.g. xxh3-128) is ~10× faster on small inputs;
+   the Rust port uses truncated blake3.
+4. **`fullCaching` `show`s and MD5s every recomputed result**
+   (`CacheBehaviors.hs`) — the `ccm_logrepr` memory item is also a
+   per-rerun time cost.
+
+### If a restructure is ever warranted
+
+The modern consensus (effectful/bluefin benchmarks) is that free-monad-family
+interpreters lose 1–3 orders of magnitude to evidence-passing/IO-based
+designs. The relevant move here is not a better free monad but **CompM over
+IO with real suspension only on cache miss**: GHC ≥ 9.6 ships delimited
+continuation primops (`prompt#`/`control0#`, GHC proposal 313 — the
+machinery behind Alexis King's eff), and this repo is on GHC 9.10.3. Cache
+hits become direct mutable-map reads; a continuation is captured only when
+the engine genuinely needs to intervene. Biggest lever, deepest cut — gate
+it on profiling evidence.
+
+### Recommended order
+
+1. Profile (`-fprof-late`) to split time across suspects 1–4.
+2. `-O2` + RTS tuning (free, ~30%+ demonstrated).
+3. MD5 → xxh3; drop the per-rerun `show`.
+4. Interning + dense lookup (shared with the memory diet).
+5. Only then judge the IO-based `CompM` rewrite.
+
 ## Not tried yet / open items
 
 - **The Interlude-2 diet, measured.** The Rust notes list a ranked, concrete
