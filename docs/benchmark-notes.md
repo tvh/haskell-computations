@@ -283,6 +283,73 @@ slower vs the -O1 Stage 0 runs (42.8 → 48.75 s default RTS) — consistent
 with Stage 0.5's finding that -O2 costs time here, and those Stage 0 runs
 used `-N` all-cores.)
 
+## Stage 1 — interning + dense lookup (commit `9fe2db3`)
+
+The load-bearing optimization the profiles kept pointing at. `AnyCompAp`
+identities are interned to dense `Int` ids (new
+`CompEngine/Utils/Intern.hs`: `HashMap AnyCompAp Int` forward — hashing via
+the now-cheap `capI_hash`, `eqT` only on bucket collision — `IntMap`
+reverse, monotonic counter, **ids never recycled**; `runGc` releases both
+directions, `resolve` fails loudly on a dead id). The five state containers
+re-key to `Int`: `SifCache` becomes an `IntMap` (plus an `IntMap CompId` so
+GC-time deletes need no `AnyCompAp`), `SifDeps` becomes
+`DepMap Int InternedDep` (`DepMap`/`VerList` needed zero changes — already
+key-generic; invalidation semantics untouched), vermap and outputs likewise.
+The old sharing machinery is gone deliberately: no more `normalizeDep`, no
+`lookupLE`-returns-the-map's-own-key trick, no `reallyUnsafePtrEquality#`
+in `validateSifState` — the id *is* the canonical identity, and the
+validator now checks the new invariant instead (every id referenced by a
+container is live in the intern table). `sifs_stale` (PAQ) and the pending
+sets stay `AnyCompAp`-keyed — small/transient, follow-on target.
+
+Tests: 70/70 (65 pre-existing + 5 new intern tests) plus the app-level
+suite, no assertions weakened.
+
+### Numbers
+
+Scale 0.1 (vs Stage 0.6, same flags): cold **1.92–1.96 s (−27%)**, live
+**0.32–0.35 s (−32%)** default; `-A64m` **1.61 s (−22%) / 0.311 s (−13%)**.
+
+Scale 1.0 — measured against a **fresh same-session rerun** of the parent
+commit, because the Stage 0.6 table's 1.0 numbers did not reproduce
+(see correction below):
+
+| Config | cold (base→interned) | live (base→interned) | RSS settle | max_live |
+|---|---|---|---|---|
+| default | 41.50 → **31.05 s (−25%)** | 16.31 → 17.78 s (+9%) | 3435 → **2790 MB (−19%)** | 1820 → 1686 MB (−7%) |
+| `-A64m` | 32.25 → **22.08 s (−32%)** | 14.45 → 14.64 s (flat) | 2347 → **1983 MB (−16%)** | 1644 → 1847 MB (+12%) |
+
+Cold eval and RSS improve solidly at both scales; the live update improves
+sharply at 0.1 but is flat-to-+9% at 1.0 (not yet understood — the live
+path's remaining costs evidently scale differently; candidate: the
+still-`AnyCompAp`-keyed PAQ/stale machinery is proportionally hotter in
+propagation than in cold eval). The `max_live_bytes` split (−7% default,
++12% `-A64m`, deterministic per config) vs. consistently-improved RSS is
+flagged, unexplained; likely a peak-sampling artifact of far fewer major
+GCs (605 vs 18.8k) — a `-hT` heap profile would settle it.
+
+### Profile after (scale 0.1)
+
+The convicted centers collapsed: `$mCompAp` matcher **9.0% → 1.2%**,
+`SifCache` structural traversal **6.1% → 3.2%**, `Ord AnyCompAp`/`eqT`
+compare **gone from the flat table entirely**. Top of the profile is now
+generic `Data.HashMap` machinery (the intern table's own lookups — cheap
+`Hash128` dispatch, no `eqT`), the PAQ (`IntPSQ.fold'` 4.0%), MD5 (`runLH`
+3.5%), and `Impl.hs` monad plumbing — i.e. the long tail is now the story,
+plus the suspects (c) and the CompM-over-IO idea from the research section.
+
+### ⚠ Correction to Stage 0.6's 1.0-scale table
+
+Stage 0.6's scale-1.0 numbers (48.75 s cold / 24.80 s live default;
+37.50/37.93 `-A64m`) **did not reproduce** in a fresh same-session rerun of
+the very same commit (41.50/16.31 and 32.25/14.45). In particular the
+"live-update reversal under `-A64m`" flagged there (37.9 s) measured 14.4 s
+this session — the reversal was session noise (machine load), not a real
+effect; consider it withdrawn. Lesson for every number in this doc:
+cross-*session* comparisons at scale 1.0 carry far more variance than the
+within-session run-to-run spread suggests; conclusions should rest on
+same-session A/B pairs, as this stage's do.
+
 ## Not tried yet / open items
 
 - **The Interlude-2 diet, measured.** The Rust notes list a ranked, concrete
