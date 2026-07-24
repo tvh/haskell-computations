@@ -4,6 +4,8 @@ module Control.Computations.CompEngine.Driver (
   compDriver',
   regSrc,
   regSink,
+  waitForRunAtLeast,
+  waitForFullSettle,
 ) where
 
 ----------------------------------------
@@ -97,3 +99,50 @@ regSink :: CompSink s => CompFlowRegistry -> IO a -> s -> IO a
 regSink reg action sink = do
   registerCompSink reg sink
   action
+
+{- | Blocks until the driver has posted a 'RunStats' whose 'rs_run' is at
+ least @n@, and returns that 'RunStats' -- whichever one first satisfies the
+ condition, not necessarily @rs_run == n@.
+
+ This "at least" contract is easy to trip over: 'shouldStartNextRun' (see
+ 'compDriver'') posts run @k@'s stats -- describing run @k-1@'s leftover
+ 'rs_staleCaps' -- at the /top/ of the loop, before run @k@ has attempted
+ its own blocking wait for changes. So by the time a caller's
+ 'waitForRunAtLeast' transaction actually gets scheduled, the driver may
+ already have raced ahead and posted a later run than the caller expected.
+ Callers must not assume the returned 'rs_run' equals @n@ -- in particular,
+ never compute "the next run after this one" as @rs_run result + 1@ from a
+ result obtained this way without first checking whether it is already
+ settled ('rs_staleCaps' @== 0@); see 'waitForFullSettle', which does this
+ correctly.
+-}
+waitForRunAtLeast :: TVar (Option RunStats) -> Int -> IO RunStats
+waitForRunAtLeast runVar n = atomically $ do
+  mrs <- readTVar runVar
+  case mrs of
+    Some rs | rs_run rs >= n -> pure rs
+    _ -> retry
+
+{- | Waits until propagation has genuinely finished, not merely until the run
+ counter has ticked forward once. The driver (see 'compDriver'') processes
+ at most 'Control.Computations.Utils.TimeSpan.seconds' 10 worth of stale
+ caps per loop iteration before yielding back to check in -- so one
+ incremental update's cascade can span *multiple* run numbers, each
+ carrying a nonzero leftover 'rs_staleCaps' into the next.
+
+ The queue is only certifiably empty once a freshly-observed run reports an
+ *incoming* backlog ('rs_staleCaps') of zero -- i.e. the run immediately
+ prior fully drained everything it saw with nothing carried over. This
+ polls forward run by run (each an efficient STM 'retry', not a busy loop)
+ until that happens, starting from @startRun@ (typically the caller's own
+ most-recently-observed run number -- see 'waitForRunAtLeast's docs for why
+ that must not be blindly incremented by callers themselves).
+-}
+waitForFullSettle :: TVar (Option RunStats) -> Int -> IO RunStats
+waitForFullSettle runVar startRun = go startRun
+ where
+  go n = do
+    rs <- waitForRunAtLeast runVar n
+    if rs_staleCaps rs == 0
+      then pure rs
+      else go (rs_run rs + 1)

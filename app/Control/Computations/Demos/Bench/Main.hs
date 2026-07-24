@@ -299,41 +299,12 @@ getRssMb = do
 -- Orchestration
 ----------------------------------------
 
-waitForRunAtLeast :: TVar (Option RunStats) -> Int -> IO RunStats
-waitForRunAtLeast runVar n = atomically $ do
-  mrs <- readTVar runVar
-  case mrs of
-    Some rs | rs_run rs >= n -> pure rs
-    _ -> retry
-
-{- | Waits until propagation has genuinely finished, not merely until the
- run counter has ticked forward once. The reference driver (see
- 'benchCompDriver' \/ 'Control.Computations.CompEngine.Run.runCompEngine')
- processes at most 'Control.Computations.Utils.TimeSpan.seconds' 10 worth
- of stale caps per @loop'@ iteration before yielding back to check in --
- so a single incremental update whose cascade exceeds that budget spans
- *multiple* run numbers, each carrying a nonzero leftover 'rs_staleCaps'
- into the next. A single 'waitForRunAtLeast' after a mutation can
- therefore observe only a time-sliced partial round: confirmed at
- @PERSIST_BENCH_SCALE=1.0@, where mutating key @\"0\"@ enqueued 684 stale
- caps, the first run processed 34356 reruns before hitting the 10s budget
- with 19258 still queued, and a naive single-run wait would have reported
- the 10-second partial figure as if it were the full settle time.
-
- The queue is only certifiably empty once a freshly-observed run reports
- an *incoming* backlog ('rs_staleCaps') of zero -- i.e. the run
- immediately prior fully drained everything it saw with nothing carried
- over. This polls forward run by run (each an efficient STM 'retry', not
- a busy loop) until that happens.
--}
-waitForFullSettle :: TVar (Option RunStats) -> Int -> IO RunStats
-waitForFullSettle runVar startRun = go startRun
- where
-  go n = do
-    rs <- waitForRunAtLeast runVar n
-    if rs_staleCaps rs == 0
-      then pure rs
-      else go (rs_run rs + 1)
+-- 'waitForRunAtLeast' and 'waitForFullSettle' now live in
+-- "Control.Computations.CompEngine.Driver" (re-exported via
+-- "Control.Computations.CompEngine"): they're generic to any
+-- 'compDriver''-style @TVar (Option RunStats)@, not bench-specific, and
+-- promoting them lets "Control.Computations.CompEngine.Tests.TestDriver"
+-- exercise their settle-detection contract directly.
 
 benchMain :: IO ()
 benchMain = do
@@ -404,7 +375,23 @@ benchMain = do
   -- no-op (0 reruns expected) -- but we still wait for it to *fully*
   -- complete (see 'waitForFullSettle') before mutating, so the live-update
   -- measurement below is attributable to *only* our mutation.
-  rs2 <- waitForFullSettle runVar (rs_run rs1 + 1)
+  --
+  -- IMPORTANT: start the settle-poll from 'rs1's own run number, not
+  -- @rs_run rs1 + 1@. 'waitForRunAtLeast' only guarantees @rs_run rs >= n@,
+  -- not equality -- 'shouldStartNextRun' posts a run's 'RunStats' (tagged
+  -- with the *upcoming* run number) describing the *previous* run's
+  -- leftover 'rs_staleCaps' before that upcoming run has even attempted its
+  -- own blocking wait. So 'rs1' can race ahead and already report run 2 (or
+  -- later) with 'rs_staleCaps' 0 -- i.e. already fully settled. Blindly
+  -- waiting for @rs_run rs1 + 1@ then asks for a run that will never come
+  -- until *something* mutates a source, but nothing does until after this
+  -- wait returns -- a genuine deadlock (reproduced: 'waitForRunAtLeast 1'
+  -- observed run=2/staleCaps=0 while the engine thread was already blocked
+  -- in 'compSrcWaitChanges', and 'waitForFullSettle' then waited on run 3
+  -- forever). 'waitForFullSettle' already re-checks 'rs_staleCaps' before
+  -- advancing, so seeding it with 'rs1's own (possibly-overshot) run number
+  -- is both correct and sufficient.
+  rs2 <- waitForFullSettle runVar (rs_run rs1)
   preLiveReruns <- readIORef counterRef
   when (preLiveReruns /= coldReruns) $
     putStrLn
@@ -418,6 +405,15 @@ benchMain = do
   -- round *fully* completes (see 'waitForFullSettle' -- at large scale a
   -- single mutation's cascade can exceed the driver's per-iteration
   -- 'rcif_maxLoopRunTime' budget and span several run numbers).
+  --
+  -- Unlike the cold-drain wait above, @rs_run rs2 + 1@ *is* safe here:
+  -- 'rs2' is 'waitForFullSettle's postcondition (genuinely 0 leftover
+  -- stale caps), and with 'rcif_emptyChangesMode' = 'Block' the driver
+  -- cannot advance its run counter again until a source actually changes --
+  -- so the engine is provably parked, still tagged with run 'rs_run rs2',
+  -- inside its blocking wait at the moment we mutate. The very next
+  -- 'RunStats' the driver posts is therefore guaranteed to report the
+  -- outcome of processing *this* mutation.
   tBeforeMutate <- getCurrentTime
   hmfInsert kv "0" "13371337"
   _rs3 <- waitForFullSettle runVar (rs_run rs2 + 1)

@@ -9,6 +9,7 @@ import Test.Framework
 import {-@ HTF_TESTS @-} Control.Computations.CompEngine.CompFlowRegistry
 import {-@ HTF_TESTS @-} Control.Computations.CompEngine.SifCache
 import {-@ HTF_TESTS @-} Control.Computations.CompEngine.Tests.TestCompEngine
+import {-@ HTF_TESTS @-} Control.Computations.CompEngine.Tests.TestDriver
 import {-@ HTF_TESTS @-} Control.Computations.CompEngine.Tests.TestOutputs
 import {-@ HTF_TESTS @-} Control.Computations.CompEngine.Tests.TestRevive
 import {-@ HTF_TESTS @-} Control.Computations.CompEngine.Tests.TestRun
