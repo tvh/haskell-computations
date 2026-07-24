@@ -191,6 +191,53 @@ it on profiling evidence.
 4. Interning + dense lookup (shared with the memory diet).
 5. Only then judge the IO-based `CompM` rewrite.
 
+## Stage 0.5 — -O2, -N2 default, and a profile (commit `ec706f4`)
+
+Build changes: `-O2` added to the global ghc-options; the executable's
+baked-in rtsopts changed `-N` → `-N2`. Measurements at scale 0.1.
+
+### -O2 is a memory win and a small *time loss*
+
+| Config | cold | live | GCs | RSS after settle | max_live |
+|---|---|---|---|---|---|
+| -O1, `-A4m -N` | 2.48–2.85 s | 0.37–0.45 s | 1,043 | 447 MB | 166 MB |
+| -O1, `-A64m -N` | 1.65 s | 0.306 s | 4 | 1,122 MB | — |
+| -O2, `-N2` | 2.60–2.89 s | 0.45–0.47 s | 1,040 | **309 MB** | 188 MB |
+| -O2, `-N2 -A64m` | 2.01–2.05 s | 0.33–0.36 s | 33 | **446–453 MB** | 166 MB |
+| -O2, `-N` | 2.63–2.66 s | 0.45 s | 1,040 | 371 MB | 188 MB |
+
+Contrary to the expectation above, `-O2` cost +7–10% cold / +20–25% live at
+matched RTS settings, while cutting RSS-after-settle 17–31% (and −60% under
+`-A64m`). `-N2` vs `-N` (14 cores) barely moves anything — allocation is
+effectively single-HEC here. `-A64m` remains the single most reliable
+timing lever. Keeping `-O2` for the memory win; the timing regression is
+within what the interning work below should dwarf.
+
+### Profile (`-fprof-late`, scale 0.1) — the suspects, measured
+
+Profiled binary: cold 11.4 s (≈4.5× slower — relative attribution only).
+Bucket attribution of measured time:
+
+| Suspect (from the section above) | %time | %alloc |
+|---|---|---|
+| (b) cache lookup/dispatch: `$mCompAp` pattern matcher **7.7% alone**, `SifCache` `Data.Map` traversal 5.6%, `Ord AnyCompAp`/`eqT` compare 3.8% | **≈27%** | ≈20% |
+| (a) DepSet unions — dominated by *generic `Hashable` derivation* for `CompEngDep` (`ghashWithSalt` chains), not the union call itself | **≈17%** | ≈28% |
+| (c) MD5 via large-hashable (`runLH`, `mkCompAp`) | ≈5% | ≈5% |
+| (d) `fullCaching` show/logrepr | ≈3% | ≈3% |
+| (e) residual: engine-loop plumbing (`fmap` ~2.3%, PAQ/IntPSQ ~4.6%), long tail, GC (invisible to cost centers) | ≈43–47% | — |
+
+Verdict: **(b) and (a) convicted, ~48% combined**; the speculative ranking
+had the right order but underestimated how close (a) and (b) are — and a
+large share of (a) is *hashing to support the union* (derived-Generic
+`Hashable` on `CompEngDep`), not set operations proper. Two consequences:
+
+1. **Interning + dense lookup moves to the front of the queue** — it
+   attacks (a) and (b) simultaneously, since both are downstream of
+   hashing/comparing `AnyCompAp`/`CompEngDep` values; hot-path keys become
+   `Int`s.
+2. The MD5→xxh3 swap and the `show` drop are real but second-order
+   (~5% and ~3%); do them opportunistically, not first.
+
 ## Not tried yet / open items
 
 - **The Interlude-2 diet, measured.** The Rust notes list a ranked, concrete
