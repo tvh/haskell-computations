@@ -17,6 +17,24 @@
  Scale is configurable via the @PERSIST_BENCH_SCALE@ environment variable
  (a float multiplier on every entry of 'baseLevelSizes', each floored at 1;
  defaults to @1.0@, the ~1,000,000-instance configuration).
+
+ Rerun counting has no honest way to run from inside a 'CompM' comp body
+ (there is no @liftIO@, unlike the Rust benchmark's async bodies which do a
+ plain @run_counter.fetch_add@ right there). Rather than smuggle an
+ 'unsafePerformIO'-based counter into comp bodies -- which does not work
+ reliably anyway, since GHC's optimizer is free to float, share, or
+ eliminate a "pure" IO action that doesn't genuinely vary per call, and in
+ practice does exactly that -- this benchmark counts at the engine's own
+ interface boundary instead: 'countingStateIf' wraps 'CompEngineStateIf'
+ (see "Control.Computations.CompEngine.Core") so that every call to
+ 'capEvaluationStarted' -- which "Control.Computations.CompEngine.Impl"
+ calls exactly once, immediately before running each computation body --
+ first bumps an 'IORef', then delegates to the original implementation.
+ This is ordinary, honest IO in the orchestrating driver thread, and
+ observes precisely the same event the Rust benchmark's
+ @run_counter.fetch_add@ observes, just from outside the body rather than
+ inside it. Comp bodies themselves stay pure 'CompM' code with no counting
+ plumbing at all.
 -}
 module Control.Computations.Demos.Bench.Main (benchMain) where
 
@@ -25,6 +43,8 @@ module Control.Computations.Demos.Bench.Main (benchMain) where
 ----------------------------------------
 import Control.Computations.CompEngine
 import Control.Computations.FlowImpls.HashMapFlow
+import Control.Computations.Utils.Logging
+import Control.Computations.Utils.TimeSpan
 import Control.Computations.Utils.Types
 
 ----------------------------------------
@@ -43,7 +63,6 @@ import Data.Time.Clock
 import Data.Word
 import GHC.Stats
 import System.Environment (lookupEnv)
-import System.IO.Unsafe (unsafePerformIO)
 import System.Posix.Process (getProcessID)
 import System.Process (readProcess)
 import Text.Printf (printf)
@@ -73,43 +92,99 @@ baseLevelSizes :: [Word32]
 baseLevelSizes = [205000, 205000, 205000, 205000, 205000, 128945, 101885, 61090, 27060, 1000]
 
 -- | Reads @PERSIST_BENCH_SCALE@ (defaulting to @1.0@ when unset or
--- unparseable) and returns the scaled level-size vector, each entry floored
--- at 1.
+-- unparseable).
 readScale :: IO Double
 readScale = do
   mScale <- lookupEnv "PERSIST_BENCH_SCALE"
   pure (fromMaybe 1.0 (mScale >>= readMaybe))
 
+-- | The scaled level-size vector, each entry floored at 1.
 scaledLevelSizes :: Double -> [Word32]
 scaledLevelSizes scale = map scaleOne baseLevelSizes
  where
   scaleOne base = max 1 (round (fromIntegral base * scale :: Double))
 
 ----------------------------------------
--- Benchmark-only rerun counter
+-- Counting interceptor + adapted driver
 ----------------------------------------
 
-{- | 'CompM' has no sanctioned way to run 'IO' inside a computation body (no
- @liftIO@), unlike the Rust benchmark's async bodies which do a plain
- @run_counter.fetch_add@. This is a benchmark-only escape hatch via
- 'unsafePerformIO', exactly as anticipated by the benchmark spec.
--}
-{-# NOINLINE benchRerunCounter #-}
-benchRerunCounter :: IORef Int
-benchRerunCounter = unsafePerformIO (newIORef 0)
+{- | Wraps a 'CompEngineStateIf' so every call to 'capEvaluationStarted' --
+ the engine's own per-instance "about to run this computation body" hook,
+ called exactly once immediately before each real (non-cache-hit)
+ invocation -- first bumps @ref@, then delegates to the original
+ implementation. All other fields delegate unchanged.
 
-{- | Bump 'benchRerunCounter' and return @()@. Takes the (otherwise unused)
- instance parameter as an argument and forces it with 'seq': this keeps
- GHC's full-laziness float-out from turning the 'unsafePerformIO' call into
- a single shared top-level thunk that would only ever run once.
+ Built as an explicit record rather than a record update
+ (@orig { capEvaluationStarted = ... }@): most fields are higher-rank
+ (@forall a. IsCompResult a => ...@), and GHC rejects record-update syntax
+ against a record with higher-rank fields.
 -}
-{-# NOINLINE bumpRerunCounter #-}
-bumpRerunCounter :: a -> ()
-bumpRerunCounter x =
-  x `seq` unsafePerformIO (atomicModifyIORef' benchRerunCounter (\n -> (n + 1, ())))
+countingStateIf :: IORef Int -> CompEngineStateIf IO -> CompEngineStateIf IO
+countingStateIf ref orig =
+  CompEngineStateIf
+    { lookupCapResult = lookupCapResult orig
+    , capEvaluationStarted = \cap -> do
+        atomicModifyIORef' ref (\n -> (n + 1, ()))
+        capEvaluationStarted orig cap
+    , capEvaluationFinished = capEvaluationFinished orig
+    , dequeueGivenCap = dequeueGivenCap orig
+    , dequeueNextCap = dequeueNextCap orig
+    , staleQueueSize = staleQueueSize orig
+    , enqueueStaleCaps = enqueueStaleCaps orig
+    , trackOutput = trackOutput orig
+    , getCompSinkOuts = getCompSinkOuts orig
+    , getQueue = getQueue orig
+    }
 
-readRerunCounter :: IO Int
-readRerunCounter = readIORef benchRerunCounter
+{- | Adapted from 'compDriver'' (see
+ "Control.Computations.CompEngine.Driver"): identical driver-loop wiring,
+ but wraps the state-if record with 'countingStateIf' before building
+ 'CompEngineIfs', so every genuine computation-body invocation is honestly
+ counted in @counterRef@.
+-}
+benchCompDriver
+  :: (IsCompParam p, IsCompResult r)
+  => IORef Int
+  -> TVar (Option RunStats)
+  -> (CompFlowRegistry -> IO () -> IO ())
+  -> CompWireM (Comp p r)
+  -> p
+  -> IO ()
+benchCompDriver counterRef runVar withRegisteredFlows wireComps startVal = do
+  reg <- newCompFlowRegistry
+  withStateIf $ \stateIf -> withRegisteredFlows reg $ do
+    let ifs =
+          CompEngineIfs
+            { ce_compFlowRegistry = reg
+            , ce_stateIf = countingStateIf counterRef stateIf
+            }
+        rifs =
+          RunCompEngineIf
+            { rcif_shouldStartWithRun = shouldStartNextRun stateIf reg runVar
+            , rcif_emptyChangesMode = Block
+            , rcif_getTime = getCurrentTime
+            , rcif_maxLoopRunTime = seconds 10
+            , rcif_maxRunIterations = CompRunUnlimitedIterations
+            , rcif_reportGarbage = garbageHandler reg
+            }
+    comps <- rootComps
+    runCompEngine ifs comps rifs ()
+ where
+  runDeletes stateIf reg =
+    do
+      logNote "Deleting leftovers from previous program run"
+      forAllSinks_ reg (deleteDeadOutputs stateIf)
+  shouldStartNextRun stateIf reg runVarLocal nRun hadChanges nStaleCaps state =
+    do
+      when (nRun == 1) (runDeletes stateIf reg)
+      let !stats = RunStats{rs_run = nRun, rs_hadChanges = hadChanges, rs_staleCaps = nStaleCaps}
+      atomically $ writeTVar runVarLocal (Some stats)
+      pure (startNextRun, state)
+  rootComps = (failInM . fmap snd) $
+    runCompWireM $
+      do
+        c <- wireComps
+        pure [wrapCompAp (mkCompAp c startVal)]
 
 ----------------------------------------
 -- Flow wiring
@@ -146,7 +221,6 @@ parseWord64 = readMaybe . BSC.unpack
 -- the parsed value or 0; result is @base + i + d@ (all wrapping 'Word64').
 level0Body :: Word64 -> Word32 -> CompM Word64
 level0Body dWord i = do
-  let !_ = bumpRerunCounter i
   mval <- compSrcReq kvSrcId (HashMapLookupReq (srcKeyFor i))
   let base = fromMaybe 0 (mval >>= parseWord64)
   pure (base + fromIntegral i + dWord)
@@ -157,8 +231,7 @@ level0Body dWord i = do
 -- Top-level instances additionally write their result to the doc sink.
 higherLevelBody :: Level -> Word32 -> Bool -> Word64 -> Word32 -> CompM Word64
 higherLevelBody prevLevel prevSize isTop dWord i = do
-  let !_ = bumpRerunCounter i
-      c0 = (i * 2 + 1) `mod` prevSize
+  let c0 = (i * 2 + 1) `mod` prevSize
       c1 = (i * 7 + 13) `mod` prevSize
       c2 = (i * 31 + 101) `mod` prevSize
       pick c = prevLevel !! fromIntegral (c `mod` fromIntegral defsPerLevel)
@@ -204,8 +277,7 @@ wireAllComps sizes = do
       topSize = last sizes
       groups = [[i | i <- [0 .. topSize - 1], i `mod` fromIntegral defsPerLevel == g] | g <- [0 .. fromIntegral defsPerLevel - 1]]
   wireComp $
-    defineComp "root" fullCaching $ \() -> do
-      let !_ = bumpRerunCounter ()
+    defineComp "root" fullCaching $ \() ->
       forM_ (zip topLevel groups) $ \(comp, is) -> mapM_ (evalCompOrFail comp) is
 
 ----------------------------------------
@@ -257,8 +329,9 @@ benchMain = do
     hmfInsert kv (BSC.pack (show k)) (BSC.pack (show (fromIntegral k * 7 + 3 :: Word64)))
 
   runVar <- newTVarIO None
+  counterRef <- newIORef 0
   t0 <- getCurrentTime
-  engineHandle <- async (compDriver' runVar (withCompFlows kv docSink) (wireAllComps sizes) ())
+  engineHandle <- async (benchCompDriver counterRef runVar (withCompFlows kv docSink) (wireAllComps sizes) ())
 
   -- Cold settle: the *entire* initial evaluation runs synchronously inside
   -- Impl.startCompEngine, before the driver loop's first
@@ -267,7 +340,7 @@ benchMain = do
   -- eval has finished.
   rs1 <- waitForRunAtLeast runVar 1
   tCold <- getCurrentTime
-  coldReruns <- readRerunCounter
+  coldReruns <- readIORef counterRef
   rssCold <- getRssMb
 
   let coldWallTime = realToFrac (diffUTCTime tCold t0) :: Double
@@ -303,7 +376,7 @@ benchMain = do
   -- complete before mutating, so the live-update measurement below is
   -- attributable to *only* our mutation.
   rs2 <- waitForRunAtLeast runVar (rs_run rs1 + 1)
-  preLiveReruns <- readRerunCounter
+  preLiveReruns <- readIORef counterRef
   when (preLiveReruns /= coldReruns) $
     putStrLn
       ( "NOTE: draining leftover pre-population changes triggered "
@@ -318,7 +391,7 @@ benchMain = do
   hmfInsert kv "0" "13371337"
   _rs3 <- waitForRunAtLeast runVar (rs_run rs2 + 1)
   tAfterMutate <- getCurrentTime
-  liveReruns <- readRerunCounter
+  liveReruns <- readIORef counterRef
   let liveWallTime = realToFrac (diffUTCTime tAfterMutate tBeforeMutate) :: Double
       liveRerunCount = liveReruns - preLiveReruns
 
