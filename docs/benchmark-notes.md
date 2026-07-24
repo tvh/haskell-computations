@@ -350,6 +350,63 @@ cross-*session* comparisons at scale 1.0 carry far more variance than the
 within-session run-to-run spread suggests; conclusions should rest on
 same-session A/B pairs, as this stage's do.
 
+## Stage 2 — CompM over IO, GenHaxl shape (commit `08be56a`) — mixed result
+
+The representation swap the research section sketched: `CompM a` becomes
+`CompMEnv -> IO (CompYield a)` with `cme_deps :: IORef [CompEngDep]` as a
+mutable accumulator. `tellDep` conses (strict fold + `modifyIORef'`);
+`compMBind`/`compMAp` no longer thread or union `DepSet`s at all — both
+sides of an `<*>` share the env's IORef, and the partial-deps-on-failure
+and run-both-sides applicative semantics fall out of sequencing both IO
+actions before dispatching on results. `CompYield`/`CompReq`/`ContCompM`
+(suspension protocol, smart-view continuations) byte-for-byte unchanged;
+`Impl.hs` allocates one fresh IORef per cap evaluation and dedupes once at
+finish. No IO leak to user code: the public facade re-exports `CompM`
+abstractly (verified by attempted misuse failing to compile); no
+`MonadIO` instance exists. Tests: 70/70 + app suite, no adjustments.
+
+### Numbers (same-session alternating A/B, parent = `8fb682c`)
+
+| Scale/config | cold | live | RSS settle | max_live |
+|---|---|---|---|---|
+| 0.1 default | flat (2.68 s) | 0.411 → 0.524 s (**+27%**) | — | +1.9% |
+| 0.1 `-A64m` | 1.94 → 1.57 s (**−19%**) | +8% | — | +2.9% |
+| 1.0 default | −2.7% | 22.6 → 26.5 s (**+18%**) | 1907 → 2255 MB (**+18%**) | +2.6% |
+| 1.0 `-A64m` | 28.3 → 22.4 s (**−21%**) | 19.4 → 23.1 s (**+19%**) | +14% | flat |
+
+Cold eval: flat to **−21%**. Live update: **+8–27% worse at every
+scale/config pair** — the opposite of the design's hope, and on the metric
+this arc cares most about. RSS flat-to-worse at 1.0.
+
+### Why (profile, scale 0.1)
+
+The per-bind union cost really is gone — but it was replaced by a
+per-suspend cost that is bigger in this regime. The engine loop's
+`case runCompM gen r of ...` used to be a *pure, bind-free* pattern match;
+it is now `yield <- liftIO (runCompM gen env)` — a real `>>=` in
+`CompEngineM`'s `StateT`-over-IO stack at every suspend/resume step. Two
+new cost centers (`$fMonadCompEngineM_$s$fMonadStateT_$c>>=` 3.9% + sibling
+0.7%) appeared, exceeding the savings; `compMBind.\` barely moved (2.0 →
+1.8%). Total profiled ticks +56% with alloc only +1.7% — the cost is
+sequencing, not allocation. The live path has the worst ratio of
+suspend/resume round trips to useful work, hence it regresses hardest.
+The trivial-bodies caveat cuts both ways here: real workloads would dilute
+this per-suspend tax.
+
+### Disposition — kept, pending one targeted follow-up
+
+Not reverted yet: the cold-eval win is real, the dep-union deletion is the
+architecturally right direction (and prerequisite groundwork for the
+delimited-continuations endgame), and the regression has a *specific,
+identified* mechanism rather than being diffuse: `CompEngineM`'s
+un-specialized monad-stack bind on the suspend path. Obvious next levers,
+in order: `INLINE`/`SPECIALIZE` the `CompEngineM` bind (classic fix for
+exactly this cost-center shape), restructure the loop to stay in IO across
+suspend/resume and only re-enter `CompEngineM` at round boundaries, or
+lazily allocate the per-cap IORef. If none of those recover the live-update
+regression, revert this stage — the doc's own rule: same-session A/B
+decides.
+
 ## Not tried yet / open items
 
 - **The Interlude-2 diet, measured.** The Rust notes list a ranked, concrete
