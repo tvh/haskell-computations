@@ -60,6 +60,7 @@ import Data.HashMap.Strict (HashMap)
 import qualified Data.HashMap.Strict as HashMap
 import Data.HashSet (HashSet)
 import qualified Data.HashSet as HashSet
+import Data.IORef
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Typeable
@@ -220,9 +221,21 @@ logStale changerepr foldable =
 dependOn :: AnyCompSrcDep -> CompM ()
 dependOn = tellDep . HashSet.singleton . CompEngDepSrc
 
+{- | Records dependencies for the cap currently being evaluated. Appends to
+ the per-cap-evaluation accumulator ('CompMEnv's 'cme_deps') instead of
+ returning a 'HashSet' for the caller to union in -- the Haxl-shaped fix
+ that kills the per-bind 'HashSet' allocation/union (see
+ docs/benchmark-notes.md's Stage 2 notes). The fold is strict so the
+ accumulator's list spine is fully built as we go rather than left as a
+ chain of `(++)` thunks hanging off the 'IORef'.
+-}
 tellDep :: DepSet -> CompM ()
-tellDep dep =
-  CompM $ \_r -> (dep, CompFinished (CompResultOk ()))
+tellDep deps
+  | HashSet.null deps = compMFinished (CompResultOk ())
+  | otherwise =
+      CompM $ \env -> do
+        modifyIORef' (cme_deps env) (\old -> HashSet.foldl' (flip (:)) old deps)
+        return (CompFinished (CompResultOk ()))
 
 data CompEngineIfs = CompEngineIfs
   { ce_compFlowRegistry :: CompFlowRegistry

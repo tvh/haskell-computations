@@ -34,6 +34,7 @@ module Control.Computations.CompEngine.Types (
 
   -- * Monad for building computation bodies
   CompM (..),
+  CompMEnv (..),
   CompYield (..),
   CompResult (..),
   CompReq (..),
@@ -103,8 +104,8 @@ import Control.Computations.Utils.Types
 import Control.Monad.Reader
 import Data.Function (on)
 import Data.HashSet (HashSet)
-import qualified Data.HashSet as HashSet
 import Data.Hashable
+import Data.IORef
 import qualified Data.LargeHashable as LH
 import Data.Map.Strict (Map)
 import Data.Ord
@@ -223,9 +224,39 @@ instance Eq (CompCacheValue a) where
 ccv_cacheSize :: CompCacheValue a -> Option DataSize
 ccv_cacheSize = ccm_approxCachedSize . ccv_meta
 
--- | Monad running the body of a computation
+{- | The (mutable, per-cap-evaluation) environment threaded through a single
+ 'CompM' computation. 'cme_compMap' is the same passthrough plumbing the old
+ pure-Reader design carried (nothing in CompM's own machinery inspects it;
+ kept for parity). 'cme_deps' is the dependency accumulator: 'tellDep'
+ conses onto it directly instead of every bind allocating and unioning a
+ 'HashSet' -- the Haxl-shaped fix (see docs/benchmark-notes.md's research
+ section on GenHaxl). It is scoped to exactly one top-level cap evaluation:
+ "Control.Computations.CompEngine.Impl" allocates a fresh one per
+ `evalCompAp` call and reads+dedupes it exactly once, at the end.
+-}
+data CompMEnv = CompMEnv
+  { cme_compMap :: CompMap
+  , cme_deps :: IORef [CompEngDep]
+  }
+
+{- | Monad running the body of a computation.
+
+ Represented directly over 'IO' (a GenHaxl-shaped resumption monad -- see
+ "There is no Fork", Marlow et al, ICFP'14): the suspension protocol
+ ('CompYield'/'CompSuspended'/'ContCompM') is unchanged, only what runs
+ *between* suspends changed from a pure function returning a paired
+ dependency set to an 'IO' action that appends to a shared accumulator.
+
+ The 'CompM' constructor and 'runCompM' accessor are deliberately exported
+ here (needed by this module, "Core", and "Impl" to build/run computations)
+ but are NOT re-exported through the public "Control.Computations.CompEngine"
+ facade -- see that module's import of this one. Without that restriction, a
+ computation body could construct a 'CompM' value by hand and smuggle
+ arbitrary IO into the engine; only engine-internal modules that import this
+ module directly may do so.
+-}
 newtype CompM a = CompM
-  { runCompM :: CompMap -> (DepSet, CompYield a)
+  { runCompM :: CompMEnv -> IO (CompYield a)
   }
   deriving (Functor)
 
@@ -309,55 +340,52 @@ compMAp
   -> CompM a
   -> CompM b
 compMAp mf mb =
-  CompM $ \r ->
-    let !(wF, resA) = runCompM mf r
-        !(wB, resB) = runCompM mb r
-        -- We always track both dependencies.
-        -- This is not strictly identical to the Monadic implementation,
-        -- but it is still correct.
-        !w' = wF <> wB
-        !res =
-          case (resA, resB) of
-            (CompFinished (CompResultOk f), CompFinished (CompResultOk b)) ->
-              -- The base case.
-              CompFinished (CompResultOk (f b))
-            (CompFinished (CompResultFail e), _) ->
-              -- Keep only the left error. Consistent with the monadic case
-              CompFinished (CompResultFail e)
-            (_, CompFinished (CompResultFail e)) ->
-              CompFinished (CompResultFail e)
-            (CompFinished (CompResultOk f), CompSuspended req g) ->
-              -- Store the finished value into the continuation
-              CompSuspended req (\x -> f :<$> g x)
-            (CompSuspended req g, CompFinished (CompResultOk b)) ->
-              -- Same as above
-              CompSuspended req (\f -> ($ b) :<$> g f)
-            (CompSuspended reqF contA, CompSuspended reqB contB) ->
-              -- Both computations are suspended so we combine the suspends into one.
-              -- This could be used to exploit parallelism.
-              CompSuspended (CompReqCombined reqF reqB) (\(f, b) -> contA f <*> contB b)
-     in (w', res)
+  CompM $ \env -> do
+    -- Both sides always run -- and so always append whatever deps they
+    -- touch to the shared `env` accumulator, even under the left-error
+    -- bias below. This is the same guarantee the old pure implementation
+    -- gave by unconditionally forcing both `(w, res)` pairs before ever
+    -- inspecting them; here it falls out of simply awaiting both actions
+    -- before the case dispatch.
+    resA <- runCompM mf env
+    resB <- runCompM mb env
+    case (resA, resB) of
+      (CompFinished (CompResultOk f), CompFinished (CompResultOk b)) ->
+        -- The base case.
+        return (CompFinished (CompResultOk (f b)))
+      (CompFinished (CompResultFail e), _) ->
+        -- Keep only the left error. Consistent with the monadic case
+        return (CompFinished (CompResultFail e))
+      (_, CompFinished (CompResultFail e)) ->
+        return (CompFinished (CompResultFail e))
+      (CompFinished (CompResultOk f), CompSuspended req g) ->
+        -- Store the finished value into the continuation
+        return (CompSuspended req (\x -> f :<$> g x))
+      (CompSuspended req g, CompFinished (CompResultOk b)) ->
+        -- Same as above
+        return (CompSuspended req (\f -> ($ b) :<$> g f))
+      (CompSuspended reqF contA, CompSuspended reqB contB) ->
+        -- Both computations are suspended so we combine the suspends into one.
+        -- This could be used to exploit parallelism.
+        return (CompSuspended (CompReqCombined reqF reqB) (\(f, b) -> contA f <*> contB b))
 
 compMBind
   :: CompM a
   -> (a -> CompM b)
   -> CompM b
 compMBind m f =
-  CompM $ \r ->
-    let !(!w, res) = runCompM m r
-     in case res of
-          CompFinished (CompResultFail e) -> (w, CompFinished (CompResultFail e))
-          CompFinished (CompResultOk a) ->
-            let (w', res') = runCompM (f a) r
-                !w'' = w <> w'
-             in (w'', res')
-          CompSuspended req g -> (w, CompSuspended req (\x -> g x :>>= f))
+  CompM $ \env -> do
+    res <- runCompM m env
+    case res of
+      CompFinished (CompResultFail e) -> return (CompFinished (CompResultFail e))
+      CompFinished (CompResultOk a) -> runCompM (f a) env
+      CompSuspended req g -> return (CompSuspended req (\x -> g x :>>= f))
 
 compMFinished :: CompResult a -> CompM a
 compMFinished ev = compMYield (CompFinished ev)
 
 compMYield :: CompYield a -> CompM a
-compMYield ret = CompM $ \_ -> (HashSet.empty, ret)
+compMYield ret = CompM $ \_env -> return ret
 
 doAnyRequest :: CompReq a -> CompM a
 doAnyRequest req =

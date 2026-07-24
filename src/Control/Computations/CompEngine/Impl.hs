@@ -40,6 +40,7 @@ import Control.Monad.State
 import qualified Data.Foldable as F
 import qualified Data.HashMap.Strict as HashMap
 import qualified Data.HashSet as HashSet
+import Data.IORef
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import qualified Data.Text as T
@@ -194,7 +195,18 @@ evalCompAp
 evalCompAp outerCap =
   do
     logDebug ("Evaluating " ++ show outerCap)
-    result@(_, !ev) <- fmap (fmap (fmap (compApResult outerCap))) $ loop (initCompAp outerCap)
+    -- Fresh per-cap-evaluation dependency accumulator (see CompMEnv's
+    -- haddock in Types.hs). `env` is threaded explicitly through every
+    -- helper below rather than captured via a Reader in CompEngineM: its
+    -- lifetime is scoped to exactly this one evaluation, and explicit
+    -- threading makes that scoping visible instead of relying on someone
+    -- remembering to reset a Reader-carried ref between nested cap evals.
+    depsRef <- liftIO (newIORef [])
+    let env = CompMEnv{cme_compMap = r, cme_deps = depsRef}
+    finalResult <- loop env (initCompAp outerCap)
+    accumulated <- liftIO (readIORef depsRef)
+    let !deps = HashSet.fromList accumulated
+        !ev = fmap (compApResult outerCap) finalResult
     logDebug
       ( show outerCap
           ++ " --> "
@@ -209,7 +221,7 @@ evalCompAp outerCap =
                 CompResultFail msg -> msg
              )
       )
-    return result
+    return (deps, ev)
  where
   r =
     case outerCap of
@@ -217,37 +229,40 @@ evalCompAp outerCap =
   doAnyEvalReq
     :: forall a x
      . IsCompResult x
-    => CompAp x
+    => CompMEnv
+    -> CompAp x
     -> CompCont (Maybe (CompApResult x)) a
-    -> CompEngineM (DepSet, CompResult a)
-  doAnyEvalReq innerCap k =
-    evalWithCache False innerCap k (doCompAp innerCap)
+    -> CompEngineM (CompResult a)
+  doAnyEvalReq env innerCap k =
+    evalWithCache env False innerCap k (doCompAp innerCap)
 
   doAnyCacheReq
     :: forall a x
      . IsCompResult x
-    => CompAp x
+    => CompMEnv
+    -> CompAp x
     -> CompCont (Maybe x) a
-    -> CompEngineM (DepSet, CompResult a)
-  doAnyCacheReq innerCap k =
-    evalWithCache True innerCap (k . fmap cr_returnValue) (return Nothing)
+    -> CompEngineM (CompResult a)
+  doAnyCacheReq env innerCap k =
+    evalWithCache env True innerCap (k . fmap cr_returnValue) (return Nothing)
 
   evalWithCache
     :: forall a x
      . IsCompResult x
-    => Bool
+    => CompMEnv
+    -> Bool
     -> CompAp x
     -> CompCont (Maybe (CompApResult x)) a
     -> CompEngineM (Maybe (CompApResult x))
-    -> CompEngineM (DepSet, CompResult a)
-  evalWithCache staleOk cap k f =
+    -> CompEngineM (CompResult a)
+  evalWithCache env staleOk cap k f =
     withCompState (flip lookupCapResult cap)
       >>= withCapLookup cap f cont (evalWithCapCached cap f cont staleOk)
    where
     cont
       :: Maybe (CompApResult x)
-      -> CompEngineM (DepSet, CompResult a)
-    cont x = loop (contToCompM $ k x)
+      -> CompEngineM (CompResult a)
+    cont x = loop env (contToCompM $ k x)
 
   evalWithCapCached
     :: forall a b
@@ -319,11 +334,12 @@ evalCompAp outerCap =
   doCompSinkReq
     :: forall x a s
      . (CompSink s)
-    => TypedCompSinkId s
+    => CompMEnv
+    -> TypedCompSinkId s
     -> CompSinkReq s a
     -> CompCont (Fail a) x
-    -> CompEngineM (DepSet, CompResult x)
-  doCompSinkReq sinkId req cont = do
+    -> CompEngineM (CompResult x)
+  doCompSinkReq env sinkId req cont = do
     let sinkFun sink = do
           (outputs, res) <- liftIO $ compSinkExecute sink req
           return (wrapCompSinkOuts sink outputs, pure res)
@@ -336,16 +352,17 @@ evalCompAp outerCap =
            in pure (emptyAnyCompOutSinksMap, return (Fail msg))
     tellOutputs (AnyCompAp outerCap) outputs
     withCompState (\sif -> trackOutput sif outerCap outputs)
-    loop (action >>= contToCompM . cont)
+    loop env (action >>= contToCompM . cont)
 
   doCompSrcReq
     :: forall x a s
      . CompSrc s
-    => TypedCompSrcId s
+    => CompMEnv
+    -> TypedCompSrcId s
     -> CompSrcReq s a
     -> CompCont (Fail a) x
-    -> CompEngineM (DepSet, CompResult x)
-  doCompSrcReq srcId req cont = do
+    -> CompEngineM (CompResult x)
+  doCompSrcReq env srcId req cont = do
     let srcFun src = do
           (inputs, res) <- liftIO $ compSrcExecute src req
           let retVal =
@@ -360,42 +377,44 @@ evalCompAp outerCap =
         Fail reason ->
           let msg = "Refusing to run request for data source " ++ show srcId ++ ": " ++ reason
            in pure (return (Fail msg))
-    loop (action >>= contToCompM . cont)
+    loop env (action >>= contToCompM . cont)
 
   doSuspended
     :: forall x a
-     . CompReq a
+     . CompMEnv
+    -> CompReq a
     -> CompCont a x
-    -> CompEngineM (DepSet, CompResult x)
-  doSuspended req cont =
+    -> CompEngineM (CompResult x)
+  doSuspended env req cont =
     case req of
-      CompReqFlow (CompFlowReqSrc src req) -> doCompSrcReq src req cont
-      CompReqFlow (CompFlowReqSink sink req) -> doCompSinkReq sink req cont
-      CompReqEval compAp -> doAnyEvalReq compAp cont
-      CompReqCache compAp -> doAnyCacheReq compAp cont
+      CompReqFlow (CompFlowReqSrc src req) -> doCompSrcReq env src req cont
+      CompReqFlow (CompFlowReqSink sink req) -> doCompSinkReq env sink req cont
+      CompReqEval compAp -> doAnyEvalReq env compAp cont
+      CompReqCache compAp -> doAnyCacheReq env compAp cont
       CompReqCombined reqA reqB -> do
         -- TODO: Make this bit parrallel
-        (wA, resA) <- doSuspended reqA return
-        (wB, resB) <- doSuspended reqB return
+        -- Both branches share `env`, so whatever either records via
+        -- tellDep lands directly in the shared accumulator -- no manual
+        -- union needed (contrast the old `tellDep (wA <> wB)` below it
+        -- replaced).
+        resA <- doSuspended env reqA return
+        resB <- doSuspended env reqB return
         let resCont =
               do
-                tellDep (wA <> wB)
                 res <- (,) <$> compMFinished resA <*> compMFinished resB
                 contToCompM (cont res)
-        loop resCont
+        loop env resCont
 
   loop
     :: forall x
-     . CompM x
-    -> CompEngineM (DepSet, CompResult x)
-  loop gen =
-    case runCompM gen r of
-      (w, CompFinished finalResult) ->
-        return (w, finalResult)
-      (w, CompSuspended req cont) -> do
-        (!w', res) <- doSuspended req cont
-        let !w'' = w <> w'
-        return (w'', res)
+     . CompMEnv
+    -> CompM x
+    -> CompEngineM (CompResult x)
+  loop env gen = do
+    yield <- liftIO (runCompM gen env)
+    case yield of
+      CompFinished finalResult -> return finalResult
+      CompSuspended req cont -> doSuspended env req cont
 
 execAp :: AnyCompAp -> CompEngineM ()
 execAp (AnyCompAp cap) = void $ doCompAp cap
