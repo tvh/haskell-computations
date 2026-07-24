@@ -443,6 +443,40 @@ Disposition: **Stage 2 + 2.5 kept.** Cumulative best-config numbers at 1M
 now: cold **20.2 s**, live **14.8 s** — versus Stage 0's 42.8 s / 24.4 s
 (different sessions, so indicative only; but the direction is settled).
 
+## Interlude — compiler upgrade: GHC 9.4.5 → 9.10.3, lts-24.51 (commit `b220764`)
+
+Done before the columnar rework specifically to isolate compiler effects
+from the rework's A/B. Three findings, one of them the headline.
+
+**Correction first**: every stage above ran on **GHC 9.4.5** (resolver
+`nightly-2023-05-08`), not the "GHC 9.10.3" the runtime-research section
+claimed — that was ghcup's default toolchain, never what `stack build`
+used. Consequence worth knowing: the delimited-continuation primops
+(`prompt#`/`control0#`) landed in GHC 9.6, so the "CompM over delcont"
+endgame was *not actually available* until this upgrade. It is now.
+
+**Performance: flat.** Same-session A/B, old side built from a pristine
+worktree at `9a1e675` on 9.4.5, new side `b220764` on 9.10.3 (isolation is
+"resolver + minimal compat fixes": a few explicit imports for newer mtl,
+`-Wno-x-partial`; nothing touching engine code). At `-A64m` — the doc's
+conclusion-carrying config — both scales are within noise: 1.0 cold
+18.66 → 18.62 s, live 13.86 → 13.96 s, max_live 1846 → 1854 MB. The
+compiler bump neither pays nor costs; the optimization arc's numbers
+carry over.
+
+**⚠ Headline: GHC 9.10.3 exposes a latent driver race.** With the default
+4 MB nursery, the driver deadlocks ("thread blocked indefinitely in an STM
+transaction") immediately after cold-eval settle — **100% of scale-1.0
+attempts (2/2), 5/6 at scale 0.1**; also reproduced at `-A8m` and `-N1`.
+Not reproduced on 9.4.5 (4/4 clean, same code); vanishes at nursery
+≥16 MB (`-A16m`/`-A64m` 3/3 clean). The compat fixes touch no
+STM/concurrency code, so this reads as a GHC 9.4→9.10 scheduler/GC timing
+change surfacing a pre-existing race in the driver — very plausibly the
+same latent bug behind Stage 0.5's `-N1` deadlock on 9.4.5. Needs its own
+investigation (deliberately not attempted inside the resolver-bump
+change). **Benchmark policy until fixed: `-A64m` is the standard config
+on 9.10.3; default-RTS rows can't be collected.**
+
 ## Memory roadmap — the path to Rust parity ("nothing off the table")
 
 Where we stand at 1M caps (Stage 1/2 measurements): `max_live_bytes`
