@@ -407,6 +407,86 @@ lazily allocate the per-cap IORef. If none of those recover the live-update
 regression, revert this stage — the doc's own rule: same-session A/B
 decides.
 
+## Memory roadmap — the path to Rust parity ("nothing off the table")
+
+Where we stand at 1M caps (Stage 1/2 measurements): `max_live_bytes`
+~1.69–1.85 GB (**~1.7–1.85 kB/cap live**), RSS ~2.0–2.3 GB. Rust Stage 5
+engine-only: 328–354 MB RSS (**~330 B/node**). Gap: **~6–7× on RSS**. The
+Rust notes' Interludes 1–3 (written against this codebase) map the options;
+this section turns them into a decision.
+
+### Why the incremental diet alone stalls at ~2× (do not stop there)
+
+The Interlude-2 items — delete `sifs_vermap` (−64 B/cap), move
+`ccm_logrepr`/`ccm_approxCachedSize` onto per-def `CompCacheBehavior`
+(−88, also kills a `show` per rerun), drop the `OM.insert key mempty`
+empty-outputs entries (−56), flatten the five-box cache-value tower into
+`data Cached = forall a. CachedOk !a !Hash128 | CachedHashOnly !Hash128 |
+CachedFail` (−70–90), dict dedup + tag hoisting (−27), unboxed edge
+vectors + dropping `VerList`'s version level for flat rdeps + a changed
+bit (−~500, semantics change) — sum to a projected **~565–600 B/cap
+live**. But live heap is not RSS: GHC's copying collector holds ~2× live
+(`-F 2`) plus to-space during major GCs, so ~600 B/cap live is still
+**~1.2–1.8 GB RSS — 4–5× Rust**, forever, no matter how disciplined the
+boxed representation gets. That multiplier is the wall; the Rust notes'
+"What no diet fixes" section called it precisely.
+
+### The equalizer: columnar-unboxed state (Interlude 3's Tier 2)
+
+The only identified move that reaches ~1×: replace `SimpleStateIf`'s
+containers with per-def struct-of-arrays behind the existing
+`CompEngineStateIf` seam (an interface record — `Impl.hs` doesn't change):
+
+- `param_hash`/`result_hash`/`flags` → unboxed columns
+  (`Data.Vector.Unboxed`/`MutablePrimArray`): 16/16/1 B per row, flat.
+- Edges → per-row unboxed `Int` arrays or CSR-with-slack: ~40–90 B/cap
+  both directions vs today's boxed-record-in-HAMT ~790 B.
+- Typed value + param columns live on the per-def `Comp p a` record where
+  both types are statically known — the same trick as Rust's
+  `CompDef<P, R>` typed column; existentials survive only at the
+  already-existing `AnyComp` boundary. (`Vector (Maybe a)` boxes every
+  element — use a has-result bit + separate column instead.)
+- Per-def index `HashMap Hash128 Int` (~40–64 B/cap); Stage 1's intern
+  table shrinks to this role.
+- Adopts flat-rdeps + changed-bit (the `VerList` semantics change) as part
+  of the rewrite, as Interlude 3 assumed.
+
+**The Haskell-specific payoff — why this reaches parity when nothing else
+does**: large unboxed `ByteArray#`s live in the large-object area — never
+scanned, never copied. The 2–3× GC multiplier then applies only to the
+small boxed residue (~50 B/cap). Projected: **~170–250 B/cap, RSS
+~250–350 MB ≈ Rust Stage 5's 328–354 MB.** Shake interning keys to `Int`
+and storing flat records is the existence proof that this is idiomatic,
+not exotic. Costs: `atomically` composability at the state layer (an
+`MVar`/IO suffices — `stepCompEngine` is sequential), and the STM
+free-snapshot advantage for a future persistence flusher is spent back.
+
+### Recommended sequencing
+
+1. **Go straight to columnar-unboxed** (Tier B). Do NOT burn a week on
+   the boxed diet first: vermap, logrepr, empty-outputs, and the box
+   tower all *die automatically* in the columnar rewrite; only the
+   cache-behavior API change (logrepr → per-def) is worth landing early
+   since it's user-visible API and kills per-rerun `show` work.
+2. Stage the rewrite behind `CompEngineStateIf` with the test suite as
+   the referee at each step (the seam held for Stage 1; trust it).
+3. After: RTS pass (`-F`, `-A`, `--nonmoving-gc`, compact regions for the
+   surviving identity objects) — small dials on a small boxed residue.
+4. Optional floor below parity: the eviction knob is already typed —
+   `CapMetaCached` vs `CapValueCached` (`Core.hs:140`), and
+   `evalWithCapCached` handles the meta-only case by recomputing today.
+   Demoting cold values at runtime is a state transition, not new
+   machinery: ~60–100 B/cap floor, memory becomes a knob.
+
+Honest risks: this is the deepest change yet (bigger than Stage 1 and 2
+combined); mutable columns + laziness need the same id-lifecycle rigor
+Stage 1 established (ids in columns, `AnyCompAp` only at boundaries);
+GC of rows means free-lists and garbage-tolerant columns (Rust Stage 5's
+row-reuse rules transfer nearly verbatim); and the 2× write-amplification
+argument for persistent structures disappears — future persistence work
+inherits mutable-snapshot complexity Rust already solved (Stage 2's
+pending-map pattern ports back).
+
 ## Not tried yet / open items
 
 - **The Interlude-2 diet, measured.** The Rust notes list a ranked, concrete
