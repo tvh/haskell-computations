@@ -1,6 +1,6 @@
 cabal-version: 1.12
 
--- This file has been generated from package.yaml by hpack version 0.35.2.
+-- This file has been generated from package.yaml by hpack version 0.39.6.
 --
 -- see: https://github.com/sol/hpack
 
@@ -155,6 +155,7 @@ library
 executable incremental-computations-exe
   main-is: Main.hs
   other-modules:
+      Control.Computations.Demos.Bench.Main
       Control.Computations.Demos.DirSync.Main
       Control.Computations.Demos.DirSync.Tests
       Control.Computations.Demos.Hospital.CompDefs
@@ -224,6 +225,7 @@ executable incremental-computations-exe
     , monad-control
     , mtl
     , optparse-applicative
+    , process
     , psqueues
     , quickcheck-instances
     , random
