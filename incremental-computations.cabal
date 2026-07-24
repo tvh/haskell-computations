@@ -50,6 +50,7 @@ library
       Control.Computations.CompEngine.Tests.TestStateIf
       Control.Computations.CompEngine.Types
       Control.Computations.CompEngine.Utils.DepMap
+      Control.Computations.CompEngine.Utils.Intern
       Control.Computations.CompEngine.Utils.OutputsMap
       Control.Computations.CompEngine.Utils.PriorityAgingQueue
       Control.Computations.CompEngine.Utils.VerList

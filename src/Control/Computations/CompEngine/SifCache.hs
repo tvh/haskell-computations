@@ -2,6 +2,21 @@
 {-# LANGUAGE RecordWildCards #-}
 {-# OPTIONS_GHC -F -pgmF htfpp #-}
 
+{- | The cache of computation results, keyed by the caller-interned 'Int' id
+ of a cap (see "Control.Computations.CompEngine.Utils.Intern") rather than
+ by 'AnyCompAp' directly. This used to be a @Data.Map AnyCompAp@, whose
+ 'Ord' instance dispatches through 'eqT' on every comparison in every
+ O(log n) tree descent -- profiling identified this as one of the two
+ dominant costs in the engine (see docs/benchmark-notes.md, Stage 0.5's
+ profile). Keying by 'Int' instead turns every lookup/insert/delete into a
+ dense 'IntMap' operation with no 'eqT'/'Ord' dispatch at all.
+
+ Each entry still needs to know which 'CompId' it belongs to (for the
+ per-computation size bookkeeping in 'sifc_compToSize'), so 'insert' takes
+ the 'AnyCompAp' alongside its id purely to derive that -- and the derived
+ 'CompId' is cached per id in 'sifc_keyToCompId' so 'delete' only ever
+ needs the id.
+-}
 module Control.Computations.CompEngine.SifCache (
   SifCache,
   CompSize (..),
@@ -11,9 +26,7 @@ module Control.Computations.CompEngine.SifCache (
   delete,
   lookup,
   size,
-  toMap,
-  fromMap,
-  toList,
+  keysSet,
   totalInstanceCount,
   dataSizeForCompId,
   compIdSizeMap,
@@ -38,6 +51,9 @@ import Control.Computations.Utils.Types
 
 import Control.Monad.Identity
 import Data.Int
+import Data.IntMap.Strict (IntMap)
+import qualified Data.IntMap.Strict as IntMap
+import Data.IntSet (IntSet)
 import Data.List (foldl')
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -45,7 +61,10 @@ import Test.Framework
 import Prelude hiding (lookup, null)
 
 data AbstractSifCache a = AbstractSifCache
-  { sifc_keyToVal :: Map AnyCompAp a
+  { sifc_keyToVal :: IntMap a
+  , sifc_keyToCompId :: IntMap CompId
+  -- ^ the 'CompId' each entry belongs to, cached at insertion time so
+  -- 'delete' doesn't need to be handed an 'AnyCompAp' just to re-derive it.
   , sifc_compToSize :: Map CompId CompSize
   }
   deriving (Show, Eq)
@@ -108,66 +127,51 @@ instance HasSizes (CapResult AnyCompCacheValue) where
   intSize = fromCapResult None . fmap (anyCompCacheValueApply $ ccm_cachedSize . ccv_meta)
 
 empty :: AbstractSifCache a
-empty = AbstractSifCache Map.empty Map.empty
+empty = AbstractSifCache IntMap.empty IntMap.empty Map.empty
 
 size :: AbstractSifCache a -> Int
-size = Map.size . sifc_keyToVal
+size = IntMap.size . sifc_keyToVal
 
 null :: AbstractSifCache a -> Bool
-null = Map.null . sifc_keyToVal
+null = IntMap.null . sifc_keyToVal
 
-insert :: (HasSizes a) => AnyCompAp -> a -> AbstractSifCache a -> AbstractSifCache a
-insert key@(AnyCompAp cap) val cache@(AbstractSifCache keyToVal compToSize) =
+-- | The set of ids currently present in the cache.
+keysSet :: AbstractSifCache a -> IntSet
+keysSet = IntMap.keysSet . sifc_keyToVal
+
+insert :: (HasSizes a) => Int -> AnyCompAp -> a -> AbstractSifCache a -> AbstractSifCache a
+insert keyId (AnyCompAp cap) val cache@(AbstractSifCache keyToVal keyToCompId compToSize) =
   AbstractSifCache
-    { sifc_keyToVal = Map.insert key val keyToVal
+    { sifc_keyToVal = IntMap.insert keyId val keyToVal
+    , sifc_keyToCompId = IntMap.insert keyId compId keyToCompId
     , sifc_compToSize = Map.insert compId newCompSize compToSize
     }
  where
   newCompSize = oldCompIdSize `csPlus` newEntrySize `csMinus` oldEntrySize
   compId = capCompId cap
   oldCompIdSize = dataSizeForCompId compId cache
-  oldEntrySize = maybe mempty compSize $ Map.lookup key keyToVal
+  oldEntrySize = maybe mempty compSize $ IntMap.lookup keyId keyToVal
   newEntrySize = compSize val
 
-delete :: HasSizes a => AnyCompAp -> AbstractSifCache a -> AbstractSifCache a
-delete key@(AnyCompAp cap) cache@(AbstractSifCache keyToVal compToSize) =
-  AbstractSifCache
-    { sifc_keyToVal = Map.delete key keyToVal
-    , sifc_compToSize =
-        if oldCompIdSize == oldEntrySize
-          then Map.delete compId compToSize
-          else Map.insert compId (oldCompIdSize `csMinus` oldEntrySize) compToSize
-    }
- where
-  compId = capCompId cap
-  oldCompIdSize = dataSizeForCompId compId cache
-  oldEntrySize = maybe mempty compSize $ Map.lookup key keyToVal
+delete :: HasSizes a => Int -> AbstractSifCache a -> AbstractSifCache a
+delete keyId cache@(AbstractSifCache keyToVal keyToCompId compToSize) =
+  case IntMap.lookup keyId keyToCompId of
+    Nothing -> cache
+    Just compId ->
+      AbstractSifCache
+        { sifc_keyToVal = IntMap.delete keyId keyToVal
+        , sifc_keyToCompId = IntMap.delete keyId keyToCompId
+        , sifc_compToSize =
+            if oldCompIdSize == oldEntrySize
+              then Map.delete compId compToSize
+              else Map.insert compId (oldCompIdSize `csMinus` oldEntrySize) compToSize
+        }
+     where
+      oldCompIdSize = dataSizeForCompId compId cache
+      oldEntrySize = maybe mempty compSize $ IntMap.lookup keyId keyToVal
 
-lookup :: AnyCompAp -> AbstractSifCache a -> Maybe (AnyCompAp, a)
-lookup key cache =
-  -- NB: returns the key used in the map. This is super important
-  -- for sharing, SimpleStateIf relies in this.
-  case Map.lookupLE key (sifc_keyToVal cache) of
-    res@(Just (key', _)) | key' == key -> res
-    _ -> Nothing
-
-toMap :: AbstractSifCache a -> Map AnyCompAp a
-toMap = sifc_keyToVal
-
-fromMap :: HasSizes a => Map AnyCompAp a -> AbstractSifCache a
-fromMap keyToVal =
-  AbstractSifCache
-    { sifc_keyToVal = keyToVal
-    , sifc_compToSize = foldl' f Map.empty $ Map.toList keyToVal
-    }
- where
-  f compToSize (AnyCompAp cap, val) =
-    let compId = capCompId cap
-        oldSize = Map.findWithDefault mempty compId compToSize
-     in Map.insert compId (oldSize `csPlus` compSize val) compToSize
-
-toList :: AbstractSifCache a -> [(AnyCompAp, a)]
-toList = Map.toList . sifc_keyToVal
+lookup :: Int -> AbstractSifCache a -> Maybe a
+lookup keyId cache = IntMap.lookup keyId (sifc_keyToVal cache)
 
 compIdSizeMap :: AbstractSifCache a -> Map CompId CompSize
 compIdSizeMap = sifc_compToSize
@@ -185,19 +189,24 @@ instance HasSizes Int where
   dataSize = Some . bytes
   intSize = Some
 
-test_fromMap :: IO ()
-test_fromMap = assertEqual actual desired
+fromList :: HasSizes a => [(AnyCompAp, a)] -> AbstractSifCache a
+fromList = snd . foldl' step (0 :: Int, empty)
+ where
+  step (!nextId, !cache) (key, val) = (nextId + 1, insert nextId key val cache)
+
+test_fromList :: IO ()
+test_fromList = assertEqual actual desired
  where
   keyToVal =
-    Map.fromList
-      [ (mkAnyCompAp "c1" "a", 1 :: Int)
-      , (mkAnyCompAp "c1" "b", 2)
-      , (mkAnyCompAp "c2" "c", 5)
-      ]
-  actual = fromMap keyToVal
+    [ (mkAnyCompAp "c1" "a", 1 :: Int)
+    , (mkAnyCompAp "c1" "b", 2)
+    , (mkAnyCompAp "c2" "c", 5)
+    ]
+  actual = fromList keyToVal
   desired =
     AbstractSifCache
-      keyToVal
+      (IntMap.fromList [(0, 1), (1, 2), (2, 5)])
+      (IntMap.fromList [(0, "c1"), (1, "c1"), (2, "c2")])
       ( Map.fromList
           [ ("c1", CompSize (Some $ DataSize 3) (Some 3) 2)
           , ("c2", CompSize (Some $ DataSize 5) (Some 5) 1)
@@ -212,10 +221,11 @@ test_insert = assertEqual actual desired
     , (mkAnyCompAp "c1" "b", 2)
     , (mkAnyCompAp "c2" "c", 5)
     ]
-  actual = foldl' (\c (key, val) -> insert key val c) empty keyValuePairs
+  actual = snd $ foldl' (\(!i, !c) (key, val) -> (i + 1, insert i key val c)) (0 :: Int, empty) keyValuePairs
   desired =
     AbstractSifCache
-      (Map.fromList keyValuePairs)
+      (IntMap.fromList [(0, 1), (1, 2), (2, 5)])
+      (IntMap.fromList [(0, "c1"), (1, "c1"), (2, "c2")])
       ( Map.fromList
           [ ("c1", CompSize (Some $ DataSize 3) (Some 3) 2)
           , ("c2", CompSize (Some $ DataSize 5) (Some 5) 1)
@@ -226,30 +236,29 @@ test_delete :: IO ()
 test_delete = assertEqual actual desired
  where
   initial =
-    fromMap
-      ( Map.fromList
-          [ (mkAnyCompAp "c1" "a", 1 :: Int)
-          , (mkAnyCompAp "c1" "b", 2)
-          , (mkAnyCompAp "c2" "c", 5)
-          , (mkAnyCompAp "c3" "c", 11)
-          ]
-      )
-  deleteKeys =
-    [(mkAnyCompAp "c1" "b"), (mkAnyCompAp "c3" "c")]
-  actual = foldl' (flip delete) initial deleteKeys
-  keyToVal =
-    Map.fromList
-      [ (mkAnyCompAp "c1" "a", 1 :: Int)
-      , (mkAnyCompAp "c2" "c", 5)
+    fromList
+      [ (mkAnyCompAp "c1" "a", 1 :: Int) -- id 0
+      , (mkAnyCompAp "c1" "b", 2) -- id 1
+      , (mkAnyCompAp "c2" "c", 5) -- id 2
+      , (mkAnyCompAp "c3" "c", 11) -- id 3
       ]
+  actual = foldl' (flip delete) initial [1, 3]
   desired =
     AbstractSifCache
-      keyToVal
+      (IntMap.fromList [(0, 1), (2, 5)])
+      (IntMap.fromList [(0, "c1"), (2, "c2")])
       ( Map.fromList
           [ ("c1", CompSize (Some $ DataSize 1) (Some 1) 1)
           , ("c2", CompSize (Some $ DataSize 5) (Some 5) 1)
           ]
       )
+
+test_deleteIsIdempotent :: IO ()
+test_deleteIsIdempotent =
+  do
+    let initial = fromList [(mkAnyCompAp "c1" "a", 1 :: Int)]
+        onceDeleted = delete 0 initial
+    assertEqual onceDeleted (delete 0 onceDeleted)
 
 unitCaching :: CompCacheBehavior ()
 unitCaching =
