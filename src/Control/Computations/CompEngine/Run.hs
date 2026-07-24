@@ -111,25 +111,29 @@ initStateIf shouldValidate =
     let close = liftIO (putMVar exitMVar ())
     return (stateIf, close)
 
+{- | The columnar rewrite's 'SifState' is genuinely, internally mutable
+ (growable unboxed/boxed vectors behind 'Data.IORef.IORef's) rather than an
+ immutable value swapped through a 'TVar' -- running arbitrary in-place
+ vector mutation inside an STM transaction would be unsound (a transaction
+ can retry, replaying the mutation). Access is serialized with a plain
+ 'MVar' lock instead; per the roadmap, this is a deliberate, accepted cost
+ ('stepCompEngine' is sequential, so there's no free-snapshot use case this
+ gives up in practice).
+-}
 setupSimpleStateIf
   :: Bool
   -> IO (CompEngineStateIf IO)
 setupSimpleStateIf shouldValidate =
   do
-    var <- newTVarIO initialSifState
+    st <- newSifState
+    lock <- newMVar ()
     let stateIf =
           SimpleStateIf
             { ssif_withState =
                 \f ->
-                  do
-                    (x, !newState) <-
-                      atomically $
-                        do
-                          oldState <- readTVar var
-                          let res = f oldState
-                          writeTVar var (snd res) -- lazy, forced later
-                          return res
-                    when shouldValidate $ validateSifState newState
+                  withMVar lock $ \() -> do
+                    x <- f st
+                    when shouldValidate $ validateSifState st
                     return x
             }
     return (mkSimpleCompEngineStateIf stateIf)

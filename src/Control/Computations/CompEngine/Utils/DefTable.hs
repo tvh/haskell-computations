@@ -1,3 +1,4 @@
+{-# LANGUAGE ScopedTypeVariables #-}
 {-# OPTIONS_GHC -F -pgmF htfpp #-}
 
 {- | Per-definition columnar row storage: the "Tier 2" memory redesign from
@@ -16,27 +17,34 @@
  just reinterpreted: what used to be an arbitrary dense counter is now
  @(defIndex \<\< rowBits) .|. row@.
 
- = Columns (so far)
+ = Columns
 
- @param_hash@/@result_hash@ (each two 'Word64's, since 'Hash128' itself has
- no 'Unbox' instance and splitting it avoids needing to write one) and
- @flags@ are genuinely unboxed columns ('Data.Vector.Unboxed.Mutable').
- Typed param/value columns and edge columns are later increments.
-
- A freshly grown region of an unboxed column is normally left as garbage
- bytes (cheap, and safe because every column here is read only behind a
- flags check) -- except @flags@ itself, whose growth is explicitly zeroed:
- a stray nonzero garbage byte there would silently read as an occupied
- row, the one column that can't rely on "gated behind a flags check"
- because it *is* the flags check.
+ Each column is a separate growable vector, unboxed where the element type
+ allows it ('Data.Vector.Unboxed.Mutable' for @param_hash@/@result_hash@
+ (as two 'Word64's each, since 'Hash128' itself has no 'Unbox' instance and
+ splitting it avoids needing to write one) and @flags@), boxed where it
+ can't be ('Data.Vector.Mutable' for the typed @param@/@value@ columns and
+ for the edge columns). A boxed column's freshly-grown capacity is left as
+ the @vector@ package's own "uninitialised element" error thunk (see
+ 'growBoxed') -- exactly the loud-failure-on-premature-read canary this
+ module established for row lifecycle in an earlier increment (dead ids
+ there, dead cells here), now extended to row storage. Growth for the
+ @flags@ column is the one exception: it is explicitly zeroed (not left as
+ unboxed garbage), because a stray nonzero byte there would silently read
+ as an occupied row.
 
  = Row lifecycle and reuse
 
- A freed row is pushed onto a free list and its 'Flags' cleared
- (not-alive, no result, not pending); every other column is left
- untouched. This is safe under the invariant every read of a possibly-
- stale column is gated behind a flags check ('flagsAlive' or the result-
- state bits), unconditionally cleared before the row can be reused.
+ A freed row is pushed onto a free list and its 'flags' cleared (not-alive,
+ no result, not pending); every other column is left untouched -- stale
+ param/value/edges from the previous occupant. This is safe under the
+ invariant that every read of a possibly-stale column is gated behind a
+ flags check (@alive@ for identity-ish columns, @hasResult@ for the
+ value/result-hash columns) that is unconditionally cleared before the row
+ can be reused, so the garbage can never be observed. Reuse does not
+ recycle the row's *hash* index entry (that is removed by the caller before
+ freeing) but does recycle the row *number* -- new occupants of a freed row
+ get a fresh index entry pointing at the recycled number.
 -}
 module Control.Computations.CompEngine.Utils.DefTable (
   -- * Row identity
@@ -72,9 +80,19 @@ module Control.Computations.CompEngine.Utils.DefTable (
   readResultHash,
   writeResultHash,
   clearResultHash,
+  readParam,
+  readValue,
+  writeValue,
+  readCompDeps,
+  writeCompDeps,
+  compDepTargets,
   hashToPair,
   pairToHash,
   noResultSentinel,
+  readRdeps,
+  writeRdeps,
+  readSrcDeps,
+  writeSrcDeps,
   htf_thisModulesTests,
 )
 where
@@ -83,6 +101,7 @@ where
 -- LOCAL
 ----------------------------------------
 
+import Control.Computations.CompEngine.CompSrc (AnyCompSrcDep)
 import Control.Computations.Utils.Hash (Hash128 (..), largeHash128)
 
 ----------------------------------------
@@ -92,9 +111,13 @@ import Control.Computations.Utils.Hash (Hash128 (..), largeHash128)
 import Data.Bits
 import Data.HashMap.Strict (HashMap)
 import qualified Data.HashMap.Strict as HashMap
+import Data.HashSet (HashSet)
+import qualified Data.HashSet as HashSet
 import Data.IORef
 import qualified Data.LargeHashable as LH
 import qualified Data.Vector.Generic.Mutable as GM
+import qualified Data.Vector.Mutable as VM
+import qualified Data.Vector.Unboxed as VU
 import qualified Data.Vector.Unboxed.Mutable as VUM
 import Data.Word (Word64, Word8)
 import Test.Framework hiding ((.&.))
@@ -177,15 +200,29 @@ pairToHash :: (Word64, Word64) -> Hash128
 pairToHash (a, b) = Hash128 (LH.Word128 a b)
 {-# INLINE pairToHash #-}
 
--- | Sentinel pair for "observed no result" (a failed dependency), used by
--- later increments' comp-dep edge column. Colliding with this via a real
--- MD5-derived 'Hash128' is not a realistic concern.
+-- | Sentinel pair for "observed no result" (a failed dependency), used in
+-- the @compDeps@ column's observed-version slot. Colliding with this via a
+-- real MD5-derived 'Hash128' is not a realistic concern.
 noResultSentinel :: (Word64, Word64)
 noResultSentinel = (maxBound, maxBound)
 
 --
--- Generic growable-vector helpers, unboxed columns only so far
+-- Generic growable-vector helpers (shared by boxed and unboxed columns via
+-- Data.Vector.Generic.Mutable, which both implement)
 --
+
+-- | Grow a boxed column so it has room for at least @needed@ rows. Freshly
+-- grown capacity is the @vector@ package's own uninitialised-element error
+-- thunk -- reading it before writing is a loud crash, by design.
+growBoxed :: IORef (VM.IOVector e) -> Int -> IO ()
+growBoxed ref needed = do
+  vec <- readIORef ref
+  let cap = GM.length vec
+  when (needed > cap) $ do
+    vec' <- GM.unsafeGrow vec (max (needed - cap) (max 4 cap))
+    writeIORef ref vec'
+ where
+  when b act = if b then act else pure ()
 
 -- | Grow an unboxed column so it has room for at least @needed@ rows.
 -- Freshly grown capacity is unspecified garbage bytes -- safe only because
@@ -201,9 +238,9 @@ growUnboxed ref needed = do
   when b act = if b then act else pure ()
 
 -- | Like 'growUnboxed', but explicitly zeroes the freshly grown region.
--- Used only for @flags@: a stray nonzero garbage byte there would
--- silently read as an occupied row, unlike every other unboxed column,
--- which is read only after a flags check has already gated it.
+-- Used only for @flags@: a stray nonzero garbage byte there would silently
+-- read as an occupied row, unlike every other unboxed column, which is
+-- read only after a flags check has already gated it.
 growUnboxedZeroed :: IORef (VUM.IOVector Word8) -> Int -> IO ()
 growUnboxedZeroed ref needed = do
   vec <- readIORef ref
@@ -220,10 +257,28 @@ growUnboxedZeroed ref needed = do
 -- The table
 --
 
-data DefTable = DefTable
+data DefTable p a = DefTable
   { dt_paramHash :: !(IORef (VUM.IOVector (Word64, Word64)))
   , dt_resultHash :: !(IORef (VUM.IOVector (Word64, Word64)))
   , dt_flags :: !(IORef (VUM.IOVector Word8))
+  , dt_param :: !(IORef (VM.IOVector p))
+  , dt_value :: !(IORef (VM.IOVector a))
+  -- ^ valid only when 'flagsResultState' is 'ResultValue'
+  , dt_compDeps :: !(IORef (VM.IOVector (VU.Vector (Int, Word64, Word64))))
+  -- ^ flat forward comp-dep edges: (packed 'DefRef' this row depends on,
+  -- the target's result hash *as observed* when this row last ran --
+  -- needed to replicate the old VerList-based "impure cap" detection,
+  -- which must distinguish "I depend on the same target at the same
+  -- version as before, yet produced a different result" (genuinely
+  -- impure) from "I depend on the same target but at a newly-changed
+  -- version" (an ordinary, expected recompute) -- a target-set comparison
+  -- alone can't tell those apart. A target with no result at observation
+  -- time (a failed dependency) is encoded as the sentinel
+  -- @(maxBound, maxBound)@; colliding with a real MD5-derived hash is not
+  -- a realistic concern.
+  , dt_rdeps :: !(IORef (VM.IOVector (VU.Vector Int)))
+  -- ^ flat reverse comp-dep edges (packed 'DefRef's depending on this row)
+  , dt_srcDeps :: !(IORef (VM.IOVector (HashSet AnyCompSrcDep)))
   , dt_index :: !(IORef (HashMap Hash128 Int))
   -- ^ this def's own param-hash -> row index (its share of what used to be
   -- one global intern table)
@@ -232,28 +287,51 @@ data DefTable = DefTable
   -- ^ logical row count (<= every column's current capacity)
   }
 
-new :: IO DefTable
+new :: IO (DefTable p a)
 new = do
   ph <- newIORef =<< VUM.new 0
   rh <- newIORef =<< VUM.new 0
   fl <- newIORef =<< VUM.new 0
+  pa <- newIORef =<< VM.new 0
+  va <- newIORef =<< VM.new 0
+  cd <- newIORef =<< VM.new 0
+  rd <- newIORef =<< VM.new 0
+  sd <- newIORef =<< VM.new 0
   ix <- newIORef HashMap.empty
   fr <- newIORef []
   ln <- newIORef 0
-  pure DefTable{dt_paramHash = ph, dt_resultHash = rh, dt_flags = fl, dt_index = ix, dt_free = fr, dt_len = ln}
+  pure
+    DefTable
+      { dt_paramHash = ph
+      , dt_resultHash = rh
+      , dt_flags = fl
+      , dt_param = pa
+      , dt_value = va
+      , dt_compDeps = cd
+      , dt_rdeps = rd
+      , dt_srcDeps = sd
+      , dt_index = ix
+      , dt_free = fr
+      , dt_len = ln
+      }
 
-growAllTo :: DefTable -> Int -> IO ()
+growAllTo :: DefTable p a -> Int -> IO ()
 growAllTo dt needed = do
   growUnboxed (dt_paramHash dt) needed
   growUnboxed (dt_resultHash dt) needed
   growUnboxedZeroed (dt_flags dt) needed
+  growBoxed (dt_param dt) needed
+  growBoxed (dt_value dt) needed
+  growBoxed (dt_compDeps dt) needed
+  growBoxed (dt_rdeps dt) needed
+  growBoxed (dt_srcDeps dt) needed
 
--- | The table's current logical row count (rows @0@ until this are valid
--- row numbers, though not all are necessarily alive -- see 'isAlive').
-rowCount :: DefTable -> IO Int
+-- | The table's current logical row count (rows 0 until this are valid
+-- indices, though not all are necessarily alive -- see 'isAlive').
+rowCount :: DefTable p a -> IO Int
 rowCount dt = readIORef (dt_len dt)
 
-allocRow :: DefTable -> IO Int
+allocRow :: DefTable p a -> IO Int
 allocRow dt = do
   free <- readIORef (dt_free dt)
   case free of
@@ -267,10 +345,14 @@ allocRow dt = do
       pure len
 
 -- | Get-or-create the row for a given param hash. On a fresh row, writes
--- the param hash and initializes flags to alive/not-pending/no-result.
--- Returns 'True' as the second component on a fresh row, 'False' on a hit.
-lookupOrInsertRow :: DefTable -> Hash128 -> IO (Int, Bool)
-lookupOrInsertRow dt h = do
+-- the param hash, the (caller-supplied) typed param, initializes flags to
+-- alive/not-pending/no-result, resets the edge/src-dep columns to empty
+-- (cheap, shared 'VU.empty'/'HashSet.empty' -- not per-row garbage, an
+-- explicit reset, since a freshly *allocated* row -- as opposed to a
+-- *reused* one -- has never had edges and there is nothing stale to gate),
+-- and returns 'True' as the second component. Returns 'False' on a hit.
+lookupOrInsertRow :: forall p a. DefTable p a -> Hash128 -> p -> IO (Int, Bool)
+lookupOrInsertRow dt h p = do
   idx <- readIORef (dt_index dt)
   case HashMap.lookup h idx of
     Just row -> pure (row, False)
@@ -278,20 +360,24 @@ lookupOrInsertRow dt h = do
       row <- allocRow dt
       modifyIORef' (dt_index dt) (HashMap.insert h row)
       writeHash (dt_paramHash dt) row h
+      writeParam dt row p
       writeFlags dt row (mkFlags True False NoResult)
+      writeCompDeps dt row VU.empty
+      writeRdeps dt row VU.empty
+      writeSrcDeps dt row HashSet.empty
       pure (row, True)
 
 -- | Remove a row's hash-index entry and push it onto the free list,
 -- clearing flags (not-alive, not-pending, no-result). Every other column
--- is left untouched -- see the module haddock's "Row lifecycle and reuse"
--- section for why that's safe.
-freeRow :: DefTable -> Hash128 -> Int -> IO ()
+-- (param/value/edges/result hash) is left untouched -- see the module
+-- haddock's "Row lifecycle and reuse" section for why that's safe.
+freeRow :: DefTable p a -> Hash128 -> Int -> IO ()
 freeRow dt h row = do
   modifyIORef' (dt_index dt) (HashMap.delete h)
   modifyIORef' (dt_free dt) (row :)
   writeFlags dt row 0
 
-isAlive :: DefTable -> Int -> IO Bool
+isAlive :: DefTable p a -> Int -> IO Bool
 isAlive dt row = flagsAlive <$> readFlags dt row
 
 --
@@ -301,13 +387,13 @@ isAlive dt row = flagsAlive <$> readFlags dt row
 -- construction.
 --
 
-readFlags :: DefTable -> Int -> IO Flags
+readFlags :: DefTable p a -> Int -> IO Flags
 readFlags dt row = readIORef (dt_flags dt) >>= \v -> VUM.read v row
 
-writeFlags :: DefTable -> Int -> Flags -> IO ()
+writeFlags :: DefTable p a -> Int -> Flags -> IO ()
 writeFlags dt row f = readIORef (dt_flags dt) >>= \v -> VUM.write v row f
 
-setPending :: DefTable -> Int -> Bool -> IO ()
+setPending :: DefTable p a -> Int -> Bool -> IO ()
 setPending dt row p = do
   f <- readFlags dt row
   writeFlags dt row (mkFlags (flagsAlive f) p (flagsResultState f))
@@ -318,21 +404,57 @@ readHash ref row = pairToHash <$> (readIORef ref >>= \v -> VUM.read v row)
 writeHash :: IORef (VUM.IOVector (Word64, Word64)) -> Int -> Hash128 -> IO ()
 writeHash ref row hv = readIORef ref >>= \v -> VUM.write v row (hashToPair hv)
 
-readParamHash :: DefTable -> Int -> IO Hash128
+readParamHash :: DefTable p a -> Int -> IO Hash128
 readParamHash dt = readHash (dt_paramHash dt)
 
-readResultHash :: DefTable -> Int -> IO Hash128
+readResultHash :: DefTable p a -> Int -> IO Hash128
 readResultHash dt = readHash (dt_resultHash dt)
 
-writeResultHash :: DefTable -> Int -> Hash128 -> IO ()
+writeResultHash :: DefTable p a -> Int -> Hash128 -> IO ()
 writeResultHash dt = writeHash (dt_resultHash dt)
 
 -- | Zero out the result-hash slot. Not required for correctness (every
 -- read is gated behind the result-state flag bits), but avoids a
 -- changed-bit false-negative from comparing against an ancient hash if a
 -- future column dump/debug tool ever reads it unconditionally.
-clearResultHash :: DefTable -> Int -> IO ()
+clearResultHash :: DefTable p a -> Int -> IO ()
 clearResultHash dt row = writeHash (dt_resultHash dt) row (pairToHash (0, 0))
+
+writeParam :: DefTable p a -> Int -> p -> IO ()
+writeParam dt row p = readIORef (dt_param dt) >>= \v -> VM.write v row p
+
+readParam :: DefTable p a -> Int -> IO p
+readParam dt row = readIORef (dt_param dt) >>= \v -> VM.read v row
+
+readValue :: DefTable p a -> Int -> IO a
+readValue dt row = readIORef (dt_value dt) >>= \v -> VM.read v row
+
+writeValue :: DefTable p a -> Int -> a -> IO ()
+writeValue dt row a = readIORef (dt_value dt) >>= \v -> VM.write v row a
+
+readCompDeps :: DefTable p a -> Int -> IO (VU.Vector (Int, Word64, Word64))
+readCompDeps dt row = readIORef (dt_compDeps dt) >>= \v -> VM.read v row
+
+writeCompDeps :: DefTable p a -> Int -> VU.Vector (Int, Word64, Word64) -> IO ()
+writeCompDeps dt row xs = readIORef (dt_compDeps dt) >>= \v -> VM.write v row xs
+
+-- | Just the target refs of a comp-dep edge set, discarding the observed
+-- version -- what the rdeps graph (add/remove edges, GC liveness) cares
+-- about.
+compDepTargets :: VU.Vector (Int, Word64, Word64) -> VU.Vector Int
+compDepTargets = VU.map (\(r, _, _) -> r)
+
+readRdeps :: DefTable p a -> Int -> IO (VU.Vector Int)
+readRdeps dt row = readIORef (dt_rdeps dt) >>= \v -> VM.read v row
+
+writeRdeps :: DefTable p a -> Int -> VU.Vector Int -> IO ()
+writeRdeps dt row xs = readIORef (dt_rdeps dt) >>= \v -> VM.write v row xs
+
+readSrcDeps :: DefTable p a -> Int -> IO (HashSet AnyCompSrcDep)
+readSrcDeps dt row = readIORef (dt_srcDeps dt) >>= \v -> VM.read v row
+
+writeSrcDeps :: DefTable p a -> Int -> HashSet AnyCompSrcDep -> IO ()
+writeSrcDeps dt row s = readIORef (dt_srcDeps dt) >>= \v -> VM.write v row s
 
 --
 -- Tests
@@ -340,6 +462,9 @@ clearResultHash dt row = writeHash (dt_resultHash dt) row (pairToHash (0, 0))
 
 h :: Int -> Hash128
 h = largeHash128
+
+newTest :: IO (DefTable Int Int)
+newTest = new
 
 test_packUnpackRoundTrips :: IO ()
 test_packUnpackRoundTrips = do
@@ -351,34 +476,34 @@ test_packUnpackRoundTrips = do
 
 test_newTableIsEmpty :: IO ()
 test_newTableIsEmpty = do
-  dt <- new
+  dt <- newTest
   n <- rowCount dt
   assertEqual 0 n
 
 test_lookupOrInsertRowIsIdempotent :: IO ()
 test_lookupOrInsertRowIsIdempotent = do
-  dt <- new
-  (r1, fresh1) <- lookupOrInsertRow dt (h 1)
-  (r2, fresh2) <- lookupOrInsertRow dt (h 1)
+  dt <- newTest
+  (r1, fresh1) <- lookupOrInsertRow dt (h 1) 100
+  (r2, fresh2) <- lookupOrInsertRow dt (h 1) 100
   assertEqual r1 r2
   assertBool fresh1
   assertBool (not fresh2)
 
 test_lookupOrInsertRowDistinctHashesGetDistinctRows :: IO ()
 test_lookupOrInsertRowDistinctHashesGetDistinctRows = do
-  dt <- new
-  (r1, _) <- lookupOrInsertRow dt (h 1)
-  (r2, _) <- lookupOrInsertRow dt (h 2)
+  dt <- newTest
+  (r1, _) <- lookupOrInsertRow dt (h 1) 1
+  (r2, _) <- lookupOrInsertRow dt (h 2) 2
   assertBool (r1 /= r2)
   n <- rowCount dt
   assertEqual 2 n
 
 test_freeRowThenReinsertNewHashReusesRowNumber :: IO ()
 test_freeRowThenReinsertNewHashReusesRowNumber = do
-  dt <- new
-  (r1, _) <- lookupOrInsertRow dt (h 1)
+  dt <- newTest
+  (r1, _) <- lookupOrInsertRow dt (h 1) 1
   freeRow dt (h 1) r1
-  (r2, fresh) <- lookupOrInsertRow dt (h 2)
+  (r2, fresh) <- lookupOrInsertRow dt (h 2) 2
   assertBool fresh
   assertEqual r1 r2
   -- freeing didn't grow the table -- the freed slot was reused, not a new one
@@ -387,19 +512,19 @@ test_freeRowThenReinsertNewHashReusesRowNumber = do
 
 test_freeRowRemovesOldHashFromIndex :: IO ()
 test_freeRowRemovesOldHashFromIndex = do
-  dt <- new
-  (r1, _) <- lookupOrInsertRow dt (h 1)
+  dt <- newTest
+  (r1, _) <- lookupOrInsertRow dt (h 1) 1
   freeRow dt (h 1) r1
   -- looking the old hash up again must allocate a *fresh* row (it's gone
   -- from the index), even though the row number happens to be recyclable
-  (r2, fresh) <- lookupOrInsertRow dt (h 1)
+  (r2, fresh) <- lookupOrInsertRow dt (h 1) 1
   assertBool fresh
   assertEqual r1 r2
 
 test_manyRowsAreAllDistinctAndCounted :: IO ()
 test_manyRowsAreAllDistinctAndCounted = do
-  dt <- new
-  rows <- mapM (\i -> fst <$> lookupOrInsertRow dt (h i)) [1 .. 200]
+  dt <- newTest
+  rows <- mapM (\i -> fst <$> lookupOrInsertRow dt (h i) i) [1 .. 200]
   n <- rowCount dt
   assertEqual 200 n
   assertEqual 200 (length (HashMap.toList (toSet rows)))
@@ -408,8 +533,8 @@ test_manyRowsAreAllDistinctAndCounted = do
 
 test_freshRowIsAliveWithNoResult :: IO ()
 test_freshRowIsAliveWithNoResult = do
-  dt <- new
-  (r, _) <- lookupOrInsertRow dt (h 1)
+  dt <- newTest
+  (r, _) <- lookupOrInsertRow dt (h 1) 1
   alive <- isAlive dt r
   assertBool alive
   f <- readFlags dt r
@@ -418,31 +543,31 @@ test_freshRowIsAliveWithNoResult = do
 
 test_freeRowIsNoLongerAlive :: IO ()
 test_freeRowIsNoLongerAlive = do
-  dt <- new
-  (r, _) <- lookupOrInsertRow dt (h 1)
+  dt <- newTest
+  (r, _) <- lookupOrInsertRow dt (h 1) 1
   freeRow dt (h 1) r
   alive <- isAlive dt r
   assertBool (not alive)
 
 test_paramHashRoundTripsThroughLookupOrInsertRow :: IO ()
 test_paramHashRoundTripsThroughLookupOrInsertRow = do
-  dt <- new
-  (r, _) <- lookupOrInsertRow dt (h 42)
+  dt <- newTest
+  (r, _) <- lookupOrInsertRow dt (h 42) 42
   got <- readParamHash dt r
   assertEqual (h 42) got
 
 test_resultHashRoundTrips :: IO ()
 test_resultHashRoundTrips = do
-  dt <- new
-  (r, _) <- lookupOrInsertRow dt (h 1)
+  dt <- newTest
+  (r, _) <- lookupOrInsertRow dt (h 1) 1
   writeResultHash dt r (h 99)
   got <- readResultHash dt r
   assertEqual (h 99) got
 
 test_setPendingTogglesFlagWithoutDisturbingOthers :: IO ()
 test_setPendingTogglesFlagWithoutDisturbingOthers = do
-  dt <- new
-  (r, _) <- lookupOrInsertRow dt (h 1)
+  dt <- newTest
+  (r, _) <- lookupOrInsertRow dt (h 1) 1
   writeFlags dt r (mkFlags True False ResultValue)
   setPending dt r True
   f <- readFlags dt r
@@ -470,14 +595,58 @@ test_hashPairRoundTrips = do
 
 test_growthAcrossManyInsertsPreservesAllData :: IO ()
 test_growthAcrossManyInsertsPreservesAllData = do
-  dt <- new
+  dt <- newTest
   -- force several regrowths (initial/step capacity starts at 4)
-  rows <- mapM (\i -> fst <$> lookupOrInsertRow dt (h i)) [1 .. 500]
+  rows <- mapM (\i -> fst <$> lookupOrInsertRow dt (h i) i) [1 .. 500]
   mapM_
     ( \(i, r) -> do
         ph <- readParamHash dt r
         assertEqual (h i) ph
+        v <- readParam dt r
+        assertEqual i v
         alive <- isAlive dt r
         assertBool alive
     )
     (zip [1 .. 500] rows)
+
+test_valueRoundTrips :: IO ()
+test_valueRoundTrips = do
+  dt <- newTest
+  (r, _) <- lookupOrInsertRow dt (h 1) 1
+  writeValue dt r 12345
+  v <- readValue dt r
+  assertEqual (12345 :: Int) v
+
+test_freshRowHasEmptyEdges :: IO ()
+test_freshRowHasEmptyEdges = do
+  dt <- newTest
+  (r, _) <- lookupOrInsertRow dt (h 1) 1
+  cd <- readCompDeps dt r
+  rd <- readRdeps dt r
+  sd <- readSrcDeps dt r
+  assertEqual VU.empty cd
+  assertEqual VU.empty rd
+  assertEqual HashSet.empty sd
+
+test_compDepsAndRdepsRoundTrip :: IO ()
+test_compDepsAndRdepsRoundTrip = do
+  dt <- newTest
+  (r, _) <- lookupOrInsertRow dt (h 1) 1
+  let cd = VU.fromList [(10, 1, 2), (20, 3, 4)]
+  writeCompDeps dt r cd
+  got <- readCompDeps dt r
+  assertEqual cd got
+  assertEqual (VU.fromList [10, 20]) (compDepTargets got)
+  let rd = VU.fromList [30, 40, 50]
+  writeRdeps dt r rd
+  gotRd <- readRdeps dt r
+  assertEqual rd gotRd
+
+-- | The sentinel used for "no result observed" must not collide with any
+-- real hash pair produced by 'hashToPair' -- spot-check a few concrete
+-- hashes against it.
+test_noResultSentinelDoesNotCollideWithRealHashes :: IO ()
+test_noResultSentinelDoesNotCollideWithRealHashes =
+  mapM_
+    (\i -> assertBool (hashToPair (h i) /= noResultSentinel))
+    [1 .. 50 :: Int]

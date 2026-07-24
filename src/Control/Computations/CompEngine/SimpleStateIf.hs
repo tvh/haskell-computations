@@ -2,15 +2,94 @@
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE Rank2Types #-}
 {-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE UndecidableInstances #-}
 {-# LANGUAGE NoMonomorphismRestriction #-}
 
+{- | The "Tier 2" columnar rewrite of the state layer (docs/benchmark-notes.md,
+ "Memory roadmap"): per-definition struct-of-arrays tables
+ ("Control.Computations.CompEngine.Utils.DefTable") instead of the five
+ boxed, "AnyCompAp"-then-@Int@-keyed persistent containers Stage 0/1 used.
+ Row identity is a packed @(defIndex, row)@ 'Int' ('DT.DefRef'); a def's
+ own hash/flags/edge/typed-value columns live in its own 'DT.DefTable',
+ reached from a 'CompId' via 'sifs_defIndex' + 'sifs_defs'. See the
+ individual functions below and DefTable.hs's module haddock for the
+ row-lifecycle and column-layout rationale.
+
+ = Existential plumbing
+
+ A cap's parameter type @p@ never appears in the public
+ 'Control.Computations.CompEngine.Core.CompEngineStateIf' interface (only
+ the result type @a@ does), so it can't be named in any of this module's
+ exported-shaped functions either -- but 'DT.DefTable' needs it. 'withRow'
+ (and 'withDefFor', which it's built on) recover @p@ by pattern-matching
+ the 'CompAp' argument via its @CompAp@ pattern synonym and hand it to a
+ rank-2-polymorphic continuation; every helper /downstream/ of that (taking
+ an already-resolved @'DT.DefTable' p a@ as a plain argument) is ordinary
+ first-rank code, since instantiating a polymorphic function at a local
+ skolem is just application, not escape.
+
+ = Two semantics changes from Stage 0/1, both mandated by the rewrite
+
+ * __No more 'VerList'/multi-version reverse-dep buckets.__ Every row's
+   dependents (@rdeps@) are a flat, unversioned list; invalidation walks
+   that list unconditionally whenever a row's result actually changes (a
+   \"changed bit\": the new result hash compared against what was there
+   before). The old \"impure cap\" detection (a cap re-run with an
+   unchanged, same-version dependency set that nonetheless produced a
+   different result) still needs per-edge /observed version/ information
+   to tell that apart from an ordinary recompute where the dependency set
+   is the same *targets* but a *new* observed version -- see
+   'DT.dt_compDeps's haddock for why that column carries a version
+   alongside each target ref.
+ * __'CompCacheMeta' lost 'ccm_logrepr'/'ccm_approxCachedSize'/'ccm_cachedSize'__
+   (Types.hs) -- they had no columnar equivalent, and the whole point of a
+   dedicated result-hash column is to not carry a redundant per-row
+   'CompCacheMeta' box around. \"SifCache.hs\"'s per-'CompId' size
+   bookkeeping (@compIdSizeMap@ et al) is gone with it -- grep confirmed
+   nothing outside that file's own tests ever read it. (SifCache.hs itself
+   is now dead code -- deleted in a later increment once nothing else
+   references it, per the incremental-commit plan.)
+
+ = The other Stage-0/1 machinery this rewrite retires
+
+ @SifCache@, the old global @Control.Computations.CompEngine.Utils.Intern@
+ table, and @Control.Computations.CompEngine.Utils.DepMap@/@VerList@'s
+ container operations are all unused now: interning is intrinsic to
+ 'DT.lookupOrInsertRow' (per-def, keyed by param hash -- structurally the
+ same per-definition index Rust's Stage 5 uses instead of one global
+ table), and comp-dep edges are flat 'DT.DefTable' columns instead of a
+ generic reverse-index map. (@DepMap.hs@'s 'IsDep' class stays -- it's load
+ -bearing for "Types.hs"'s 'CompEngDep'/'CompDep' instances, unrelated to
+ its now-dead container.) @sifs_vermap@ is gone -- a row's result hash
+ (gated by its result-state flag) is the vermap entry now.
+ @sifs_pendingCaps@ is gone -- \"currently mid-evaluation\" is a per-row
+ flag bit instead of a separate 'Set'. The output containers
+ ("Control.Computations.CompEngine.Utils.OutputsMap") are untouched in
+ design, just re-keyed onto packed refs, exactly as the Rust notes say
+ Tier 2 leaves its analogous side tables; the empty-outputs 'OM.insert'
+ for every output-less cap is dropped (a cap absent from the map now just
+ means \"no outputs\", via 'OM.lookup's existing 'Nothing' case).
+
+ = Concurrency
+
+ Genuinely mutable columns are incompatible with the old
+ \"@SifState -> (a, SifState)@ run inside @atomically@\" pattern (an STM
+ transaction can retry, and retrying arbitrary in-place vector mutation is
+ unsound). 'SimpleStateIf' now serializes access to one persistent,
+ internally-mutable 'SifState' with an IO action instead of swapping
+ immutable snapshots through a @TVar@ -- see
+ "Control.Computations.CompEngine.Run"'s @MVar@-guarded @setupSimpleStateIf@.
+ This costs the STM free-snapshot property (not used by anything today)
+ and matches the roadmap's own call: \"an MVar suffices; stepCompEngine is
+ sequential\".
+-}
 module Control.Computations.CompEngine.SimpleStateIf (
   SimpleStateIf (..),
-  SifState (..),
+  SifState,
   mkSimpleCompEngineStateIf,
-  initialSifState,
+  newSifState,
   validateSifState,
 )
 where
@@ -23,15 +102,18 @@ import Control.Computations.CompEngine.CompFlow
 import Control.Computations.CompEngine.CompSink
 import Control.Computations.CompEngine.CompSrc
 import Control.Computations.CompEngine.Core
-import Control.Computations.CompEngine.SifCache (SifCache)
-import qualified Control.Computations.CompEngine.SifCache as SifCache
 import Control.Computations.CompEngine.Types
-import Control.Computations.CompEngine.Utils.DepMap
-import qualified Control.Computations.CompEngine.Utils.DepMap as DepMap
-import Control.Computations.CompEngine.Utils.Intern (InternTable)
-import qualified Control.Computations.CompEngine.Utils.Intern as Intern
+import Control.Computations.CompEngine.Utils.DefTable (
+  DefRef,
+  DefTable,
+  ResultState (..),
+ )
+import qualified Control.Computations.CompEngine.Utils.DefTable as DT
+import Control.Computations.CompEngine.Utils.DepMap (IsDep (..))
 import qualified Control.Computations.CompEngine.Utils.OutputsMap as OM
+import Control.Computations.CompEngine.Utils.PriorityAgingQueue (PaqPriority)
 import qualified Control.Computations.CompEngine.Utils.PriorityAgingQueue as Paq
+import Control.Computations.Utils.Hash (Hash128)
 import Control.Computations.Utils.Logging
 import qualified Control.Computations.Utils.StrictList as SL
 import Control.Computations.Utils.Tuple
@@ -42,156 +124,120 @@ import Control.Computations.Utils.Types
 ----------------------------------------
 
 import Control.Monad
-import Data.Foldable (foldr')
+import Control.Monad.IO.Class
 import qualified Data.Foldable as F
-import GHC.Generics (Generic)
+import Data.HashMap.Strict (HashMap)
 import qualified Data.HashMap.Strict as HashMap
 import Data.HashSet (HashSet)
 import qualified Data.HashSet as HashSet
-import Data.Hashable (Hashable, hashWithSalt)
-import qualified Data.IntMap.Strict as IntMap
 import Data.IntMap.Strict (IntMap)
+import qualified Data.IntMap.Strict as IntMap
 import qualified Data.IntSet as IntSet
+import Data.IORef
 import Data.List (intercalate)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Maybe
 import Data.Proxy (Proxy (..))
-import Data.Set (Set)
-import qualified Data.Set as Set
+import Data.Type.Equality ((:~:) (Refl))
+import Data.Typeable (Typeable, eqT)
+import qualified Data.Vector.Unboxed as VU
+import Data.Word (Word64)
+
+--
+-- Existential per-definition entry: a Comp p a (needed to reconstruct an
+-- AnyCompAp from a bare row -- see resolveRefToAny) alongside its DefTable
+-- p a. p/a are recovered at each use via eqT (see castDefEntry), the same
+-- one-cast-per-lookup idea "Types.hs"'s castCompCacheValue already uses --
+-- not a new category of cost, just moved here.
+--
+data SomeDefEntry
+  = forall p a.
+    (IsCompParam p, IsCompResult a) =>
+    SomeDefEntry (Comp p a) (DefTable p a)
 
 newtype SimpleStateIf m = SimpleStateIf
-  { ssif_withState :: forall a. (SifState -> (a, SifState)) -> m a
+  { ssif_withState :: forall a. (SifState -> m a) -> m a
   }
 
-{- | The state layer interns every 'AnyCompAp' cap identity to a dense 'Int'
- id (see "Control.Computations.CompEngine.Utils.Intern") and re-keys its
- five bulk containers (cache, vermap, the dep map's two indices, outputs)
- on that id instead. 'InternedDep'/'InternedDepKey' are the corresponding
- interned form of the public 'CompEngDep'/'CompEngDepKey': the src half is
- untouched (its key was never 'AnyCompAp'), the comp half carries the
- target's interned id instead of the target's full 'AnyCompAp'.
-
- This is deliberately private to this module: 'DepSet'/'CompEngDep' (what
- 'CompM' and "Control.Computations.CompEngine.Impl" actually manipulate)
- are untouched -- interning only happens at the point a dep set is handed
- to the state layer, and reversed (via 'Intern.resolve') only when a
- result crosses back out through the 'CompEngineStateIf' boundary.
+{- | One entry per source key currently depended on by at least one row:
+ every dependent packed ref, each mapped to the version /that specific row/
+ last observed for this key. This is flat in the sense that there's no
+ VerList-style secondary index bucketing dependents by version -- but per-
+ dependent version tracking itself is still required, not optional: a
+ test (@test_modifcationWhileWorkingOnQueue@) exercises exactly the case
+ where two rows depend on the same key but have observed *different*
+ versions of it (one caught up to a newer notification before the other),
+ and a notification must invalidate only the row(s) whose recorded version
+ doesn't match -- a single flat "last known version" dedup (this module's
+ first attempt) can't distinguish that from "everyone's stale", and gets
+ it wrong. Comparing per-dependent below is what actually replicates
+ VerList's targeted invalidation, just without the separate bucket index.
 -}
-data InternedDep
-  = InternedDepSrc !AnyCompSrcDep
-  | InternedDepComp !Int !CompDepVer
-  deriving (Eq, Show)
-
-data InternedDepKey
-  = InternedDepKeySrc !AnyCompSrcKey
-  | InternedDepKeyComp !Int
-  deriving (Eq, Show, Generic)
-
-instance Hashable InternedDepKey
-
-instance Hashable InternedDep where
-  hashWithSalt s dep =
-    case dep of
-      InternedDepSrc x -> s `hashWithSalt` (0 :: Int) `hashWithSalt` x
-      InternedDepComp i v -> s `hashWithSalt` (1 :: Int) `hashWithSalt` i `hashWithSalt` v
-
-instance IsDep InternedDep where
-  type DepKey InternedDep = InternedDepKey
-  type DepVer InternedDep = CompEngDepVer
-  depKey (InternedDepSrc x) = InternedDepKeySrc (depKey x)
-  depKey (InternedDepComp i _) = InternedDepKeyComp i
-  depVer (InternedDepSrc x) = CompEngDepVerSrc (depVer x)
-  depVer (InternedDepComp _ v) = CompEngDepVerComp v
-
--- | Owners are interned cap ids; see the module haddock above.
-type SifDeps = DepMap Int InternedDep
-type SifVerMap = IntMap CompDepVer
-type SifOutputs = OM.OutputsMap Int
-type SifPendingOutputs = Map AnyCompAp AnyCompSinkOutsMap
-type SifStale = Paq.PriorityAgingQueue AnyCompAp ()
-type SifPendingCaps = Set AnyCompAp
+newtype SrcEntry = SrcEntry
+  { se_dependents :: HashMap DefRef AnyCompSrcVer
+  }
 
 data SifState = SifState
-  { sifs_deps :: SifDeps
-  , sifs_cache :: SifCache
-  , sifs_vermap :: SifVerMap
-  , sifs_outputs :: SifOutputs
-  , sifs_pendingOutputs :: SifPendingOutputs
-  , sifs_pendingCaps :: SifPendingCaps
-  -- ^ caps for which calculation has been started but not finished
-  , sifs_stale :: SifStale
-  , sifs_intern :: InternTable AnyCompAp
-  -- ^ the cap identity intern table; see the module haddock above
+  { sifs_defIndex :: !(IORef (HashMap CompId Int))
+  , sifs_defs :: !(IORef (IntMap SomeDefEntry))
+  , sifs_nextDefIdx :: !(IORef Int)
+  , sifs_srcIndex :: !(IORef (HashMap AnyCompSrcKey SrcEntry))
+  , sifs_outputs :: !(IORef (OM.OutputsMap Int))
+  , sifs_pendingOutputs :: !(IORef (Map Int AnyCompSinkOutsMap))
+  , sifs_stale :: !(IORef (Paq.PriorityAgingQueue Int ()))
   }
-  deriving (Show)
 
-{- | Checks invariants about the SifState.
+newSifState :: IO SifState
+newSifState =
+  SifState
+    <$> newIORef HashMap.empty
+    <*> newIORef IntMap.empty
+    <*> newIORef 0
+    <*> newIORef HashMap.empty
+    <*> newIORef OM.empty
+    <*> newIORef Map.empty
+    <*> newIORef Paq.empty
 
- Under interning, the old invariant here (that every container which
- stores an 'AnyCompAp' key stores the *same* shared thunk for that key,
- checked with 'reallyUnsafePtrEquality#' after a 'Set.lookupLE') is moot:
- the re-keyed containers no longer store 'AnyCompAp' at all, they store
- plain 'Int's, so there is nothing left to "not be the same thunk". Its
- replacement checks the invariant interning actually depends on: every id
- referenced by any of the five re-keyed containers must be currently live
- in the intern table (i.e. it was interned and not since released by GC).
- A dangling id here means a lifecycle bug -- an id used after 'runGc'
- released it, or a container that never got told about a fresh id.
+{- | Checks invariants about the SifState: every def index referenced by
+ the def registry has a table entry, and every alive row's forward
+ (@compDeps@) or reverse (@rdeps@) edges point only at other alive rows.
+ This is the columnar-rewrite analogue of Stage 1's "every id referenced by
+ a container is live in the intern table" -- same idea (dangling
+ references are a lifecycle bug), different storage to check it against.
 -}
 validateSifState :: SifState -> IO ()
-validateSifState state =
-  do
-    let live = Intern.liveIds (sifs_intern state)
-        checkIds what ids =
-          let dangling = IntSet.difference ids live
-           in unless (IntSet.null dangling) $
-                fail
-                  ( "When validating "
-                      ++ what
-                      ++ ": found ids not present in the intern table: "
-                      ++ show (IntSet.toList dangling)
-                  )
-        depOwnerIds = IntSet.fromList $ HashSet.toList $ DepMap.keys (sifs_deps state)
-        depTargetIds =
-          IntSet.fromList $
-            flip mapMaybe (HashSet.toList $ DepMap.depKeys (sifs_deps state)) $ \case
-              InternedDepKeySrc _ -> Nothing
-              InternedDepKeyComp i -> Just i
-        cacheIds = SifCache.keysSet (sifs_cache state)
-        vermapIds = IntMap.keysSet (sifs_vermap state)
-        outputIds = IntSet.fromList $ HashMap.keys $ OM.forwardMap $ sifs_outputs state
-    checkIds "sifs_deps (owners)" depOwnerIds
-    checkIds "sifs_deps (dep targets)" depTargetIds
-    checkIds "sifs_cache" cacheIds
-    checkIds "sifs_vermap" vermapIds
-    checkIds "sifs_outputs" outputIds
-
-initialSifState :: SifState
-initialSifState =
-  SifState
-    { sifs_deps = DepMap.empty
-    , sifs_cache = emptyCache
-    , sifs_vermap = IntMap.empty
-    , sifs_outputs = OM.empty
-    , sifs_pendingOutputs = mempty
-    , sifs_pendingCaps = mempty
-    , sifs_stale = Paq.empty
-    , sifs_intern = Intern.empty
-    }
-
-emptyCache :: SifCache
-emptyCache = SifCache.empty
+validateSifState st = do
+  defs <- readIORef (sifs_defs st)
+  forM_ (IntMap.toList defs) $ \(defIdx, SomeDefEntry _ dt) -> do
+    len <- DT.rowCount dt
+    forM_ [0 .. len - 1] $ \row -> do
+      flags <- DT.readFlags dt row
+      when (DT.flagsAlive flags) $ do
+        cd <- DT.readCompDeps dt row
+        rd <- DT.readRdeps dt row
+        checkRefs defs ("compDeps of def " ++ show defIdx ++ " row " ++ show row) (DT.compDepTargets cd)
+        checkRefs defs ("rdeps of def " ++ show defIdx ++ " row " ++ show row) rd
+ where
+  checkRefs defs what refs =
+    forM_ (VU.toList refs) $ \ref -> do
+      let (targetDef, targetRow) = DT.unpackRef ref
+      case IntMap.lookup targetDef defs of
+        Nothing -> fail (what ++ " points at unknown def " ++ show targetDef)
+        Just (SomeDefEntry _ dt) -> do
+          flags <- DT.readFlags dt targetRow
+          unless (DT.flagsAlive flags) $
+            fail (what ++ " points at dead row " ++ show (targetDef, targetRow))
 
 mkSimpleCompEngineStateIf
-  :: (Monad m)
+  :: (MonadIO m)
   => SimpleStateIf m
   -> CompEngineStateIf m
 mkSimpleCompEngineStateIf sif =
   CompEngineStateIf
     { lookupCapResult = lookupCapResultImpl sif
     , capEvaluationStarted = capEvaluationStartedImpl sif
-    , capEvaluationFinished = putCapResultImpl sif
+    , capEvaluationFinished = capEvaluationFinishedImpl sif
     , dequeueGivenCap = dequeueGivenCapImpl sif
     , staleQueueSize = staleQueueSizeImpl sif
     , dequeueNextCap = dequeueNextCapImpl sif
@@ -201,138 +247,220 @@ mkSimpleCompEngineStateIf sif =
     , getQueue = getQueueImpl sif
     }
 
+withSifState :: SimpleStateIf m -> (SifState -> m a) -> m a
+withSifState = ssif_withState
+
 --
--- Interning helpers
+-- Def/row resolution. See the module haddock's "Existential plumbing"
+-- section for why withDefFor/withRow are CPS-shaped.
 --
 
--- | Intern (get-or-create) the id for a cap.
-internCap :: AnyCompAp -> SifState -> (Int, SifState)
-internCap cap st =
-  let (!i, !tbl') = Intern.intern cap (sifs_intern st)
-   in (i, st{sifs_intern = tbl'})
+withDefFor
+  :: forall p a r
+   . (IsCompParam p, IsCompResult a)
+  => SifState
+  -> Comp p a
+  -> (Int -> DefTable p a -> IO r)
+  -> IO r
+withDefFor st comp k = do
+  let cid = comp_name comp
+  idxMap <- readIORef (sifs_defIndex st)
+  case HashMap.lookup cid idxMap of
+    Just defIdx -> do
+      defs <- readIORef (sifs_defs st)
+      case IntMap.lookup defIdx defs of
+        Just entry -> castDefEntry cid entry >>= k defIdx
+        Nothing ->
+          error
+            ( "SimpleStateIf.withDefFor: defIndex "
+                ++ show defIdx
+                ++ " for "
+                ++ show cid
+                ++ " has no table entry -- a lifecycle bug, not a data problem"
+            )
+    Nothing -> do
+      dt <- DT.new
+      defIdx <- readIORef (sifs_nextDefIdx st)
+      writeIORef (sifs_nextDefIdx st) (defIdx + 1)
+      modifyIORef' (sifs_defIndex st) (HashMap.insert cid defIdx)
+      modifyIORef' (sifs_defs st) (IntMap.insert defIdx (SomeDefEntry comp dt))
+      k defIdx dt
 
--- | Intern a single public dependency edge into its private, id-based form.
--- This is the replacement for the old @normalizeDep@: interning a dep's
--- target *is* canonicalizing it, there's nothing further to normalize.
-internDep :: CompEngDep -> SifState -> (InternedDep, SifState)
-internDep dep st =
-  case dep of
-    CompEngDepSrc x -> (InternedDepSrc x, st)
-    CompEngDepComp (CompDep (Dep (CompDepKey capAp) ver)) ->
-      let (i, st') = internCap capAp st
-       in (InternedDepComp i ver, st')
+-- | One cast per def resolution -- the same idea "Types.hs"'s
+-- 'castCompCacheValue' already applies per cache read, just moved to the
+-- def-lookup step; a 'CompId' maps to exactly one @(p, a)@ pair for the
+-- lifetime of the engine (comp names are unique, checked at wiring time by
+-- "CompDef.hs"'s @insertComp@), so the fallback branch below can only mean
+-- a genuine bug, not a legitimate runtime occurrence.
+castDefEntry :: forall p a. (Typeable p, Typeable a) => CompId -> SomeDefEntry -> IO (DefTable p a)
+castDefEntry cid (SomeDefEntry (_ :: Comp p' a') dt) =
+  case (eqT :: Maybe (p :~: p'), eqT :: Maybe (a :~: a')) of
+    (Just Refl, Just Refl) -> pure dt
+    _ ->
+      error
+        ( "SimpleStateIf.castDefEntry: type mismatch resolving "
+            ++ show cid
+            ++ " -- a CompId must map to exactly one (param, result) type pair"
+        )
 
--- | Intern an entire (public) 'DepSet' into its private, id-based form.
-internDepSet :: DepSet -> SifState -> (HashSet InternedDep, SifState)
-internDepSet deps st0 =
-  F.foldl' step (HashSet.empty, st0) deps
- where
-  step (!acc, !st) d =
-    let (!d', !st') = internDep d st
-     in (HashSet.insert d' acc, st')
+-- | Get-or-create the def table for a cap's computation and its row within
+-- that table, then run a continuation with typed access to both. The
+-- continuation is rank-2 polymorphic in the cap's (otherwise never named)
+-- parameter type -- see the module haddock.
+withRow
+  :: forall a r
+   . IsCompResult a
+  => SifState
+  -> CompAp a
+  -> (forall p. IsCompParam p => Int -> DefTable p a -> Int -> Bool -> IO r)
+  -> IO r
+withRow st cap k =
+  case cap of
+    CompAp _ comp param ->
+      withDefFor st comp $ \defIdx dt -> do
+        (row, fresh) <- DT.lookupOrInsertRow dt (cap_hash cap) param
+        k defIdx dt row fresh
 
--- | Resolve a set of interned ids (as returned by 'DepMap.stale' et al, a
--- @HashSet Int@) back to their (public) 'AnyCompAp' form.
-resolveSet :: HashSet Int -> SifState -> HashSet AnyCompAp
-resolveSet ids st =
-  HashSet.map (\i -> Intern.resolve i (sifs_intern st)) ids
+-- | Reconstruct an 'AnyCompAp' from a packed ref -- needed only at the
+-- boundary where the public interface hands back an 'AnyCompAp' (stale
+-- sets, GC reports, dequeue results) for a row this call didn't already
+-- have the typed 'CompAp' for in hand. Not on the hot inner path: one
+-- 'IntMap' lookup plus one param-column read plus (via 'mkCompAp')
+-- recomputing that cap's hash, deterministically identical to the hash
+-- already stored in its param-hash column.
+resolveRefToAny :: SifState -> DefRef -> IO AnyCompAp
+resolveRefToAny st ref = do
+  let (defIdx, row) = DT.unpackRef ref
+  defs <- readIORef (sifs_defs st)
+  case IntMap.lookup defIdx defs of
+    Just (SomeDefEntry comp dt) -> do
+      p <- DT.readParam dt row
+      pure (AnyCompAp (mkCompAp comp p))
+    Nothing ->
+      error ("SimpleStateIf.resolveRefToAny: unknown def index " ++ show defIdx ++ " (bug)")
 
--- | Look up (without creating) the interned form of a public dep, used
--- only to *query* staleness (see 'enqueueStaleCapsImpl'). 'Nothing' means
--- the dep's target has never been interned, so nothing can currently
--- depend on it.
-queryInternedDep :: CompEngDep -> InternTable AnyCompAp -> Maybe InternedDep
-queryInternedDep dep tbl =
-  case dep of
-    CompEngDepSrc x -> Just (InternedDepSrc x)
-    CompEngDepComp (CompDep (Dep (CompDepKey capAp) ver)) ->
-      (\i -> InternedDepComp i ver) <$> Intern.lookupId capAp tbl
+resolveRefsToAny :: SifState -> HashSet DefRef -> IO (HashSet AnyCompAp)
+resolveRefsToAny st refs = HashSet.fromList <$> mapM (resolveRefToAny st) (HashSet.toList refs)
+
+--
+-- CompDepVer <-> unboxed pair, for the compDeps column's observed-version
+-- slot (see DefTable.hs's dt_compDeps haddock).
+--
+
+encodeVer :: CompDepVer -> (Word64, Word64)
+encodeVer (CompDepVer None) = DT.noResultSentinel
+encodeVer (CompDepVer (Some h)) = DT.hashToPair h
+
+decodeVer :: (Word64, Word64) -> CompDepVer
+decodeVer pair
+  | pair == DT.noResultSentinel = CompDepVer None
+  | otherwise = CompDepVer (Some (DT.pairToHash pair))
 
 --
 -- CompEngineStateIf implementation
 --
 
-getQueueImpl :: Monad m => SimpleStateIf m -> m [AnyCompAp]
-getQueueImpl sif =
-  do
-    (Paq.PaqView rtq xq rq bq) <- fromSifState sif (Paq.view . sifs_stale)
-    return $! map Paq.paqe_key $ concat [rtq, xq, rq, bq]
+getQueueImpl :: MonadIO m => SimpleStateIf m -> m [AnyCompAp]
+getQueueImpl sif = withSifState sif $ \st -> liftIO $ do
+  q <- readIORef (sifs_stale st)
+  let (Paq.PaqView rtq xq rq bq) = Paq.view q
+      refs = map Paq.paqe_key (concat [rtq, xq, rq, bq])
+  mapM (resolveRefToAny st) refs
 
-staleQueueSizeImpl :: SimpleStateIf m -> m Int
-staleQueueSizeImpl sif =
-  fromSifState sif $ \st -> Paq.size (sifs_stale st)
+staleQueueSizeImpl :: MonadIO m => SimpleStateIf m -> m Int
+staleQueueSizeImpl sif = withSifState sif $ \st -> liftIO $ Paq.size <$> readIORef (sifs_stale st)
 
 trackOutputImpl
-  :: (Monad m, IsCompResult a)
+  :: forall m a
+   . (MonadIO m, IsCompResult a)
   => SimpleStateIf m
   -> CompAp a
   -> AnyCompSinkOutsMap
   -> m ()
 trackOutputImpl sif cap outputs
-  | nullAnyOutsMap outputs = return ()
-  | otherwise =
-      withSifState sif $ \st ->
-        let outputsStr = unlines (map ("  - " ++) (lines (show outputs)))
-            msg = (show (capId cap) ++ " produced the following outputs:\n" ++ outputsStr)
-            newOutputs = Map.insertWith mappend (AnyCompAp cap) outputs (sifs_pendingOutputs st)
-            newSt = st{sifs_pendingOutputs = newOutputs}
-         in pureDebug msg ((), newSt)
+  | nullAnyOutsMap outputs = pure ()
+  | otherwise = withSifState sif $ \st -> liftIO $
+      withRow st cap $ \defIdx _dt row _fresh -> do
+        let ref = DT.packRef defIdx row
+        logDebug (show (capId cap) ++ " produced the following outputs:\n" ++ indentedShow outputs)
+        modifyIORef' (sifs_pendingOutputs st) (Map.insertWith mappend ref outputs)
+ where
+  indentedShow x = unlines (map ("  - " ++) (lines (show x)))
 
-commitPendingOutputsForKey :: SifState -> Int -> AnyCompAp -> SifState
-commitPendingOutputsForKey st keyId capAny =
-  case Map.lookup capAny (sifs_pendingOutputs st) of
-    Nothing -> st{sifs_outputs = OM.insert keyId mempty (sifs_outputs st)}
-    Just anyOuts ->
-      let warnMsgs =
-            catMaybes $
-              do
-                ForAnyCompFlow ident p (SomeCompSinkOuts outs) <-
-                  Map.elems (unAnyCompSinkOutsMap anyOuts)
-                output <- F.toList outs
-                let revLookupResult =
-                      OM.lookupOutputKey
-                        (p, ident, output)
-                        (sifs_outputs st)
-                case SL.filter (/= keyId) revLookupResult of
-                  SL.Nil -> pure Nothing
-                  otherKeyIds ->
-                    pure $
-                      Just
-                        ( "MULTIPLE_COMPAPS_ONE_OUTPUT: The output "
-                            ++ show output
-                            ++ " has just been generated by the comp ap "
-                            ++ showAnyCompApDetails capAny
-                            ++ ". Before, this output has been generated by the comp ap(s) "
-                            ++ intercalate
-                              ", "
-                              (map (showAnyCompApDetails . flip Intern.resolve (sifs_intern st)) (SL.toList otherKeyIds))
-                            ++ ". "
-                            ++ " This 'travelling' of outputs of one comp ap "
-                            ++ "to another is outlawed since it can lead to outdated "
-                            ++ "outputs. FIX THIS!"
-                        )
-          doWarnings =
-            if F.null warnMsgs
-              then id
-              else pureWarn (unlines warnMsgs)
-       in doWarnings $
-            st
-              { sifs_outputs = OM.insert keyId anyOuts (sifs_outputs st)
-              , sifs_pendingOutputs = Map.delete capAny (sifs_pendingOutputs st)
-              }
+{- | Commit a row's pending outputs into the durable outputs map, warning
+ about (but not preventing) the same output being claimed by more than one
+ cap, and reporting any outputs this row *used to* produce but no longer
+ does (and that nothing else currently produces either) as garbage -- this
+ runs unconditionally on every finish, not just when there are pending
+ outputs, exactly like Stage 0/1's @insertCapWithDeps@ did, since a row
+ that produced outputs last time and none this time still needs its old
+ ones diffed out. Unlike Stage 0/1, a row with no *current* outputs gets
+ 'OM.delete'd rather than given an empty 'OM.insert' -- the "empty-outputs
+ insert" the roadmap calls out to kill; 'OM.lookup's existing 'Nothing'
+ case already means "no outputs" without needing an entry to say so.
+-}
+commitPendingOutputsForKey :: SifState -> DefRef -> AnyCompAp -> IO Garbage
+commitPendingOutputsForKey st ref capAny = do
+  pending <- readIORef (sifs_pendingOutputs st)
+  outs <- readIORef (sifs_outputs st)
+  let newOutputs = fromMaybe mempty (Map.lookup ref pending)
+      oldOutputs = fromMaybe mempty (OM.lookup ref outs)
+      delOutputs = oldOutputs `diffAnyOutsMap` newOutputs
+  -- The existential `s` inside each ForAnyCompFlow can't escape a shared
+  -- list (different sink outputs may carry different s) -- unlike the old
+  -- pure version, which could fold everything in one list-monad
+  -- comprehension, this processes each entry's outputs (including the IO
+  -- resolve step) within its own forM iteration.
+  warnMsgLists <-
+    forM (Map.elems (unAnyCompSinkOutsMap newOutputs)) $
+      \(ForAnyCompFlow ident p (SomeCompSinkOuts outsSet)) ->
+        fmap catMaybes $
+          forM (F.toList outsSet) $ \output -> do
+            let revLookupResult = OM.lookupOutputKey (p, ident, output) outs
+            case SL.filter (/= ref) revLookupResult of
+              SL.Nil -> pure Nothing
+              otherRefs -> do
+                otherCaps <- mapM (resolveRefToAny st) (SL.toList otherRefs)
+                pure $
+                  Just
+                    ( "MULTIPLE_COMPAPS_ONE_OUTPUT: The output "
+                        ++ show output
+                        ++ " has just been generated by the comp ap "
+                        ++ showAnyCompApDetails capAny
+                        ++ ". Before, this output has been generated by the comp ap(s) "
+                        ++ intercalate ", " (map showAnyCompApDetails otherCaps)
+                        ++ ". "
+                        ++ " This 'travelling' of outputs of one comp ap "
+                        ++ "to another is outlawed since it can lead to outdated "
+                        ++ "outputs. FIX THIS!"
+                    )
+  let warnMsgs = concat warnMsgLists
+  unless (null warnMsgs) (logWarn (unlines warnMsgs))
+  let outs' =
+        if nullAnyOutsMap newOutputs
+          then OM.delete ref outs
+          else OM.insert ref newOutputs outs
+  writeIORef (sifs_outputs st) outs'
+  modifyIORef' (sifs_pendingOutputs st) (Map.delete ref)
+  let garbOutputs = OM.filterUnreferencedOutputs outs' delOutputs
+  pure $
+    if nullAnyOutsMap garbOutputs
+      then mempty
+      else mempty{garbage_outputs = HashMap.singleton capAny garbOutputs}
 
 getDataIfOutputsImpl
   :: forall s m
-   . (CompSink s)
+   . (MonadIO m, CompSink s)
   => SimpleStateIf m
   -> s
   -> m (CompSinkOuts s)
-getDataIfOutputsImpl sif s =
-  fromSifState sif $ \st ->
-    foldr'
+getDataIfOutputsImpl sif s = withSifState sif $ \st -> liftIO $ do
+  outs <- readIORef (sifs_outputs st)
+  pure $
+    F.foldr'
       (\out set -> unionOuts (anyOutputsToCompSinkOutputs out) set)
       HashSet.empty
-      (HashMap.elems $ OM.forwardMap $ sifs_outputs st)
+      (HashMap.elems $ OM.forwardMap outs)
  where
   anyOutputsToCompSinkOutputs :: AnyCompSinkOutsMap -> Maybe (CompSinkOuts s)
   anyOutputsToCompSinkOutputs m = compSinkOutsFromAny (Proxy @s) (compSinkId s) m
@@ -340,453 +468,440 @@ getDataIfOutputsImpl sif s =
   unionOuts (Just set1) set2 = set1 `HashSet.union` set2
 
 lookupCapResultImpl
-  :: IsCompResult a
+  :: forall m a
+   . (MonadIO m, IsCompResult a)
   => SimpleStateIf m
   -> CompAp a
   -> m (CapLookup (CapResult (CapCached a)))
-lookupCapResultImpl sif cap =
-  withSifState sif $ \sifState ->
-    let (_, res, sifState') = lookupCapResultImpl' cap sifState
-     in (res, sifState')
+lookupCapResultImpl sif cap = withSifState sif $ \st -> liftIO $
+  withRow st cap $ \_defIdx dt row _fresh -> do
+    flags <- DT.readFlags dt row
+    case DT.flagsResultState flags of
+      NoResult -> pure CapNotFound
+      ResultFailure -> pure (CapFound CapFailure)
+      ResultMetaOnly -> do
+        h <- DT.readResultHash dt row
+        pure (CapFound (CapSuccess (CapMetaCached (CompCacheMeta h))))
+      ResultValue -> do
+        h <- DT.readResultHash dt row
+        v <- DT.readValue dt row
+        let ccv = CompCacheValue (Some v) (CompCacheMeta h)
+        pure (CapFound (CapSuccess (CapValueCached (CompApResult v ccv))))
 
-lookupCapResultImpl'
-  :: IsCompResult r
-  => CompAp r
-  -> SifState
-  -> (Int, CapLookup (CapResult (CapCached r)), SifState)
-lookupCapResultImpl' cap st =
-  let (keyId, st') = internCap (AnyCompAp cap) st
-      res = SifCache.lookup keyId (sifs_cache st')
-      result =
-        case res of
-          Nothing -> CapNotFound
-          Just CapFailure -> CapFound CapFailure
-          Just (CapSuccess (AnyCompCacheValue ccvAnyType)) ->
-            let optionCvc = fmap capCached (castCompCacheValue ccvAnyType)
-             in CapFound (optionToCapResult optionCvc)
-   in (keyId, result, st')
- where
-  capCached ccv =
-    case ccv_payload ccv of
-      Some value -> CapValueCached (CompApResult value ccv)
-      None -> CapMetaCached (ccv_meta ccv)
+capEvaluationStartedImpl :: (MonadIO m, IsCompResult a) => SimpleStateIf m -> CompAp a -> m ()
+capEvaluationStartedImpl sif cap = withSifState sif $ \st -> liftIO $
+  withRow st cap $ \_defIdx dt row _fresh -> DT.setPending dt row True
 
-fromSifState :: SimpleStateIf m -> (SifState -> a) -> m a
-fromSifState (SimpleStateIf{..}) f = ssif_withState (\x -> (f x, x))
-
-withSifState :: SimpleStateIf m -> (SifState -> (a, SifState)) -> m a
-withSifState (SimpleStateIf{..}) = ssif_withState
-
-dequeueNextCapImpl :: Monad m => SimpleStateIf m -> m (Maybe (AnyCompAp))
-dequeueNextCapImpl sif =
-  do
-    res <- withSifState sif nextStaleCap
-    return res
- where
-  nextStaleCap :: SifState -> (Maybe AnyCompAp, SifState)
-  nextStaleCap ges =
-    case Paq.dequeue curQ of
-      None ->
-        pureDebug
-          ("Cache has " ++ show instanceCount ++ " entries.")
-          (Nothing, ges)
-      Some (e :!: newQ) ->
-        pureDebug
-          ( "Dequeued "
-              ++ show (Paq.paqe_key e)
-              ++ " with "
-              ++ show (Paq.size newQ)
+dequeueGivenCapImpl :: (MonadIO m, IsCompResult a) => SimpleStateIf m -> CompAp a -> m Bool
+dequeueGivenCapImpl sif cap = withSifState sif $ \st -> liftIO $
+  withRow st cap $ \defIdx _dt row _fresh -> do
+    let ref = DT.packRef defIdx row
+    q <- readIORef (sifs_stale st)
+    case Paq.deleteView ref q of
+      Some (_ :!: q') -> do
+        writeIORef (sifs_stale st) q'
+        logDebug
+          ( show (capId cap)
+              ++ " dequeued, "
+              ++ show (Paq.size q')
               ++ " stale caps remaining."
           )
-          $ let newSt =
-                  ges
-                    { sifs_stale = newQ
-                    }
-             in (Just (Paq.paqe_key e), newSt)
-   where
-    curQ = sifs_stale ges
-    cache = sifs_cache ges
-    instanceCount = SifCache.totalInstanceCount cache
+        pure True
+      None -> pure False
 
-capEvaluationStartedImpl :: IsCompResult a => SimpleStateIf m -> CompAp a -> m ()
-capEvaluationStartedImpl sif cap =
-  withSifState sif $ \s ->
-    let newPendingCaps = Set.insert (AnyCompAp cap) (sifs_pendingCaps s)
-     in ((), s{sifs_pendingCaps = newPendingCaps})
+dequeueNextCapImpl :: MonadIO m => SimpleStateIf m -> m (Maybe AnyCompAp)
+dequeueNextCapImpl sif = withSifState sif $ \st -> liftIO $ do
+  q <- readIORef (sifs_stale st)
+  case Paq.dequeue q of
+    None -> pure Nothing
+    Some (e :!: q') -> do
+      writeIORef (sifs_stale st) q'
+      Just <$> resolveRefToAny st (Paq.paqe_key e)
 
-putCapResultImpl
-  :: SimpleStateIf m
+mkPaqEntry :: PaqPriority -> DefRef -> Paq.PaqEntry DefRef ()
+mkPaqEntry prio ref = Paq.PaqEntry (Paq.PaqTime 0) prio ref ()
+
+-- | Enqueue a set of refs as stale, skipping any that are currently
+-- pending (mid-evaluation) -- same rule as Stage 0/1's @invalidate@,
+-- rephrased against a per-row pending flag instead of a separate pending
+-- set. Priority comes from each ref's own def (@compId_priority@, via the
+-- def's 'Comp' -- Stage 0/1 read this off an 'AnyCompAp' via
+-- 'anyCompApPriority'; same source, reached differently). Returns exactly
+-- the refs that were *newly* added to the queue (excludes both
+-- pending-skipped refs and refs that were already queued) -- the set
+-- 'finishCap'/'notifyDepChange' report back through the public interface,
+-- matching Stage 0/1's @invalidate@ return value.
+enqueueRefs :: SifState -> HashSet DefRef -> IO (HashSet DefRef)
+enqueueRefs st refs = fmap (HashSet.fromList . catMaybes) $ forM (HashSet.toList refs) $ \ref -> do
+  let (defIdx, row) = DT.unpackRef ref
+  defs <- readIORef (sifs_defs st)
+  case IntMap.lookup defIdx defs of
+    Nothing -> pure Nothing -- resolved to a dead def; nothing to enqueue
+    Just (SomeDefEntry comp dt) -> do
+      flags <- DT.readFlags dt row
+      if DT.flagsPending flags
+        then pure Nothing
+        else do
+          q <- readIORef (sifs_stale st)
+          let (how, q') = Paq.enqueue (mkPaqEntry (compId_priority (comp_name comp)) ref) q
+          writeIORef (sifs_stale st) q'
+          pure $ case how of
+            Paq.EnqueueAddedNewEntry -> Just ref
+            Paq.EnqueueUpdatedEntry -> Nothing
+
+removeFromStale :: SifState -> DefRef -> IO ()
+removeFromStale st ref = modifyIORef' (sifs_stale st) (Paq.delete ref)
+
+--
+-- Dependency bookkeeping: splitting a public DepSet into comp-dep
+-- (target -> observed version) and src-deps, interning any not-yet-seen
+-- comp-dep target along the way.
+--
+
+splitDeps :: SifState -> DepSet -> IO (IntMap CompDepVer, HashSet AnyCompSrcDep)
+splitDeps st deps = foldM step (IntMap.empty, HashSet.empty) (HashSet.toList deps)
+ where
+  step (!comps, !srcs) dep =
+    case dep of
+      CompEngDepSrc x -> pure (comps, HashSet.insert x srcs)
+      CompEngDepComp (CompDep (Dep (CompDepKey (AnyCompAp targetCap)) observedVer)) -> do
+        ref <- withRow st targetCap (\defIdx _dt row _fresh -> pure (DT.packRef defIdx row))
+        pure (IntMap.insert ref observedVer comps, srcs)
+
+--
+-- Edge (rdeps/src-index) bookkeeping and garbage collection. None of these
+-- need the CPS treatment: each resolves its own SomeDefEntry locally and
+-- only ever touches p/a-oblivious columns (flags, hashes, edges).
+--
+
+addRdep :: SifState -> DefRef -> DefRef -> IO ()
+addRdep st targetRef ref = do
+  let (tDef, tRow) = DT.unpackRef targetRef
+  defs <- readIORef (sifs_defs st)
+  case IntMap.lookup tDef defs of
+    Nothing -> pure () -- shouldn't happen: target must be alive, we just depended on it
+    Just (SomeDefEntry _ dt) -> do
+      rd <- DT.readRdeps dt tRow
+      unless (VU.elem ref rd) $ DT.writeRdeps dt tRow (VU.snoc rd ref)
+
+-- | Remove @ref@ from a target's rdeps; if the target's rdeps become
+-- empty as a result (nothing depends on it any more), cascade-free it --
+-- unless it's currently pending (mid-evaluation), in which case it's left
+-- alone: something further up the active call stack still has an
+-- in-flight, not-yet-recorded intent to depend on it.
+removeRdep :: SifState -> DefRef -> DefRef -> IO Garbage
+removeRdep st targetRef ref = do
+  let (tDef, tRow) = DT.unpackRef targetRef
+  defs <- readIORef (sifs_defs st)
+  case IntMap.lookup tDef defs of
+    Nothing -> pure mempty
+    Just (SomeDefEntry _ dt) -> do
+      rd <- DT.readRdeps dt tRow
+      let rd' = VU.filter (/= ref) rd
+      DT.writeRdeps dt tRow rd'
+      if VU.null rd'
+        then do
+          flags <- DT.readFlags dt tRow
+          if DT.flagsPending flags
+            then pure mempty
+            else freeRowCascade st tDef tRow
+        else pure mempty
+
+freeRowCascade :: SifState -> Int -> Int -> IO Garbage
+freeRowCascade st defIdx row = do
+  defs <- readIORef (sifs_defs st)
+  case IntMap.lookup defIdx defs of
+    Nothing -> pure mempty
+    Just (SomeDefEntry _ dt) -> do
+      let ref = DT.packRef defIdx row
+      capAny <- resolveRefToAny st ref
+      paramHash <- DT.readParamHash dt row
+      myCompDeps <- DT.compDepTargets <$> DT.readCompDeps dt row
+      mySrcDeps <- DT.readSrcDeps dt row
+      outs <- readIORef (sifs_outputs st)
+      let mOldOutputs = OM.lookup ref outs
+          oldOutputs = fromMaybe mempty mOldOutputs
+      DT.freeRow dt paramHash row
+      let outs' = OM.delete ref outs
+      writeIORef (sifs_outputs st) outs'
+      removeFromStale st ref
+      compGarbage <- fmap mconcat $ forM (VU.toList myCompDeps) $ \t -> removeRdep st t ref
+      srcGarbageKeys <- fmap catMaybes $ forM (HashSet.toList mySrcDeps) $ \dep -> removeSrcDependent st dep ref
+      -- Only outputs nothing *else* still claims are actually garbage --
+      -- e.g. two rows both writing to sink key "output": one dying must
+      -- not delete a key the other is still producing. Filtered against
+      -- outs' (this row's own entry already removed), matching Stage 0/1.
+      let garbOutputs = OM.filterUnreferencedOutputs outs' oldOutputs
+          outsGarbage =
+            if nullAnyOutsMap garbOutputs
+              then mempty
+              else mempty{garbage_outputs = HashMap.singleton capAny garbOutputs}
+      pure
+        ( mempty
+            { garbage_caps = HashSet.singleton capAny
+            , garbage_deps = HashSet.fromList srcGarbageKeys
+            }
+            <> compGarbage
+            <> outsGarbage
+        )
+
+addSrcDependent :: SifState -> AnyCompSrcDep -> DefRef -> IO ()
+addSrcDependent st dep ref = do
+  let key = depKey dep
+      ver = depVer dep
+  modifyIORef' (sifs_srcIndex st) $
+    HashMap.insertWith
+      (\_new old -> old{se_dependents = HashMap.insert ref ver (se_dependents old)})
+      key
+      (SrcEntry (HashMap.singleton ref ver))
+
+-- | Remove @ref@ from a source key's dependent set; if that empties it,
+-- drop the key entirely and report it as a garbage dep (for
+-- 'Control.Computations.CompEngine.Run' to tell the source to unregister
+-- it), returning 'Just' that key.
+removeSrcDependent :: SifState -> AnyCompSrcDep -> DefRef -> IO (Maybe AnyCompSrcKey)
+removeSrcDependent st dep ref = do
+  let key = depKey dep
+  idx <- readIORef (sifs_srcIndex st)
+  case HashMap.lookup key idx of
+    Nothing -> pure Nothing
+    Just entry -> do
+      let deps' = HashMap.delete ref (se_dependents entry)
+      if HashMap.null deps'
+        then do
+          modifyIORef' (sifs_srcIndex st) (HashMap.delete key)
+          pure (Just key)
+        else do
+          modifyIORef' (sifs_srcIndex st) (HashMap.insert key entry{se_dependents = deps'})
+          pure Nothing
+
+-- | Update a row's forward edge columns (comp-deps with their observed
+-- versions, and src-deps) from old to new, diffing to add/remove the
+-- corresponding rdeps/src-index entries, cascading garbage collection for
+-- anything that becomes unreferenced as a result.
+updateEdges
+  :: DefTable p a
+  -> SifState
+  -> DefRef
+  -> VU.Vector (Int, Word64, Word64)
+  -- ^ old comp-deps (with observed versions)
+  -> IntMap CompDepVer
+  -- ^ new comp-deps (target -> observed version)
+  -> HashSet AnyCompSrcDep
+  -> HashSet AnyCompSrcDep
+  -> IO Garbage
+updateEdges dt st row oldCompVer newCompVerMap oldSrc newSrc = do
+  let oldCompTargets = IntSet.fromList (VU.toList (DT.compDepTargets oldCompVer))
+      newCompTargets = IntMap.keysSet newCompVerMap
+      addedComp = IntSet.difference newCompTargets oldCompTargets
+      removedComp = IntSet.difference oldCompTargets newCompTargets
+      addedSrc = HashSet.difference newSrc oldSrc
+      removedSrc = HashSet.difference oldSrc newSrc
+      newTriples =
+        VU.fromList
+          [(t, hi, lo) | (t, v) <- IntMap.toList newCompVerMap, let (hi, lo) = encodeVer v]
+
+  DT.writeCompDeps dt (DT.refRow row) newTriples
+  DT.writeSrcDeps dt (DT.refRow row) newSrc
+
+  -- Removes before adds, deliberately: removedSrc/addedSrc are diffed on
+  -- the *full* (key, version) pair, so a row observing the same source key
+  -- at a new version produces both a removal (old key@version) and an
+  -- addition (new key@version) for the *same* row against the *same*
+  -- se_dependents entry -- but addSrcDependent/removeSrcDependent both key
+  -- off the row alone (se_dependents doesn't have room for "the same row,
+  -- twice, at two versions"). Adding first and removing second would let
+  -- the stale removal wipe the fresh add right back out.
+  compGarbage <- fmap mconcat $ forM (IntSet.toList removedComp) $ \t -> removeRdep st t row
+  forM_ (IntSet.toList addedComp) $ \t -> addRdep st t row
+
+  srcGarbageKeys <- fmap catMaybes $ forM (HashSet.toList removedSrc) $ \dep -> removeSrcDependent st dep row
+  forM_ (HashSet.toList addedSrc) $ \dep -> addSrcDependent st dep row
+
+  pure (compGarbage <> mempty{garbage_deps = HashSet.fromList srcGarbageKeys})
+
+checkSelfStale :: SifState -> IntMap CompDepVer -> IO Bool
+checkSelfStale st comps = or <$> mapM checkOne (IntMap.toList comps)
+ where
+  checkOne (ref, observedVer) = do
+    let (tDef, tRow) = DT.unpackRef ref
+    defs <- readIORef (sifs_defs st)
+    case IntMap.lookup tDef defs of
+      Nothing -> pure False
+      Just (SomeDefEntry _ dt) -> do
+        curVer <- currentVer dt tRow
+        pure (observedVer /= curVer)
+
+currentVer :: DefTable p a -> Int -> IO CompDepVer
+currentVer dt row = do
+  flags <- DT.readFlags dt row
+  case DT.flagsResultState flags of
+    ResultFailure -> pure (CompDepVer None)
+    NoResult -> pure (CompDepVer None)
+    _ -> CompDepVer . Some <$> DT.readResultHash dt row
+
+writeFinishedRow :: DefTable p a -> Int -> ResultState -> Maybe Hash128 -> Maybe a -> IO ()
+writeFinishedRow dt row rs mh mres = do
+  flags <- DT.readFlags dt row
+  DT.writeFlags dt row (DT.mkFlags (DT.flagsAlive flags) (DT.flagsPending flags) rs)
+  case mh of
+    Just h -> DT.writeResultHash dt row h
+    Nothing -> DT.clearResultHash dt row
+  case (rs, mres) of
+    (ResultValue, Just v) -> DT.writeValue dt row v
+    _ -> pure ()
+
+--
+-- Finishing a cap's evaluation: the columnar analogue of Stage 0/1's
+-- putCapRes. See the module haddock for the changed-bit semantics this
+-- implements in place of VerList.
+--
+
+capEvaluationFinishedImpl
+  :: forall m a
+   . (MonadIO m, IsCompResult a)
+  => SimpleStateIf m
   -> CompAp a
   -> DepSet
   -> Maybe a
   -> m (HashSet AnyCompAp, Garbage)
-putCapResultImpl sif cap deps mres =
-  withSifState sif (putCapRes cap deps (maybeToOption mres))
+capEvaluationFinishedImpl sif cap deps mres =
+  withSifState sif $ \st -> liftIO $
+    withRow st cap $ \defIdx dt row _fresh ->
+      finishCap st cap defIdx dt row deps mres
 
-runGc
-  :: String
-  -> SifState
-  -> Garbage
-  -> HashSet InternedDepKey
-  -> (SifState, Garbage)
-runGc capIdStr !origS del@(Garbage _delCaps _delDeps delOutsMap) garbage =
-  case HashSet.toList garbage of
-    [] ->
-      let delOuts = unionsAnyCompSinkOutsMap $ HashMap.elems delOutsMap
-       in ( origS
-          , if not (nullAnyOutsMap delOuts)
-              then
-                pureInfo
-                  ( "Change of "
-                      ++ capIdStr
-                      ++ " unreferenced "
-                      ++ ( if sizeAnyOutsMap delOuts == 1
-                            then "one output: "
-                            else show (sizeAnyOutsMap delOuts) ++ " outputs:\n"
-                         )
-                      ++ ( intercalate "\n" $
-                            map (("- " ++) . show) (anyOutsMapToList delOuts)
-                         )
-                  )
-                  del
-              else del
-          )
-    x@(InternedDepKeyComp capIntId) : _ ->
-      let capAny = Intern.resolve capIntId (sifs_intern origS)
-          (dm', garbage') = DepMap.delete capIntId (sifs_deps origS)
-          oldOuts = sifs_outputs origS
-          newOuts = OM.delete capIntId oldOuts
-          newS =
-            origS
-              { sifs_deps = dm'
-              , sifs_cache = SifCache.delete capIntId (sifs_cache origS)
-              , sifs_vermap = IntMap.delete capIntId (sifs_vermap origS)
-              , sifs_outputs = newOuts
-              , sifs_stale = Paq.delete capAny (sifs_stale origS)
-              , sifs_intern = Intern.release capIntId (sifs_intern origS)
-              }
-          newGarbage = HashSet.delete x garbage `HashSet.union` garbage'
-          garbageOutputs =
-            maybe mempty (OM.filterUnreferencedOutputs newOuts) $
-              OM.lookup capIntId oldOuts
-          moreDel =
-            emptyGarbage
-              { garbage_caps = HashSet.singleton capAny
-              , garbage_outputs =
-                  if garbageOutputs == mempty
-                    then mempty
-                    else HashMap.singleton capAny garbageOutputs
-              }
-          del' = del `mappend` moreDel
-       in runGc capIdStr newS del' newGarbage
-    x@(InternedDepKeySrc srcDepKey) : _ ->
-      let moreDel =
-            emptyGarbage{garbage_deps = HashSet.singleton srcDepKey}
-       in runGc capIdStr origS (del <> moreDel) (HashSet.delete x garbage)
-
-insertCapWithDeps
-  :: Int
-  -> AnyCompAp
-  -> HashSet InternedDep
-  -> SifState
-  -> (SifState, Maybe (HashSet InternedDep), Garbage)
-insertCapWithDeps capIntId capAny deps sIn =
-  let capIdStr = show (anyCapId capAny)
-      mOldOutputs = OM.lookup capIntId (sifs_outputs sIn)
-      oldOutputs = fromMaybe mempty mOldOutputs
-      newOutputs = Map.findWithDefault mempty capAny (sifs_pendingOutputs sIn)
-      addOutputs = newOutputs `diffAnyOutsMap` oldOutputs
-      delOutputs = oldOutputs `diffAnyOutsMap` newOutputs
-      addCount = sizeAnyOutsMap addOutputs
-      delCount = sizeAnyOutsMap delOutputs
-      changeCount = addCount + delCount
-      outputsChanged = newOutputs /= oldOutputs
-      s = commitPendingOutputsForKey sIn capIntId capAny
-      garbOutputs = OM.filterUnreferencedOutputs (sifs_outputs s) delOutputs
-      logOutputs x =
-        logMsg1 msg1 $!
-          logMsg2 msg2 $!
-            x
-       where
-        logMsg1
-          | changeCount > 0 && isJust mOldOutputs = pureInfo
-          | changeCount > 0 = pureDebug
-          | outputsChanged = pureDebug
-          | nullAnyOutsMap oldOutputs && nullAnyOutsMap newOutputs = pureNoLog
-          | otherwise = pureDebug
-        logMsg2
-          | changeCount > 0 = pureDebug
-          | outputsChanged = pureDebug
-          | otherwise = pureNoLog
-        msg1 =
-          ( capIdStr
-              ++ " now has "
-              ++ show (sizeAnyOutsMap newOutputs)
-              ++ " outputs. "
-              ++ "It previously had "
-              ++ show (sizeAnyOutsMap oldOutputs)
-              ++ " (+"
-              ++ show addCount
-              ++ "/-"
-              ++ show delCount
-              ++ ")"
-              ++ ( if changeCount == 0
-                    then ". No keys changed."
-                    else if changeCount > 1 then ":\n" else ": "
-                 )
-              ++ ( intercalate
-                    "\n"
-                    ( mapAnyOutsMap (\_ -> ("+ " ++) . show) addOutputs
-                        ++ mapAnyOutsMap (\_ -> ("- " ++) . show) delOutputs
-                    )
-                 )
-          )
-        msg2 =
-          ( "Outputs of "
-              ++ show capAny
-              ++ " changed:\n"
-              ++ "Old outputs: "
-              ++ show oldOutputs
-              ++ "\n"
-              ++ "New outputs: "
-              ++ show newOutputs
-          )
-      (tempDepMap, mOldDeps, directGarbage) = DepMap.insert' capIntId deps (sifs_deps s)
-      tempS = s{sifs_deps = tempDepMap}
-      (newS, allGarbageCaps) = runGc capIdStr tempS emptyGarbage directGarbage
-      allGarbage =
-        if nullAnyOutsMap garbOutputs
-          then allGarbageCaps
-          else
-            allGarbageCaps
-              `mappend` (mempty{garbage_outputs = HashMap.singleton capAny garbOutputs})
-      notify (x, d, g) =
-        if g == mempty
-          then (x, d, g)
-          else
-            pureDebug
-              ( "Insertion of "
-                  ++ capIdStr
-                  ++ " led to garbage: "
-                  ++ show allGarbage
-              )
-              (x, d, g)
-      msg = ("insertCapWithDeps " ++ capIdStr ++ " <- " ++ show (HashSet.toList deps))
-   in pureDebug msg $!
-        logOutputs $!
-          notify $!
-            ( newS
-            , mOldDeps
-            , allGarbage
-            )
-
-putCapRes
-  :: CompAp a
+finishCap
+  :: forall p a
+   . IsCompResult a
+  => SifState
+  -> CompAp a
+  -> Int
+  -> DefTable p a
+  -> Int
   -> DepSet
-  -> Option a
-  -> SifState
-  -> ((HashSet AnyCompAp, Garbage), SifState)
-putCapRes gap@(CompAp{cap_comp = Comp{comp_caching = CompCacheBehavior{..}}}) deps res s0 =
-  let capAny = AnyCompAp gap
-      -- Intern this cap (also fetches its current cache entry, if any) and
-      -- every dep it references. This is the replacement for the old
-      -- `normalizeDep`/sharing-trick: the interned id already is the
-      -- canonical identity, there's no separate "canonical shared object"
-      -- left to look up.
-      (capIntId, oldCcv, s0a) = lookupCapResultImpl' gap s0
-      (internedDeps, s1) = internDepSet deps s0a
+  -> Maybe a
+  -> IO (HashSet AnyCompAp, Garbage)
+finishCap st cap defIdx dt row deps mres = do
+  let ref = DT.packRef defIdx row
+      capIdStr = show (capId cap)
+      capAny = AnyCompAp cap
 
-      ccv = fmap ccb_memcache res
-      anyCcv = fmap AnyCompCacheValue ccv
-      newVer = CompDepVer (fmap ccv_largeHash ccv)
-      key = anyCapId capAny
-      oldVer = fmap capResultToVer oldCcv
-      staleInt = DepMap.stale (InternedDepComp capIntId newVer) (sifs_deps s1)
-      (s2, oldDeps, garbage) = insertCapWithDeps capIntId capAny internedDeps s1
-      s3 =
-        -- first delete current cap from queue - if it's stale it should be enqueued at the end
-        s2{sifs_stale = Paq.delete capAny (sifs_stale s2)}
-      s4 =
-        let prevS = s3
-            cache =
-              SifCache.insert capIntId capAny (optionToCapResult anyCcv) (sifs_cache prevS)
-            vermap = IntMap.insert capIntId newVer (sifs_vermap prevS)
-         in s3
-              { sifs_cache = cache
-              , sifs_vermap = vermap
-              }
-      (newStaleCaps, s5)
-        | oldDeps == Just internedDeps
-            && oldVer /= CapNotFound
-            && oldVer /= CapFound newVer =
-            pureError
-              ( "Impure cap "
-                  ++ show gap
-                  ++ " returned different result than previously "
-                  ++ " although inputs didn't change.  Not marking anything as stale."
-                  ++ " New result:\n"
-                  ++ show ccv
-                  ++ "\nOld result:\n"
-                  ++ show oldCcv
-                  ++ "\nDeps are: "
-                  ++ concatMap (("\n - " ++) . show) deps
-              )
-              (HashSet.empty, s4)
-        | otherwise =
-            let staleAny = resolveSet staleInt s4
-             in (if HashSet.null staleAny then pureNoLog else pureDebug)
-                  ( show key
-                      ++ " invalidates "
-                      ++ show (HashSet.size staleAny)
-                      ++ ( if HashSet.size staleAny >= 5
-                            then " caps:" ++ concatMap (("\n " ++) . show) staleAny
-                            else " caps " ++ show (HashSet.toList staleAny)
-                         )
-                  )
-                  (invalidate staleAny s4)
-      -- finally remove current cap from stack of pending caps (must be done after invalidate
-      -- because invalidate only enqueues caps that are not currently being calculated)
-      s6 =
-        case sifs_pendingCaps s5 of
-          xs
-            | capAny `Set.member` xs ->
-                s5{sifs_pendingCaps = Set.delete capAny xs}
-            | otherwise ->
-                pureError
-                  ( "Tried to pop "
-                      ++ show key
-                      ++ " from pending set but "
-                      ++ "it's not contained:\n"
-                      ++ concatMap (("\n " ++) . show) xs
-                  )
-                  s5
-      s7 =
-        -- now store the current version of the cap in the verpmap and check if it's stale
-        let changedDeps = mapMaybe checkIfDepChanged (HashSet.toList internedDeps)
-            checkIfDepChanged idep =
-              case idep of
-                InternedDepSrc{} -> Nothing
-                InternedDepComp i observedVer ->
-                  case IntMap.lookup i (sifs_vermap s6) of
-                    Nothing ->
-                      pureError
-                        ( "Cap "
-                            ++ show key
-                            ++ " depends on "
-                            ++ show (Intern.resolve i (sifs_intern s6))
-                            ++ " but "
-                            ++ "it's not contained in the vermap."
-                        )
-                        Nothing
-                    Just curver
-                      | observedVer /= curver -> Just (i, curver)
-                      | otherwise -> Nothing
-            sNew =
-              s6{sifs_stale = snd $ Paq.enqueue (mkPaqEntry capAny) (sifs_stale s6)}
-         in case changedDeps of
-              [] -> s6
-              [(i, cur)] ->
-                pureInfo
-                  ( "Cap "
-                      ++ show key
-                      ++ " depends on the old "
-                      ++ show (Intern.resolve i (sifs_intern s6))
-                      ++ " but new version is "
-                      ++ show cur
-                      ++ ".  Invalidating current cap!"
-                  )
-                  sNew
-              xs ->
-                pureInfo
-                  ( "Cap "
-                      ++ show key
-                      ++ " depends on old caps. Invalidating current cap!"
-                      ++ concatMap
-                        (\(i, cur) -> "\n " ++ show (Intern.resolve i (sifs_intern s6)) ++ " --> " ++ show cur)
-                        xs
-                  )
-                  sNew
-   in ((newStaleCaps, garbage), s7)
+  oldFlags <- DT.readFlags dt row
+  let oldResultState = DT.flagsResultState oldFlags
+  oldHash <- if oldResultState == NoResult then pure Nothing else Just <$> DT.readResultHash dt row
+  oldCompDepsVer <- DT.readCompDeps dt row
+  oldSrcDeps <- DT.readSrcDeps dt row
+  -- who's currently watching this row -- read before this call mutates
+  -- anything (nothing below touches our *own* rdeps column).
+  rdeps <- DT.readRdeps dt row
 
-dequeueGivenCapImpl :: IsCompResult a => SimpleStateIf m -> CompAp a -> m Bool
-dequeueGivenCapImpl sif cap =
-  withSifState sif $ \sifs0 ->
-    let
-      -- first remove the cap from the queue of stale caps
-      (didDequeueCap, sifs1) =
-        case Paq.deleteView (AnyCompAp cap) (sifs_stale sifs0) of
-          Some (_ :!: q) ->
-            pureDebug
-              ( "Dequeued given cap "
-                  ++ show key
-                  ++ ", "
-                  ++ show (Paq.size q)
-                  ++ " stale caps remaining."
-              )
-              (True, sifs0{sifs_stale = q})
-          None ->
-            (False, sifs0)
-     in
-      (didDequeueCap, sifs1)
- where
-  key = capId cap
+  (newCompDepsVer, newSrcDeps) <- splitDeps st deps
 
-mkPaqEntry :: AnyCompAp -> Paq.PaqEntry (AnyCompAp) ()
-mkPaqEntry key =
-  Paq.PaqEntry (Paq.PaqTime 0) (anyCompApPriority key) key ()
+  -- cap_comp/cap_param aren't usable as plain functions on an existential
+  -- CompAp (GHC: "escaped type variables") -- pattern-match instead, same
+  -- as withRow/withDefFor do.
+  let ccb = case cap of CompAp _ comp _ -> comp_caching comp
+      mccv = fmap (ccb_memcache ccb) mres
+      newHash = fmap (ccm_largeHash . ccv_meta) mccv
+      newResultState = case mccv of
+        Nothing -> ResultFailure
+        Just ccv -> case ccv_payload ccv of
+          Some _ -> ResultValue
+          None -> ResultMetaOnly
+      oldCompDepsMap =
+        IntMap.fromList [(t, decodeVer (hi, lo)) | (t, hi, lo) <- VU.toList oldCompDepsVer]
+      sameDeps = oldCompDepsMap == newCompDepsVer && oldSrcDeps == newSrcDeps
+      impure = sameDeps && oldResultState /= NoResult && oldHash /= newHash
+
+  when impure $
+    logError
+      ( "Impure cap "
+          ++ capIdStr
+          ++ " returned a different result than previously although inputs "
+          ++ "didn't change. Not marking anything as stale. New hash: "
+          ++ show newHash
+          ++ ", old hash: "
+          ++ show oldHash
+      )
+
+  -- Commit the new value/hash and edge columns unconditionally -- Stage
+  -- 0/1 also updated its containers before ever branching on the impure
+  -- check.
+  writeFinishedRow dt row newResultState newHash mres
+  edgeGarbage <- updateEdges dt st ref oldCompDepsVer newCompDepsVer oldSrcDeps newSrcDeps
+  outputGarbage <- commitPendingOutputsForKey st ref capAny
+  let garbage = edgeGarbage <> outputGarbage
+  removeFromStale st ref
+  DT.setPending dt row False
+
+  if impure
+    then pure (HashSet.empty, garbage)
+    else do
+      let resultChanged = oldResultState /= newResultState || oldHash /= newHash
+      newlyStale <-
+        if resultChanged
+          then enqueueRefs st (HashSet.fromList (VU.toList rdeps))
+          else pure HashSet.empty
+      selfStale <- checkSelfStale st newCompDepsVer
+      -- self-enqueue happens (it's the mechanism keeping this cap on the
+      -- queue), but -- matching Stage 0/1's putCapRes, where the returned
+      -- newStaleCaps was bound before the self-check ran -- it never shows
+      -- up in the *reported* stale set below, only in the actual queue.
+      when selfStale $ void $ enqueueRefs st (HashSet.singleton ref)
+      staleCaps <-
+        if resultChanged
+          then resolveRefsToAny st newlyStale
+          else pure HashSet.empty
+      pure (staleCaps, garbage)
+
+--
+-- Source-change notification (the only place enqueueStaleCaps is actually
+-- called with -- see Impl.hs's notifyCompEngine, always CompEngDepSrc).
+--
 
 enqueueStaleCapsImpl
-  :: (Foldable t)
+  :: (MonadIO m, Foldable t)
   => SimpleStateIf m
-  -> t (CompEngDep)
-  -> m (EnqueueInfo)
-enqueueStaleCapsImpl sif deps =
-  withSifState sif $ \gesOld ->
-    let (depsWithStaleCaps, gesNew) = notifyDepChanges deplist gesOld
-        affectedStaleCaps = mkRecompInfoMap depsWithStaleCaps
-        enqueueInfo =
-          EnqueueInfo
-            { ei_affectedCaps = affectedStaleCaps
-            , ei_currentQueueSize = Paq.size (sifs_stale gesNew)
-            }
-     in (enqueueInfo, gesNew)
- where
-  deplist = F.toList deps
-  notifyDepChanges deps state =
-    F.foldl'
-      ( \(xs, state) dep ->
-          let (set, newState) = notifyDepChange dep state
-           in ((dep, set) : xs, newState)
-      )
-      ([], state)
-      deps
+  -> t CompEngDep
+  -> m EnqueueInfo
+enqueueStaleCapsImpl sif deps = withSifState sif $ \st -> liftIO $ do
+  affected <- forM (F.toList deps) $ \dep -> do
+    stale <- notifyDepChange st dep
+    pure (dep, stale)
+  let affectedStaleCaps = mkRecompInfoMap affected
+  qsize <- Paq.size <$> readIORef (sifs_stale st)
+  pure EnqueueInfo{ei_affectedCaps = affectedStaleCaps, ei_currentQueueSize = qsize}
 
-  notifyDepChange dep oldS =
-    let staleAny =
-          case queryInternedDep dep (sifs_intern oldS) of
-            Nothing -> HashSet.empty
-            Just idep -> resolveSet (DepMap.stale idep (sifs_deps oldS)) oldS
-        msg = "Change " ++ show dep ++ " invalidates " ++ show staleAny
-        maybeLog
-          | HashSet.null staleAny =
-              pureDebug $
-                "Nothing depends on (an old version of) " ++ show dep
-          | otherwise = pureDebug msg
-        (_addedKeys, newS) = invalidate staleAny oldS
-     in maybeLog (staleAny, newS)
-
-{- | Enqueues all given caps in the queue of stale caps an returns those that were not already
- enqueued.
--}
-invalidate :: HashSet AnyCompAp -> SifState -> (HashSet AnyCompAp, SifState)
-invalidate stale ges =
-  let foldFun s@(newStaleCaps, curQ) x
-        | x `Set.member` sifs_pendingCaps ges =
-            -- don't enqueue cap that has already been dequeued for computation
-            s
-        | otherwise =
-            case Paq.enqueue (mkPaqEntry x) curQ of
-              (Paq.EnqueueAddedNewEntry, nextQ) -> (HashSet.insert x newStaleCaps, nextQ)
-              (Paq.EnqueueUpdatedEntry, nextQ) -> (newStaleCaps, nextQ)
-      (enqueuedCaps, newQ) = F.foldl' foldFun (HashSet.empty, sifs_stale ges) stale
-   in (enqueuedCaps, ges{sifs_stale = newQ})
+-- | 'CompEngDepComp' is unreachable in practice (see the haddock above),
+-- handled defensively (no-op) rather than erroring: it's not a bug if hit,
+-- just unused by anything today.
+notifyDepChange :: SifState -> CompEngDep -> IO (HashSet AnyCompAp)
+notifyDepChange _st (CompEngDepComp _) = pure HashSet.empty
+notifyDepChange st (CompEngDepSrc srcDep) = do
+  let key = depKey srcDep
+      newVer = depVer srcDep
+  idx <- readIORef (sifs_srcIndex st)
+  case HashMap.lookup key idx of
+    Nothing -> pure HashSet.empty
+    Just entry -> do
+      -- Invalidate only the dependents whose *own* recorded observation
+      -- differs from the new version -- not "everyone who depends on this
+      -- key" (see SrcEntry's haddock for why that's required, not just a
+      -- nicety). Deliberately does not write the new version back into
+      -- se_dependents: like VerList, a dependent's recorded version only
+      -- moves when *it* re-registers via a real finish (updateEdges), not
+      -- merely because a notification went by.
+      let staleRefs =
+            HashSet.fromList
+              [r | (r, v) <- HashMap.toList (se_dependents entry), v /= newVer]
+      -- Actually enqueue (the side effect, internally pending-aware); but
+      -- -- matching Stage 0/1's notifyDepChange, which reported
+      -- DepMap.stale's raw result and discarded invalidate's filtered
+      -- "_addedKeys" -- report the full stale-relative-to-this-notification
+      -- set regardless of whether each one was already queued or is
+      -- mid-evaluation. (EnqueueInfo answers "who's affected by this
+      -- change", not "who did this call newly enqueue"; contrast
+      -- finishCap's staleCaps, which answers the latter and does use
+      -- enqueueRefs's filtered return.)
+      void $ enqueueRefs st staleRefs
+      resolveRefsToAny st staleRefs

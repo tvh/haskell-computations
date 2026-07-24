@@ -12,6 +12,7 @@ module Control.Computations.CompEngine.Types (
   Comp (..),
   AnyComp (..),
   CompId,
+  compId_priority,
   mkCompId,
   mkCompIdWithPriority,
   mkCompIdFromText,
@@ -30,7 +31,6 @@ module Control.Computations.CompEngine.Types (
   anyCompCacheValueApply,
   castCompCacheValue,
   CompCacheMeta (..),
-  ccv_cacheSize,
 
   -- * Monad for building computation bodies
   CompM (..),
@@ -92,7 +92,6 @@ import Control.Computations.CompEngine.CompSink
 import Control.Computations.CompEngine.CompSrc
 import Control.Computations.CompEngine.Utils.DepMap (IsDep (..))
 import Control.Computations.CompEngine.Utils.PriorityAgingQueue (PaqPriority (..))
-import Control.Computations.Utils.DataSize
 import Control.Computations.Utils.Hash
 import Control.Computations.Utils.Logging
 import Control.Computations.Utils.Types
@@ -201,28 +200,29 @@ castCompCacheValue ccv =
  where
   targetType = typeRep (Proxy :: Proxy a)
 
-data CompCacheMeta = CompCacheMeta
+{- | Shrunk to the one field anything downstream of a cache entry actually
+ needs, as part of the columnar state-layer rewrite (docs/benchmark-notes.md
+ "Memory roadmap"): 'ccm_logrepr'/'ccm_approxCachedSize'/'ccm_cachedSize'
+ had no columnar equivalent (a per-row 'Text' render and a per-CompId size
+ tally that only "SifCache.hs" itself ever read) and are gone, not just
+ unused -- logging a value now 'show's the already-in-scope typed value
+ directly (see "Control.Computations.CompEngine.Impl"'s success-log line),
+ rather than pre-rendering and storing a logrepr nothing may ever look at.
+-}
+newtype CompCacheMeta = CompCacheMeta
   { ccm_largeHash :: Hash128
-  , ccm_logrepr :: T.Text
-  , ccm_approxCachedSize :: Option DataSize -- FIXME: what is needed from the size stuff?
-  , ccm_cachedSize :: Option Int
-  -- \| Size of the cached value in arbitrary unit.
-  -- For example number of patients, ...
   }
   deriving (Show, Eq, Typeable)
 
 instance Show (CompCacheValue a) where
   showsPrec p ccv =
     showParen (p > 10) $
-      showString "CompCacheValue { ccv_logrepr = "
-        . showString (T.unpack (ccm_logrepr (ccv_meta ccv)))
+      showString "CompCacheValue { ccv_largeHash = "
+        . shows (ccm_largeHash (ccv_meta ccv))
         . showString "}"
 
 instance Eq (CompCacheValue a) where
   (==) = (==) `on` (ccm_largeHash . ccv_meta)
-
-ccv_cacheSize :: CompCacheValue a -> Option DataSize
-ccv_cacheSize = ccm_approxCachedSize . ccv_meta
 
 {- | The (mutable, per-cap-evaluation) environment threaded through a single
  'CompM' computation. 'cme_compMap' is the same passthrough plumbing the old

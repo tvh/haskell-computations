@@ -24,9 +24,8 @@ import Control.Computations.Utils.Fail
 -- External
 ----------------------------------------
 
-import Control.Concurrent.STM
+import Control.Concurrent.STM (retry)
 import Control.Monad.IO.Class
-import Control.Monad.State.Strict (StateT, runStateT, state)
 import qualified Data.ByteString as BS
 import qualified Data.HashSet as HashSet
 import Data.Hashable
@@ -37,7 +36,11 @@ import Data.Typeable
 import GHC.Generics (Generic)
 import Test.Framework
 
-type TestM = StateT SifState IO
+-- | Was 'StateT SifState IO': the columnar rewrite's 'SifState' is a
+-- genuinely mutable handle rather than a pure value threaded through
+-- 'StateT', so there is no longer any state to thread -- 'TestM' collapses
+-- to plain 'IO'.
+type TestM = IO
 
 data TestStateSrc = TestStateSrc deriving (Show, Read, Eq, Ord, Generic, Typeable)
 
@@ -59,14 +62,9 @@ prepareTest
   -> IO ()
 prepareTest test =
   do
-    _ <- runStateT (test stateIf) initialSifState
-    return ()
- where
-  stateIf =
-    mkSimpleCompEngineStateIf $
-      SimpleStateIf
-        { ssif_withState = state
-        }
+    st <- newSifState
+    let stateIf = mkSimpleCompEngineStateIf (SimpleStateIf{ssif_withState = \f -> f st})
+    test stateIf
 
 test_capIsNotConsideredStaleAfterItHasBeenDequeuedAsNextCap :: IO ()
 test_capIsNotConsideredStaleAfterItHasBeenDequeuedAsNextCap =

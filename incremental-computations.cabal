@@ -39,7 +39,6 @@ library
       Control.Computations.CompEngine.Driver
       Control.Computations.CompEngine.Impl
       Control.Computations.CompEngine.Run
-      Control.Computations.CompEngine.SifCache
       Control.Computations.CompEngine.SimpleStateIf
       Control.Computations.CompEngine.Tests.TestCompEngine
       Control.Computations.CompEngine.Tests.TestDriver

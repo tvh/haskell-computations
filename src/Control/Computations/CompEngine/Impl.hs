@@ -46,7 +46,6 @@ import qualified Data.HashSet as HashSet
 import Data.IORef
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import qualified Data.Text as T
 
 newtype CompEngine = CompEngine
   { ce_compEngineIfs :: CompEngineIfs
@@ -253,9 +252,12 @@ evalCompAp outerCap =
       ( show outerCap
           ++ " --> "
           ++ ( case ev of
-                CompResultOk (cr_cacheValue -> ccv) ->
+                -- CompCacheMeta no longer pre-renders/stores a logrepr (see
+                -- its haddock in Types.hs) -- render the already-in-scope
+                -- typed value directly, on demand, only for this log line.
+                CompResultOk (CompApResult val ccv) ->
                   concat
-                    [ T.unpack (ccm_logrepr (ccv_meta ccv))
+                    [ take 40 (show val)
                     , " ("
                     , show (ccv_largeHash ccv)
                     , ")"
