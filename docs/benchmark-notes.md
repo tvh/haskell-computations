@@ -407,6 +407,42 @@ lazily allocate the per-cap IORef. If none of those recover the live-update
 regression, revert this stage — the doc's own rule: same-session A/B
 decides.
 
+## Stage 2.5 — specialize CompEngineM's monad stack (commit `4aab454`)
+
+The targeted follow-up Stage 2's disposition demanded, and it recovered
+the regression. Changes (Lever 1 only; the plain-IO loop restructure was
+not needed): `CompEngineM`'s GND-derived `Functor`/`Applicative`/`Monad`/
+`MonadIO` instances replaced with hand-written, representationally
+identical methods carrying `{-# INLINE #-}` (no custom `(>>)` —
+`-Wnoncanonical-monad-instances` forbids it; the default via the
+now-INLINE `Applicative` stands); `INLINE` on the small hot-path helpers
+(`withCompState`, `tellGarbage`, `tellOutputs`, `runCompEngineM`*);
+mtl's default **lazy** `StateT` swapped for `Control.Monad.State.Strict`;
+`INLINE` on `CompM`'s instance methods. No `SPECIALIZE` pragmas — the loop
+was already monomorphic; there was nothing to specialize from. Tests
+70/70 + app suite.
+
+Evidence, three independent signals agreeing:
+
+- The dictionary-trampoline cost center
+  (`$fMonadCompEngineM_$s$fMonadStateT_$c>>=`) is gone from the profile.
+- Total profiled alloc 7.48 → **6.71 GB** — below even Stage 1's 7.36 GB;
+  profiled ticks −28% vs Stage 2.
+- Three-way same-session A/B (Stage 1 / Stage 2 / fix) at scale 1.0,
+  `-A64m` (the low-noise config: ~590 GCs): **fix wins outright** —
+  cold **20.2 s** (vs 31.1 / 22.6), live **14.8 s** (vs 18.1 / 18.7).
+  That's −35% cold and −18% live against Stage 1, keeping Stage 2's
+  cold win *and* beating Stage 1's live number.
+
+Noise notes, for the record: scale-0.1 was too noisy this session to
+separate the three builds (~15% cluster); default-RTS live at 1.0 remains
+the noisiest metric in the doc (one Stage 2 sample swung 41.9 → 19.3 s
+across identical-binary rounds). The `-A64m` rows carry the conclusion.
+
+Disposition: **Stage 2 + 2.5 kept.** Cumulative best-config numbers at 1M
+now: cold **20.2 s**, live **14.8 s** — versus Stage 0's 42.8 s / 24.4 s
+(different sessions, so indicative only; but the direction is settled).
+
 ## Memory roadmap — the path to Rust parity ("nothing off the table")
 
 Where we stand at 1M caps (Stage 1/2 measurements): `max_live_bytes`
