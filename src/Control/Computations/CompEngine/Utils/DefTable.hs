@@ -650,3 +650,56 @@ test_noResultSentinelDoesNotCollideWithRealHashes =
   mapM_
     (\i -> assertBool (hashToPair (h i) /= noResultSentinel))
     [1 .. 50 :: Int]
+
+--
+-- Row reuse and garbage tolerance (Rust Stage 5's rules, ported): freeing a
+-- row must not physically clear its result-hash/value/edge columns -- only
+-- flags, param hash, and the caller-visible param/edge-reset fields that
+-- lookupOrInsertRow re-establishes on the *next* occupant. Everything else
+-- is left as garbage until overwritten, safe only because every read is
+-- gated behind a flags check that reuse unconditionally clears first.
+--
+
+test_freeRowLeavesResultHashAndValueAsGarbageButFlagsGateThem :: IO ()
+test_freeRowLeavesResultHashAndValueAsGarbageButFlagsGateThem = do
+  dt <- newTest
+  (r1, _) <- lookupOrInsertRow dt (h 1) 111
+  writeResultHash dt r1 (h 999)
+  writeValue dt r1 (777 :: Int)
+  freeRow dt (h 1) r1
+  -- the row is dead -- callers must not trust it without checking flags
+  -- first (this module doesn't force-clear result_hash/value: reusing the
+  -- row is what re-establishes a safe state, matching Rust Stage 5)
+  alive <- isAlive dt r1
+  assertBool (not alive)
+  -- reuse: a fresh occupant of the same row number gets fresh flags/param,
+  -- but the physical result_hash/value bytes are untouched garbage until
+  -- this new occupant's own finish overwrites them -- readable-but-stale,
+  -- never observed because nothing reads them without a flags check first.
+  (r2, fresh) <- lookupOrInsertRow dt (h 2) 222
+  assertBool fresh
+  assertEqual r1 r2
+  f <- readFlags dt r2
+  assertEqual NoResult (flagsResultState f)
+  assertBool (flagsAlive f)
+  staleHash <- readResultHash dt r2
+  assertEqual (h 999) staleHash -- old bytes, still physically there
+  staleVal <- readValue dt r2
+  assertEqual (777 :: Int) staleVal -- old bytes, still physically there
+  -- but the *new* occupant's own param is correct, not garbage
+  p <- readParam dt r2
+  assertEqual (222 :: Int) p
+
+test_freeRowResetsEdgesOnReuse :: IO ()
+test_freeRowResetsEdgesOnReuse = do
+  dt <- newTest
+  (r1, _) <- lookupOrInsertRow dt (h 1) 1
+  writeCompDeps dt r1 (VU.fromList [(5, 1, 2)])
+  writeRdeps dt r1 (VU.fromList [7, 8])
+  freeRow dt (h 1) r1
+  (r2, _) <- lookupOrInsertRow dt (h 2) 2
+  assertEqual r1 r2
+  cd <- readCompDeps dt r2
+  rd <- readRdeps dt r2
+  assertEqual VU.empty cd
+  assertEqual VU.empty rd

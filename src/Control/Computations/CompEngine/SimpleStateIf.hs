@@ -334,6 +334,27 @@ resolveRefToAny st ref = do
   defs <- readIORef (sifs_defs st)
   case IntMap.lookup defIdx defs of
     Just (SomeDefEntry comp dt) -> do
+      -- Every ref flowing through the state layer (stale queue, rdeps,
+      -- outputs) must originate from a row that is still alive -- garbage
+      -- collection (freeRowCascade) is responsible for scrubbing a dying
+      -- row out of every container that could hand its ref back here
+      -- before freeing it. Hitting a dead row is therefore always a
+      -- lifecycle bug, never a legitimate runtime occurrence -- fail
+      -- loudly instead of silently reading whatever garbage (or a
+      -- recycled occupant's data) happens to be sitting in the freed row's
+      -- columns, mirroring Stage 1's 'Utils.Intern.resolve' contract for
+      -- a released id.
+      alive <- DT.isAlive dt row
+      unless alive $
+        error
+          ( "SimpleStateIf.resolveRefToAny: ref "
+              ++ show ref
+              ++ " (def "
+              ++ show defIdx
+              ++ ", row "
+              ++ show row
+              ++ ") is not (or no longer) alive -- a lifecycle bug in the caller"
+          )
       p <- DT.readParam dt row
       pure (AnyCompAp (mkCompAp comp p))
     Nothing ->
