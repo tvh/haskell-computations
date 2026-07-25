@@ -1,3 +1,4 @@
+{-# LANGUAGE AllowAmbiguousTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# OPTIONS_GHC -F -pgmF htfpp #-}
 
@@ -242,6 +243,7 @@ import Control.Computations.Utils.Hash (Hash128 (..), largeHash128)
 -- EXTERNAL
 ----------------------------------------
 
+import Control.Applicative ((<|>))
 import Control.Monad (forM_, when)
 import Data.Bits
 import qualified Data.HashMap.Strict as HashMap
@@ -250,6 +252,8 @@ import qualified Data.HashSet as HashSet
 import Data.IORef
 import Data.Int (Int32)
 import qualified Data.LargeHashable as LH
+import Data.Type.Equality ((:~:) (Refl))
+import Data.Typeable (Typeable, eqT)
 import qualified Data.Vector.Generic.Mutable as GM
 import qualified Data.Vector.Mutable as VM
 import qualified Data.Vector.Unboxed as VU
@@ -385,6 +389,73 @@ growUnboxedZeroed ref needed = do
     vec' <- GM.unsafeGrow vec extra
     GM.set (GM.unsafeSlice cap extra vec') 0
     writeIORef ref vec'
+
+--
+-- Typed value columns (param / value): unboxed where the element type is
+-- provably one of a fixed set of primitives, boxed otherwise -- see the
+-- module haddock's "Typed value columns" section for the full rationale.
+-- Selection happens once, at column-construction time, via 'eqT' against
+-- @e@'s 'Typeable' instance; nothing on the read/write hot path branches on
+-- the *type*, only on which data constructor the already-built 'Column'
+-- happens to be (a single, cheap, wholly local pattern match GHC has every
+-- opportunity to specialize per call site).
+--
+
+-- | A param or value column. @e@ is unconstrained on 'ColBoxed' -- every
+-- type, including e.g. 'Data.ByteString.ByteString', goes through it; the
+-- existential 'VUM.Unbox' dictionary plus the @e :~: u@ equality witness on
+-- 'ColUnboxed' is what lets a single read\/write pair (below) work for both
+-- branches without a second, type-directed dispatch at every access.
+data Column e where
+  ColBoxed :: !(IORef (VM.IOVector e)) -> Column e
+  ColUnboxed :: (VUM.Unbox u) => !(e :~: u) -> !(IORef (VUM.IOVector u)) -> Column e
+
+-- | Build a fresh, empty column for @e@, choosing 'ColUnboxed' when @e@ is
+-- one of the fixed set of primitive types this module recognizes (mirrors
+-- the task brief's list: Word32\/Word64\/Int\/Char\/Bool\/Double -- the
+-- benchmark's own def bodies are @Word32@ param \/ @Word64@ result, so this
+-- exercises the unboxed path directly) and 'ColBoxed' for everything else
+-- (e.g. the test suite's @ByteString@/@String@ param\/result types).
+-- Requires only 'Typeable' @e@ -- already implied by both
+-- 'Control.Computations.CompEngine.Types.IsCompParam' and
+-- 'Control.Computations.CompEngine.Types.IsCompResult', so this adds no
+-- constraint beyond what every caller already has in scope; nothing in the
+-- public engine interface (@defineComp@, @wireComp@, etc.) changes shape.
+mkColumn :: forall e. (Typeable e) => IO (Column e)
+mkColumn =
+  case tryUnboxed of
+    Just mk -> mk
+    Nothing -> ColBoxed <$> (newIORef =<< VM.new 0)
+ where
+  tryUnboxed :: Maybe (IO (Column e))
+  tryUnboxed =
+    unboxedAs @Word32
+      <|> unboxedAs @Word64
+      <|> unboxedAs @Int
+      <|> unboxedAs @Char
+      <|> unboxedAs @Bool
+      <|> unboxedAs @Double
+  unboxedAs :: forall u. (Typeable u, VUM.Unbox u) => Maybe (IO (Column e))
+  unboxedAs = case eqT :: Maybe (e :~: u) of
+    Just Refl -> Just (ColUnboxed Refl <$> (newIORef =<< VUM.new 0))
+    Nothing -> Nothing
+
+-- | Test/introspection helper: which representation a column picked.
+columnIsUnboxed :: Column e -> Bool
+columnIsUnboxed ColBoxed{} = False
+columnIsUnboxed ColUnboxed{} = True
+
+colGrow :: Int -> Column e -> IO ()
+colGrow needed (ColBoxed ref) = growBoxed ref needed
+colGrow needed (ColUnboxed Refl ref) = growUnboxed ref needed
+
+colRead :: Column e -> Int -> IO e
+colRead (ColBoxed ref) row = readIORef ref >>= \v -> VM.read v row
+colRead (ColUnboxed Refl ref) row = readIORef ref >>= \v -> VUM.read v row
+
+colWrite :: Column e -> Int -> e -> IO ()
+colWrite (ColBoxed ref) row e = readIORef ref >>= \v -> VM.write v row e
+colWrite (ColUnboxed Refl ref) row e = readIORef ref >>= \v -> VUM.write v row e
 
 --
 -- CSR-style per-def edge arenas -- see the module haddock's "Edge storage"
@@ -692,9 +763,11 @@ data DefTable p a = DefTable
   { dt_paramHash :: !(IORef (VUM.IOVector (Word64, Word64)))
   , dt_resultHash :: !(IORef (VUM.IOVector (Word64, Word64)))
   , dt_flags :: !(IORef (VUM.IOVector Word8))
-  , dt_param :: !(IORef (VM.IOVector p))
-  , dt_value :: !(IORef (VM.IOVector a))
-  -- ^ valid only when 'flagsResultState' is 'ResultValue'
+  , dt_param :: !(Column p)
+  , dt_value :: !(Column a)
+  -- ^ valid only when 'flagsResultState' is 'ResultValue'. Unboxed when @a@
+  -- is one of 'mkColumn''s recognized primitive types, boxed otherwise --
+  -- see the "Typed value columns" section above.
   , dt_compDeps :: !EdgeArena
   -- ^ flat forward comp-dep edges, stride 3: (packed 'DefRef' this row
   -- depends on, the target's result hash *as observed* when this row last
@@ -722,13 +795,13 @@ data DefTable p a = DefTable
   -- ^ logical row count (<= every column's current capacity)
   }
 
-new :: IO (DefTable p a)
+new :: forall p a. (Typeable p, Typeable a) => IO (DefTable p a)
 new = do
   ph <- newIORef =<< VUM.new 0
   rh <- newIORef =<< VUM.new 0
   fl <- newIORef =<< VUM.new 0
-  pa <- newIORef =<< VM.new 0
-  va <- newIORef =<< VM.new 0
+  pa <- mkColumn
+  va <- mkColumn
   cd <- newEdgeArena
   rd <- newEdgeArena
   sd <- newIORef =<< VM.new 0
@@ -755,8 +828,8 @@ growAllTo dt needed = do
   growUnboxed (dt_paramHash dt) needed
   growUnboxed (dt_resultHash dt) needed
   growUnboxedZeroed (dt_flags dt) needed
-  growBoxed (dt_param dt) needed
-  growBoxed (dt_value dt) needed
+  colGrow needed (dt_param dt)
+  colGrow needed (dt_value dt)
   eaGrowRows (dt_compDeps dt) needed
   eaGrowRows (dt_rdeps dt) needed
   growBoxed (dt_srcDeps dt) needed
@@ -857,16 +930,16 @@ clearResultHash :: DefTable p a -> Int -> IO ()
 clearResultHash dt row = writeHash (dt_resultHash dt) row (pairToHash (0, 0))
 
 writeParam :: DefTable p a -> Int -> p -> IO ()
-writeParam dt row p = readIORef (dt_param dt) >>= \v -> VM.write v row p
+writeParam dt row p = colWrite (dt_param dt) row p
 
 readParam :: DefTable p a -> Int -> IO p
-readParam dt row = readIORef (dt_param dt) >>= \v -> VM.read v row
+readParam dt row = colRead (dt_param dt) row
 
 readValue :: DefTable p a -> Int -> IO a
-readValue dt row = readIORef (dt_value dt) >>= \v -> VM.read v row
+readValue dt row = colRead (dt_value dt) row
 
 writeValue :: DefTable p a -> Int -> a -> IO ()
-writeValue dt row a = readIORef (dt_value dt) >>= \v -> VM.write v row a
+writeValue dt row a = colWrite (dt_value dt) row a
 
 -- | Flatten a comp-dep edge set into stride-3 words (target, hash-hi,
 -- hash-lo) for 'eaWrite'.
@@ -1072,6 +1145,61 @@ test_valueRoundTrips = do
   writeValue dt r 12345
   v <- readValue dt r
   assertEqual (12345 :: Int) v
+
+--
+-- Column representation: mkColumn must pick ColUnboxed for the recognized
+-- primitive types (mirroring the benchmark's own Word32 param / Word64
+-- result) and ColBoxed for everything else (e.g. a non-unboxable param or
+-- result type such as String -- the task brief's fallback requirement),
+-- and both representations must round-trip correctly through DefTable's
+-- ordinary read/write API either way.
+--
+
+test_columnPicksUnboxedForRecognizedPrimitiveTypes :: IO ()
+test_columnPicksUnboxedForRecognizedPrimitiveTypes = do
+  (dtW32 :: DefTable Word32 Word64) <- new
+  assertBool (columnIsUnboxed (dt_param dtW32))
+  assertBool (columnIsUnboxed (dt_value dtW32))
+  (dtOther :: DefTable Bool Double) <- new
+  assertBool (columnIsUnboxed (dt_param dtOther))
+  assertBool (columnIsUnboxed (dt_value dtOther))
+
+-- | A non-unboxable param/result type (here 'String', standing in for the
+-- task brief's @ByteString@ example -- real param types in the test suite
+-- include both) must fall back to 'ColBoxed', not fail to build.
+test_columnFallsBackToBoxedForNonUnboxableTypes :: IO ()
+test_columnFallsBackToBoxedForNonUnboxableTypes = do
+  (dt :: DefTable String String) <- new
+  assertBool (not (columnIsUnboxed (dt_param dt)))
+  assertBool (not (columnIsUnboxed (dt_value dt)))
+
+-- | Round-trip through the unboxed path (Word32 param / Word64 result,
+-- exactly the benchmark's def shape) with values that exercise the full
+-- width of each type.
+test_unboxedColumnParamValueRoundTrip :: IO ()
+test_unboxedColumnParamValueRoundTrip = do
+  (dt :: DefTable Word32 Word64) <- new
+  (r, _) <- lookupOrInsertRow dt (h 1) maxBound
+  writeValue dt r maxBound
+  p <- readParam dt r
+  v <- readValue dt r
+  assertEqual (maxBound :: Word32) p
+  assertEqual (maxBound :: Word64) v
+
+-- | Round-trip through the boxed fallback path with a non-unboxable type
+-- (String), the case the task brief specifically asks to be covered: a
+-- real param/result type that can never satisfy an 'Unbox' constraint
+-- (like 'Data.ByteString.ByteString' in the wider test suite) must keep
+-- working unchanged.
+test_boxedColumnParamValueRoundTrip :: IO ()
+test_boxedColumnParamValueRoundTrip = do
+  (dt :: DefTable String String) <- new
+  (r, _) <- lookupOrInsertRow dt (h 1) "hello param"
+  writeValue dt r "hello value"
+  p <- readParam dt r
+  v <- readValue dt r
+  assertEqual "hello param" p
+  assertEqual "hello value" v
 
 test_freshRowHasEmptyEdges :: IO ()
 test_freshRowHasEmptyEdges = do
