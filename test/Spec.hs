@@ -13,7 +13,7 @@ import {-@ HTF_TESTS @-} Control.Computations.CompEngine.Tests.TestRevive
 import {-@ HTF_TESTS @-} Control.Computations.CompEngine.Tests.TestRun
 import {-@ HTF_TESTS @-} Control.Computations.CompEngine.Tests.TestStateIf
 import {-@ HTF_TESTS @-} Control.Computations.CompEngine.Utils.DefTableTest
-import {-@ HTF_TESTS @-} Control.Computations.CompEngine.Utils.OutputsMap
+import {-@ HTF_TESTS @-} Control.Computations.CompEngine.Utils.OutputsMapTest
 import {-@ HTF_TESTS @-} Control.Computations.CompEngine.Utils.PriorityAgingQueue
 import {-@ HTF_TESTS @-} Control.Computations.CompEngine.Utils.SrcIndexTest
 import {-@ HTF_TESTS @-} Control.Computations.FlowImpls.FileSinkTest
