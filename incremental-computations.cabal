@@ -107,17 +107,12 @@ library
     , base >=4.7 && <5
     , base16-bytestring
     , bytestring
-    , cereal
-    , cereal-text
     , containers
     , direct-sqlite
     , directory
     , exceptions
-    , extra
     , filepath
-    , ghc-prim
     , hashable
-    , hslogger
     , large-hashable
     , megaparsec
     , monad-control
@@ -195,17 +190,13 @@ executable incremental-computations-exe
     , base16-bytestring
     , binary
     , bytestring
-    , cereal
-    , cereal-text
     , containers
     , direct-sqlite
     , directory
     , exceptions
     , extra
     , filepath
-    , ghc-prim
     , hashable
-    , hslogger
     , http-types
     , incremental-computations
     , large-hashable
@@ -349,11 +340,8 @@ test-suite incremental-computations-test
     , direct-sqlite
     , directory
     , exceptions
-    , extra
     , filepath
-    , ghc-prim
     , hashable
-    , hslogger
     , large-hashable
     , megaparsec
     , monad-control
@@ -411,17 +399,12 @@ benchmark incremental-computations-bench
     , base >=4.7 && <5
     , base16-bytestring
     , bytestring
-    , cereal
-    , cereal-text
     , containers
     , direct-sqlite
     , directory
     , exceptions
-    , extra
     , filepath
-    , ghc-prim
     , hashable
-    , hslogger
     , incremental-computations
     , large-hashable
     , megaparsec

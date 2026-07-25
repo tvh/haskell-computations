@@ -20,17 +20,12 @@ dependencies:
   - base >= 4.7 && < 5
   - base16-bytestring
   - bytestring
-  - cereal
-  - cereal-text
   - direct-sqlite
   - containers
   - directory
   - exceptions
-  - extra
   - filepath
-  - ghc-prim
   - hashable
-  - hslogger
   - large-hashable
   - megaparsec
   - monad-control
@@ -50,6 +45,16 @@ dependencies:
   - unix
   - unordered-containers
   - vector
+  # NOTE: cereal, cereal-text, extra, ghc-prim, and hslogger used to be
+  # here. cereal/cereal-text are used only by
+  # test/Control/Computations/CompEngine/Tests/TestCompEngine.hs (moved to
+  # the tests: stanza); extra is used only by
+  # app/Control/Computations/Demos/Hospital/Main.hs (moved to the
+  # executables: stanza); ghc-prim and hslogger have no importer anywhere
+  # in this repo (base already re-exports the GHC.* modules actually used
+  # -- GHC.Generics, GHC.Stack, GHC.Conc, GHC.Exts, GHC.Stats -- none of
+  # which require ghc-prim as a direct dependency; no module imports
+  # System.Log.*) and were dropped entirely.
 
 ghc-options:
   - -O2
@@ -117,6 +122,7 @@ executables:
     - HTF
     - QuickCheck
     - binary
+    - extra
     - http-types
     - incremental-computations
     - optparse-applicative
@@ -148,6 +154,8 @@ tests:
     dependencies:
     - HTF
     - QuickCheck
+    - cereal
+    - cereal-text
     ghc-options:
     - -threaded
     - -rtsopts
