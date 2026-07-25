@@ -942,6 +942,67 @@ an order of magnitude. Cold 2.4× and live 1.7× are believable constant
 factors for a boxed-by-default runtime; the remaining RSS ratio is GHC's
 copying headroom, not layout.
 
+### 4g — refcounted src-dep ids: the 4e leak, closed (commits `6f5a8af`, `e0d0621`)
+
+4e's "ids are never recycled" note was a real leak, not a footnote:
+`AnyCompSrcDep` carries an observed version, so distinct `(key, version)`
+pairs accumulate forever in a long-running high-churn system, in both the
+forward `HashMap` and the boxed reverse vector — even though old versions
+become unreferenced the moment their observing rows re-run.
+
+Fixed with **reference counting** (chosen over a threshold sweep: precise,
+prompt, and O(1) per edge on a path that already walks the span).
+`SrcDepIntern` gains an unboxed refcount column parallel to the reverse
+table plus an id free-list; the reverse element type became
+`Maybe AnyCompSrcDep` so a released slot genuinely **drops the boxed
+value** rather than orphaning it behind a stale forward entry — which was
+half the leak. `sdiIntern` is now split from `sdiRetain`/`sdiRelease` so a
+writer can intern its whole new span before retaining any of it.
+
+Two subtleties worth recording:
+
+- **The overlap-ordering hazard is the common case, not an edge case.**
+  `writeSrcDeps` runs on every finish, changed or not, so a rewritten span
+  usually shares ids with the old one. Retain-new-before-release-old is
+  therefore load-bearing: releasing first would transiently zero a
+  refcount that is about to be re-established, freeing an id out from
+  under a live row. Tested explicitly.
+- **`freeRow` releases the src-dep span eagerly** (via a new `eaTakeRow`
+  that reads the span, then zeroes offset/len and marks the words dead) —
+  unlike `compDeps`/`rdeps`, which stay garbage-tolerant until compaction.
+  An unreferenced id must become reclaimable immediately, and the zeroing
+  also prevents a double-release when the row is later reused.
+
+`sdiResolve` now checks refcount > 0 as well as range: recycling reopens
+an "in range but dead" gap that a never-recycled table couldn't have.
+
+Cost, as expected for a correctness fix: **cold +1.2%, live flat, memory
+flat** — all well under the 5% materiality bar. Public API unchanged.
+
+### Test coverage audit (bundled with 4g)
+
+Tests **108 → 126**. The audit's own finding was that *nothing tested the
+leak* — the never-recycled table had simply been accepted. Added: refcount
+retain/release/underflow; shared-id survival when one of two referencing
+rows frees; the overlap-ordering hazard under repeated overwrite;
+version-churn boundedness; reused-id-behaves-like-fresh; loud failure on
+dead-id resolve and release-underflow; "no stale garbage in any column on
+reuse"; index growth interleaved with frees; arena compaction with shared
+ids and bystanders; a row freed and reused *between* two compactions; and
+a **QuickCheck model-based property** (100 random alloc/free/write
+sequences) asserting the intern table fully drains once everything the
+model tracks as live is freed. Plus two engine-level churn tests through
+real `capEvaluation` round trips (single cap, and 50 caps sharing one key)
+confirming the live count tracks the referenced set, not the total ever
+observed.
+
+Nothing pre-existing was found broken. One gap left open deliberately and
+recorded rather than papered over: no direct white-box test of
+`resolveRefToAny`'s dead-row loud-failure contract — unmodified Stage-3
+machinery, and constructing a dead-ref scenario would need more debug
+surface than it justifies; it is exercised transitively (never triggered,
+which is the correct outcome) by every engine test.
+
 ## Not tried yet / open items
 
 - **The Interlude-2 diet, measured.** The Rust notes list a ranked, concrete
