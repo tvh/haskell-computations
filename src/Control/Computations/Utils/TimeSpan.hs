@@ -159,14 +159,14 @@ prop_timeSpanP f =
 -- shouldn't need to know this module is implemented with 'Parser'. On
 -- failure, the 'Fail' string is megaparsec's own parse-error message, which
 -- is far more informative than a generic "invalid input" string.
+-- Note: 'prop_readShow' (round-tripping via 'read'/'show') used to live
+-- here alongside a 'Read TimeSpan' instance. Now that 'Read TimeSpan' is
+-- gone (its sole consumer, Config.hs, calls 'parseTimeSpan' directly),
+-- that round-trip property is exactly 'prop_timeSpanP' above --
+-- 'parseTimeSpan' is defined as 'parseM timeSpanP ""' -- so it was dropped
+-- as redundant rather than retargeted.
 parseTimeSpan :: T.Text -> Fail TimeSpan
 parseTimeSpan = parseM timeSpanP ""
-
-instance Read TimeSpan where
-  readsPrec _ = parserToReadsPrec timeSpanP
-
-prop_readShow :: TimeSpan -> Bool
-prop_readShow ts = ts == read (show ts)
 
 zeroTime :: TimeSpan
 zeroTime = TimeSpan 0
