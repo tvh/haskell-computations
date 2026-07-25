@@ -748,6 +748,39 @@ allocations). The arenas really are sitting outside the copied path — the
 mechanism the roadmap said was needed to escape the copying multiplier,
 now demonstrated rather than assumed.
 
+### 4c — open-addressed index replaces the per-def HAMT (commit `db24c13`) — **kept**
+
+`dt_index :: IORef (HashMap Hash128 Int)` exploited a redundancy: the key
+is *already* in the unboxed `dt_paramHash` column, so the index never
+needed to store keys at all. Replaced with an unboxed open-addressing
+table of row ids only (`VUM.IOVector Int32`, `-1` sentinel; slot =
+`w128_first hash .&. (cap-1)`, power-of-two capacity; a probe is verified
+by comparing the full 128-bit hash read from the row's own column via a
+`getHash` callback). Growth doubles at load factor 0.7 — a rebuild copies
+no keys, just re-slots row ids. **Deletion is backward-shift** (Knuth),
+chosen deliberately over tombstones because the live-update path frees and
+reuses rows constantly and tombstones would accumulate under exactly that
+workload; occupied-slots always equals live-entries. `SifCache`-style API
+stability held again: zero edits outside `DefTable.hs`.
+
+| Scale 1.0 | before | after | Δ |
+|---|---|---|---|
+| cold | 8.10 s | **7.04–7.12 s** | **−13%** |
+| live | 10.58–10.66 s | 10.61–10.69 s | flat |
+| max_live | 886.5 MB | 853.9 MB | −3.7% |
+| RSS settle | 1581.8 MB | 1457.6 MB | −7.8% |
+
+Tests 89 → **99** (10 new: collision chains, mid-chain delete, grow
+preserves entries, 500-cycle churn asserting capacity does *not* inflate,
+plus a `DefTable`-level churn test proving a freed row's hash is
+unfindable).
+
+**Estimate correction**: this section's earlier guess of ~88 B/cap for the
+index was too high — the real saving is ~33 B/cap (886.5 → 853.9).
+Deterministic and reproducible, but the HAMT was cheaper than the
+back-of-envelope suggested. The decisive win here was **time, not
+memory**: −13% cold, with no run overlap.
+
 ## Not tried yet / open items
 
 - **The Interlude-2 diet, measured.** The Rust notes list a ranked, concrete
