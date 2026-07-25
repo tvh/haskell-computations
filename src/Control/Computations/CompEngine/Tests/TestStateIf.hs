@@ -18,6 +18,7 @@ import Control.Computations.CompEngine.CompSrc
 import Control.Computations.CompEngine.Core
 import Control.Computations.CompEngine.SimpleStateIf
 import Control.Computations.CompEngine.Types
+import Control.Computations.CompEngine.Utils.DepMap (IsDep (..))
 import Control.Computations.Utils.Fail
 
 ----------------------------------------
@@ -178,6 +179,105 @@ test_srcDepInternTableSharedAcrossManyCapsStaysBoundedAndDrains = do
     [2 .. 20 :: Int]
   c2 <- debugTotalSrcDepInternLiveCount st
   assertEqual 1 c2
+
+{- | The reverse-index analogue of
+ 'test_srcDepInternTableStaysBoundedAcrossVersionChurn', against the
+ columnar 'Control.Computations.CompEngine.Utils.SrcIndex.KeyIntern' this
+ task adds: a single cap repeatedly re-registers the *same* source key at a
+ new version on every run (so the key's dependent set drops to zero and is
+ immediately re-populated each time -- see 'SimpleStateIf.removeSrcDependent's
+ haddock for why that transient drop-to-zero happens on every version bump
+ even though a single row \"holds\" the key throughout). Both the live key
+ count and the total ids ever assigned must stay bounded, not grow with the
+ number of version bumps -- the id-recycling churn test the task brief asks
+ for, on the key side rather than the src-dep side.
+-}
+test_srcKeyInternTableStaysBoundedAcrossVersionChurn :: IO ()
+test_srcKeyInternTableStaysBoundedAcrossVersionChurn = do
+  st <- newSifState
+  let stateIf = mkSimpleCompEngineStateIf (SimpleStateIf{ssif_withState = \f -> f st})
+  c0 <- debugSrcKeyInternLiveCount st
+  assertEqual 0 c0
+  mapM_ (\v -> capEvaluation stateIf foo1 (mkExtDeps [("ext", v)]) jval1) [1 .. 2000 :: Int]
+  c1 <- debugSrcKeyInternLiveCount st
+  assertEqual 1 c1
+  assigned <- debugSrcKeyInternAssignedCount st
+  -- ids are recycled every drop-to-zero/re-add cycle, not accumulated
+  assertBool (assigned <= 4)
+
+{- | The reverse-index analogue of
+ 'test_srcDepInternTableSharedAcrossManyCapsStaysBoundedAndDrains': many
+ caps all sharing the same source key (this codebase's own benchmark shape
+ -- 300 keys against ~200k dependent rows) must keep the key's live count
+ at 1 throughout, and dropping every dependent (by moving them all onto a
+ version none of them re-register against) must drain it back to zero.
+-}
+test_srcKeyInternTableSharedAcrossManyCapsStaysBoundedAndDrains :: IO ()
+test_srcKeyInternTableSharedAcrossManyCapsStaysBoundedAndDrains = do
+  st <- newSifState
+  let stateIf = mkSimpleCompEngineStateIf (SimpleStateIf{ssif_withState = \f -> f st})
+      caps = [mkCompAp barComp i | i <- [1 .. 50 :: Int]]
+  mapM_ (\cap -> capEvaluation stateIf cap (mkExtDeps [("shared", 1)]) jval1) caps
+  c1 <- debugSrcKeyInternLiveCount st
+  assertEqual 1 c1
+  mapM_
+    ( \v -> do
+        _ <- enqueueStaleCaps stateIf (mkExtDeps [("shared", v)])
+        mapM_ (\cap -> capEvaluation stateIf cap (mkExtDeps [("shared", v)]) jval1) caps
+    )
+    [2 .. 20 :: Int]
+  c2 <- debugSrcKeyInternLiveCount st
+  assertEqual 1 c2
+  -- now every cap drops the dependency entirely -- the key must drain
+  mapM_ (\cap -> capEvaluation stateIf cap noDeps jval1) caps
+  c3 <- debugSrcKeyInternLiveCount st
+  assertEqual 0 c3
+
+{- | Direct engine-level check of the reverse index's core semantic (also
+ exercised indirectly by 'test_modifcationWhileWorkingOnQueue' and
+ 'test_olderVersionInsertedLater'): when two caps depend on the same source
+ key but have observed *different* versions of it, a change notification
+ must invalidate only the one whose recorded version doesn't match the new
+ one -- not both, and not neither. This is the property that makes a flat
+ per-key \"last known version\" insufficient and justifies tracking a
+ version per dependent (see the 'SifState' haddock in \"SimpleStateIf.hs\").
+-}
+test_srcIndexInvalidatesOnlyTheMismatchedDependent :: IO ()
+test_srcIndexInvalidatesOnlyTheMismatchedDependent =
+  prepareTest $ \sif ->
+    do
+      -- both start out observing "ext"@1
+      capEvaluation sif bar1 (mkExtDeps [("ext", 1)]) jval1
+      capEvaluation sif bar2 (mkExtDeps [("ext", 1)]) jval1
+      -- bar1 catches up to "ext"@2 via a real re-run; bar2 does not
+      dequeueAndStartCap sif bar1 >>= liftIO . assertEqual False
+      _ <- capEvaluationFinished sif bar1 (mkExtDeps [("ext", 2)]) jval1
+      -- a notification for "ext"@2 must now affect only bar2 (still @1)
+      affected <- enqueueStaleCaps sif (mkExtDeps [("ext", 2)])
+      liftIO $ assertEqual 1 (eqiCapSize affected)
+      dequeueGivenCap sif bar2 >>= liftIO . assertEqual True
+      dequeueGivenCap sif bar1 >>= liftIO . assertEqual False
+
+{- | 'SimpleStateIf.removeSrcDependent' reports a source key as a garbage
+ dep (for \"Run.hs\" to unregister) exactly when its dependent set drops to
+ zero -- confirms that reporting survives the columnar rewrite of
+ 'sifs_srcIndex' bit-for-bit, using 'capEvaluationFinished's returned
+ 'Garbage' directly rather than only the app-level DirSync check
+ docs/benchmark-notes.md's Stage 4e cites.
+-}
+test_srcIndexReportsGarbageDepWhenLastDependentDrops :: IO ()
+test_srcIndexReportsGarbageDepWhenLastDependentDrops =
+  prepareTest $ \sif ->
+    do
+      capEvaluation sif foo1 (mkExtDeps [("ext", 1)]) jval1
+      capEvaluationStarted sif foo1
+      -- foo1 re-runs depending on nothing at all -- "ext" now has zero
+      -- dependents and must be reported as garbage.
+      (_, garbage) <- capEvaluationFinished sif foo1 noDeps jval2
+      liftIO $ assertEqual (HashSet.fromList [srcKeyOf "ext"]) (garbage_deps garbage)
+
+srcKeyOf :: T.Text -> AnyCompSrcKey
+srcKeyOf k = depKey (wrapCompSrcDep TestStateSrc (Dep k (0 :: Int)))
 
 test_gc :: IO ()
 test_gc =

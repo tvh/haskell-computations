@@ -92,6 +92,8 @@ module Control.Computations.CompEngine.SimpleStateIf (
   newSifState,
   validateSifState,
   debugTotalSrcDepInternLiveCount,
+  debugSrcKeyInternLiveCount,
+  debugSrcKeyInternAssignedCount,
 )
 where
 
@@ -114,6 +116,7 @@ import Control.Computations.CompEngine.Utils.DepMap (IsDep (..))
 import qualified Control.Computations.CompEngine.Utils.OutputsMap as OM
 import Control.Computations.CompEngine.Utils.PriorityAgingQueue (PaqPriority)
 import qualified Control.Computations.CompEngine.Utils.PriorityAgingQueue as Paq
+import qualified Control.Computations.CompEngine.Utils.SrcIndex as SI
 import Control.Computations.Utils.Hash (Hash128)
 import Control.Computations.Utils.Logging
 import qualified Control.Computations.Utils.StrictList as SL
@@ -161,29 +164,35 @@ newtype SimpleStateIf m = SimpleStateIf
   { ssif_withState :: forall a. (SifState -> m a) -> m a
   }
 
-{- | One entry per source key currently depended on by at least one row:
- every dependent packed ref, each mapped to the version /that specific row/
- last observed for this key. This is flat in the sense that there's no
- VerList-style secondary index bucketing dependents by version -- but per-
- dependent version tracking itself is still required, not optional: a
- test (@test_modifcationWhileWorkingOnQueue@) exercises exactly the case
- where two rows depend on the same key but have observed *different*
- versions of it (one caught up to a newer notification before the other),
- and a notification must invalidate only the row(s) whose recorded version
- doesn't match -- a single flat "last known version" dedup (this module's
- first attempt) can't distinguish that from "everyone's stale", and gets
- it wrong. Comparing per-dependent below is what actually replicates
- VerList's targeted invalidation, just without the separate bucket index.
--}
-newtype SrcEntry = SrcEntry
-  { se_dependents :: HashMap DefRef AnyCompSrcVer
-  }
+{- | The reverse source index: for every source key currently depended on by
+ at least one row, the flat set of dependent rows, each with the version
+ /that specific row/ last observed for this key. Per-dependent version
+ tracking (rather than one shared "current version" per key) is required,
+ not optional: a test (@test_modifcationWhileWorkingOnQueue@) exercises
+ exactly the case where two rows depend on the same key but have observed
+ *different* versions of it (one caught up to a newer notification before
+ the other), and a notification must invalidate only the row(s) whose
+ recorded version doesn't match -- a single flat "last known version" dedup
+ (this module's first attempt, pre-Stage-3) can't distinguish that from
+ "everyone's stale", and gets it wrong.
 
+ Storage is columnar (see "Utils/SrcIndex.hs"'s module haddock for the full
+ design rationale, mirroring "Utils/DefTable.hs"'s forward-side src-dep
+ interning): 'sifs_srcKeyIntern' interns each 'AnyCompSrcKey' to a dense
+ 'Int', and 'sifs_srcEntries' maps that id to a 'SI.SrcKeyArena' holding the
+ key's current @(DefRef, AnyCompSrcVer)@ dependent list as an unboxed
+ 'DefRef' column plus a parallel boxed 'AnyCompSrcVer' column, instead of
+ the old @HashMap AnyCompSrcKey (HashMap DefRef AnyCompSrcVer)@ (a boxed
+ existential key hashed/compared on every access, nested inside a second
+ boxed HAMT). A key's arena is created on its first dependent and deleted
+ on its last -- see 'addSrcDependent'\/'removeSrcDependent'.
+-}
 data SifState = SifState
   { sifs_defIndex :: !(IORef (HashMap CompId Int))
   , sifs_defs :: !(IORef (IntMap SomeDefEntry))
   , sifs_nextDefIdx :: !(IORef Int)
-  , sifs_srcIndex :: !(IORef (HashMap AnyCompSrcKey SrcEntry))
+  , sifs_srcKeyIntern :: !SI.KeyIntern
+  , sifs_srcEntries :: !(IORef (IntMap SI.SrcKeyArena))
   , sifs_outputs :: !(IORef (OM.OutputsMap Int))
   , sifs_pendingOutputs :: !(IORef (Map Int AnyCompSinkOutsMap))
   , sifs_stale :: !(IORef (Paq.PriorityAgingQueue Int ()))
@@ -195,17 +204,21 @@ newSifState =
     <$> newIORef HashMap.empty
     <*> newIORef IntMap.empty
     <*> newIORef 0
-    <*> newIORef HashMap.empty
+    <*> SI.newKeyIntern
+    <*> newIORef IntMap.empty
     <*> newIORef OM.empty
     <*> newIORef Map.empty
     <*> newIORef Paq.empty
 
 {- | Checks invariants about the SifState: every def index referenced by
- the def registry has a table entry, and every alive row's forward
- (@compDeps@) or reverse (@rdeps@) edges point only at other alive rows.
- This is the columnar-rewrite analogue of Stage 1's "every id referenced by
- a container is live in the intern table" -- same idea (dangling
- references are a lifecycle bug), different storage to check it against.
+ the def registry has a table entry, every alive row's forward
+ (@compDeps@) or reverse (@rdeps@) edges point only at other alive rows, and
+ every 'SI.SrcKeyArena' entry in 'sifs_srcEntries' points at an alive row --
+ the reverse-index analogue of the same check, added alongside the
+ columnar rewrite of 'sifs_srcIndex'. This is the columnar-rewrite analogue
+ of Stage 1's "every id referenced by a container is live in the intern
+ table" -- same idea (dangling references are a lifecycle bug), different
+ storage to check it against.
 -}
 validateSifState :: SifState -> IO ()
 validateSifState st = do
@@ -219,6 +232,10 @@ validateSifState st = do
         rd <- DT.readRdeps dt row
         checkRefs defs ("compDeps of def " ++ show defIdx ++ " row " ++ show row) (DT.compDepTargets cd)
         checkRefs defs ("rdeps of def " ++ show defIdx ++ " row " ++ show row) rd
+  entries <- readIORef (sifs_srcEntries st)
+  forM_ (IntMap.toList entries) $ \(keyId, arena) -> do
+    pairs <- SI.skaToList arena
+    checkRefs defs ("srcIndex key " ++ show keyId) (VU.fromList (map fst pairs))
  where
   checkRefs defs what refs =
     forM_ (VU.toList refs) $ \ref -> do
@@ -241,6 +258,21 @@ debugTotalSrcDepInternLiveCount :: SifState -> IO Int
 debugTotalSrcDepInternLiveCount st = do
   defs <- readIORef (sifs_defs st)
   sum <$> mapM (\(SomeDefEntry _ dt) -> DT.srcDepInternLiveCount dt) (IntMap.elems defs)
+
+{- | Debug/test-only: number of currently-interned source keys (i.e. keys
+ with at least one dependent right now) -- the reverse-index analogue of
+ 'debugTotalSrcDepInternLiveCount', exercised by the churn test in
+ Tests/TestStateIf.hs.
+-}
+debugSrcKeyInternLiveCount :: SifState -> IO Int
+debugSrcKeyInternLiveCount st = SI.kiLiveCount (sifs_srcKeyIntern st)
+
+{- | Debug/test-only: total source-key ids ever assigned (not decremented on
+ release) -- lets a churn test confirm ids are actually being recycled
+ rather than growing once per intern/release cycle.
+-}
+debugSrcKeyInternAssignedCount :: SifState -> IO Int
+debugSrcKeyInternAssignedCount st = SI.kiAssignedCount (sifs_srcKeyIntern st)
 
 mkSimpleCompEngineStateIf
   :: (MonadIO m)
@@ -679,35 +711,48 @@ freeRowCascade st defIdx row = do
             <> outsGarbage
         )
 
+-- | Add @ref@ (observed at @dep@'s version) as a dependent of @dep@'s
+-- source key, interning the key on first use and creating its arena. Like
+-- the pre-columnar @HashMap.insert@ this replaces, a second add for a
+-- @ref@ already present in this key's arena is not deduplicated -- see
+-- 'SI.skaAppend's haddock for why the real call path never hits that case.
 addSrcDependent :: SifState -> AnyCompSrcDep -> DefRef -> IO ()
 addSrcDependent st dep ref = do
   let key = depKey dep
       ver = depVer dep
-  modifyIORef' (sifs_srcIndex st) $
-    HashMap.insertWith
-      (\_new old -> old{se_dependents = HashMap.insert ref ver (se_dependents old)})
-      key
-      (SrcEntry (HashMap.singleton ref ver))
+  keyId <- SI.kiIntern (sifs_srcKeyIntern st) key
+  entries <- readIORef (sifs_srcEntries st)
+  arena <- case IntMap.lookup keyId entries of
+    Just a -> pure a
+    Nothing -> do
+      a <- SI.newSrcKeyArena
+      writeIORef (sifs_srcEntries st) (IntMap.insert keyId a entries)
+      pure a
+  SI.skaAppend arena ref ver
 
 -- | Remove @ref@ from a source key's dependent set; if that empties it,
--- drop the key entirely and report it as a garbage dep (for
--- 'Control.Computations.CompEngine.Run' to tell the source to unregister
--- it), returning 'Just' that key.
+-- drop the key's arena and release its interned id, reporting it as a
+-- garbage dep (for 'Control.Computations.CompEngine.Run' to tell the
+-- source to unregister it), returning 'Just' that key.
 removeSrcDependent :: SifState -> AnyCompSrcDep -> DefRef -> IO (Maybe AnyCompSrcKey)
 removeSrcDependent st dep ref = do
   let key = depKey dep
-  idx <- readIORef (sifs_srcIndex st)
-  case HashMap.lookup key idx of
+  mKeyId <- SI.kiLookup (sifs_srcKeyIntern st) key
+  case mKeyId of
     Nothing -> pure Nothing
-    Just entry -> do
-      let deps' = HashMap.delete ref (se_dependents entry)
-      if HashMap.null deps'
-        then do
-          modifyIORef' (sifs_srcIndex st) (HashMap.delete key)
-          pure (Just key)
-        else do
-          modifyIORef' (sifs_srcIndex st) (HashMap.insert key entry{se_dependents = deps'})
-          pure Nothing
+    Just keyId -> do
+      entries <- readIORef (sifs_srcEntries st)
+      case IntMap.lookup keyId entries of
+        Nothing -> pure Nothing
+        Just arena -> do
+          _ <- SI.skaRemove arena ref
+          empty <- SI.skaNull arena
+          if empty
+            then do
+              writeIORef (sifs_srcEntries st) (IntMap.delete keyId entries)
+              SI.kiRelease (sifs_srcKeyIntern st) key
+              pure (Just key)
+            else pure Nothing
 
 -- | Update a row's forward edge columns (comp-deps with their observed
 -- versions, and src-deps) from old to new, diffing to add/remove the
@@ -914,28 +959,32 @@ notifyDepChange _st (CompEngDepComp _) = pure HashSet.empty
 notifyDepChange st (CompEngDepSrc srcDep) = do
   let key = depKey srcDep
       newVer = depVer srcDep
-  idx <- readIORef (sifs_srcIndex st)
-  case HashMap.lookup key idx of
+  mKeyId <- SI.kiLookup (sifs_srcKeyIntern st) key
+  case mKeyId of
     Nothing -> pure HashSet.empty
-    Just entry -> do
-      -- Invalidate only the dependents whose *own* recorded observation
-      -- differs from the new version -- not "everyone who depends on this
-      -- key" (see SrcEntry's haddock for why that's required, not just a
-      -- nicety). Deliberately does not write the new version back into
-      -- se_dependents: like VerList, a dependent's recorded version only
-      -- moves when *it* re-registers via a real finish (updateEdges), not
-      -- merely because a notification went by.
-      let staleRefs =
-            HashSet.fromList
-              [r | (r, v) <- HashMap.toList (se_dependents entry), v /= newVer]
-      -- Actually enqueue (the side effect, internally pending-aware); but
-      -- -- matching Stage 0/1's notifyDepChange, which reported
-      -- DepMap.stale's raw result and discarded invalidate's filtered
-      -- "_addedKeys" -- report the full stale-relative-to-this-notification
-      -- set regardless of whether each one was already queued or is
-      -- mid-evaluation. (EnqueueInfo answers "who's affected by this
-      -- change", not "who did this call newly enqueue"; contrast
-      -- finishCap's staleCaps, which answers the latter and does use
-      -- enqueueRefs's filtered return.)
-      void $ enqueueRefs st staleRefs
-      resolveRefsToAny st staleRefs
+    Just keyId -> do
+      entries <- readIORef (sifs_srcEntries st)
+      case IntMap.lookup keyId entries of
+        Nothing -> pure HashSet.empty
+        Just arena -> do
+          -- Invalidate only the dependents whose *own* recorded observation
+          -- differs from the new version -- not "everyone who depends on
+          -- this key" (see the reverse-index haddock on 'SifState' for why
+          -- that's required, not just a nicety). Deliberately does not
+          -- write the new version back into the arena: like VerList, a
+          -- dependent's recorded version only moves when *it* re-registers
+          -- via a real finish (updateEdges), not merely because a
+          -- notification went by.
+          pairs <- SI.skaToList arena
+          let staleRefs = HashSet.fromList [r | (r, v) <- pairs, v /= newVer]
+          -- Actually enqueue (the side effect, internally pending-aware);
+          -- but -- matching Stage 0/1's notifyDepChange, which reported
+          -- DepMap.stale's raw result and discarded invalidate's filtered
+          -- "_addedKeys" -- report the full stale-relative-to-this-
+          -- notification set regardless of whether each one was already
+          -- queued or is mid-evaluation. (EnqueueInfo answers "who's
+          -- affected by this change", not "who did this call newly
+          -- enqueue"; contrast finishCap's staleCaps, which answers the
+          -- latter and does use enqueueRefs's filtered return.)
+          void $ enqueueRefs st staleRefs
+          resolveRefsToAny st staleRefs

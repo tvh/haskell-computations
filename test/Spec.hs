@@ -16,6 +16,7 @@ import {-@ HTF_TESTS @-} Control.Computations.CompEngine.Tests.TestStateIf
 import {-@ HTF_TESTS @-} Control.Computations.CompEngine.Utils.DefTable
 import {-@ HTF_TESTS @-} Control.Computations.CompEngine.Utils.OutputsMap
 import {-@ HTF_TESTS @-} Control.Computations.CompEngine.Utils.PriorityAgingQueue
+import {-@ HTF_TESTS @-} Control.Computations.CompEngine.Utils.SrcIndex
 import {-@ HTF_TESTS @-} Control.Computations.FlowImpls.FileSink
 import {-@ HTF_TESTS @-} Control.Computations.FlowImpls.FileSrc
 import {-@ HTF_TESTS @-} Control.Computations.FlowImpls.SqliteSrc

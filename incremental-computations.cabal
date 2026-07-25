@@ -53,6 +53,7 @@ library
       Control.Computations.CompEngine.Utils.DepMap
       Control.Computations.CompEngine.Utils.OutputsMap
       Control.Computations.CompEngine.Utils.PriorityAgingQueue
+      Control.Computations.CompEngine.Utils.SrcIndex
       Control.Computations.FlowImpls.CompLogging
       Control.Computations.FlowImpls.FileSink
       Control.Computations.FlowImpls.FileSrc
