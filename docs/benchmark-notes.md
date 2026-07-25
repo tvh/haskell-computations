@@ -1073,6 +1073,54 @@ general*: hashtables genuinely beats the HAMT for the simple-key table.
 Not wired in this pass (measured, not landed) — a small contained swap for
 `KeyIntern`, listed in open items.
 
+### 4i — strictness audit, heap attribution, hashtables verdict (commits `799ce43`, `2692bc0`; `tried/hashtables-keyintern`)
+
+**Job 1 — strictness audit: kept, but it found no live bug.** Audited every
+`VM.write`/`VUM.write`/`writeIORef`/`modifyIORef` of a non-primitive across
+`DefTable`, `SrcIndex`, `SimpleStateIf`, `OutputsMap`,
+`PriorityAgingQueue`. Real gaps existed (`colWrite`'s `ColBoxed` path,
+`sdiIntern`'s `dep`, bare `writeIORef` of computed `HashMap`/`IntMap`
+updates, `enqueueRefs`' lazy tuple) and were fixed — but **every one was
+already protected incidentally**: `Word32`/`Word64` take 4d's unboxed
+path, and where boxed values do flow, an earlier `largeHash128` on the
+same value forces it deeply as a side effect of hashing. A/B: flat within
+noise on every metric. Kept as zero-cost hardening, since that protection
+is an unenforced accident of call order — precisely 4h's bug class waiting
+to recur.
+
+Agent self-correction worth recording: it first "fixed" `OutputsMap`/`PAQ`
+record fields believing them lazy, then found **`-XStrictData` is set
+project-wide** and they were already strict; it reverted the change and
+fixed its own misleading comments rather than leaving false claims in the
+code.
+
+**Job 2 — `+RTS -hT` heap attribution** (scale 0.25, cross-checked at 0.1;
+percentages matched, so the split is stable). Of the ~94.5 MB live set:
+
+| Category | % | Read |
+|---|---|---|
+| Arena/column payload (`ARR_WORDS`) | **68.3%** | exactly what the columnar design intends — unboxed columns, CSR arenas, hash index |
+| Existential/`Typeable` cluster (`ForAnyCompFlow`, `TrApp`, dictionaries, `CompSrcId`, `Word128`, `Text`) | **18.1%** | scale-proportional, not CAF-like: the quantified price of 4h's deliberate choice *not* to intern `AnyCompSrcVer` — a documented tradeoff, not an oversight |
+| Generic boxed thunks/closures | **11.6%** | **the biggest remaining reducible item**, unattributed |
+| RTS bookkeeping / container internals | 1.8% | floor |
+
+Explicitly confirmed: **param/value columns are not boxed in this
+benchmark** — 4d's unboxed path covers `Word32`/`Word64`, so the boxed
+residue is source-dependency existential wrappers, not param/value as the
+roadmap had assumed. Limitation reported rather than hidden: `-hi` with
+`-finfo-table-map` could not resolve addresses to source locations with
+the available tooling, so the thunk cluster's origin is unpinned.
+
+**Job 3 — `hashtables` for `KeyIntern`: tried, reverted, archived.**
+Implemented cleanly, 145/145 green, and **flat within noise at every
+metric** at both scales — despite 4h's standalone microbenchmark showing a
+consistent ~35% win for this exact key shape. Root cause: `KeyIntern`'s
+table holds one entry per distinct *source key* (300), small enough to sit
+in cache under any implementation, and its op volume is a rounding error
+against per-row work. **The microbenchmark did not transfer** — a useful
+negative result, and a caution about sizing microbenchmarks by op count
+rather than by working-set pressure.
+
 ## Not tried yet / open items
 
 - **The Interlude-2 diet, measured.** The Rust notes list a ranked, concrete
