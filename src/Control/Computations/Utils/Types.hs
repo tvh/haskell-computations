@@ -3,7 +3,6 @@
 module Control.Computations.Utils.Types (
   -- better name: Misc
   module F,
-  Choice (..),
   Option (..),
   option,
   maybeToOption,
@@ -128,24 +127,6 @@ isNone (Some _) = False
 isSome :: Option a -> Bool
 isSome None = False
 isSome (Some _) = True
-
-data Choice a b
-  = This a
-  | That b
-  deriving
-    ( Eq
-    , Ord
-    , Read
-    , Show
-    , Foldable
-    , Traversable
-    , Typeable
-    , Data
-    , Functor
-    , Generic
-    , Hashable
-    , LH.LargeHashable
-    )
 
 -- FIXME: Empty needed with Proxy?
 data Empty a = Empty deriving (Read, Show, Eq, Ord, Typeable)
