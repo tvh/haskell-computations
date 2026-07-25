@@ -19,7 +19,6 @@ import {-@ HTF_TESTS @-} Control.Computations.CompEngine.Utils.PriorityAgingQueu
 import {-@ HTF_TESTS @-} Control.Computations.CompEngine.Utils.SrcIndex
 import {-@ HTF_TESTS @-} Control.Computations.FlowImpls.FileSink
 import {-@ HTF_TESTS @-} Control.Computations.FlowImpls.FileSrc
-import {-@ HTF_TESTS @-} Control.Computations.FlowImpls.SqliteSrc
 import {-@ HTF_TESTS @-} Control.Computations.FlowImpls.TimeSrc
 import {-@ HTF_TESTS @-} Control.Computations.Utils.DataSize
 import {-@ HTF_TESTS @-} Control.Computations.Utils.Dispatcher

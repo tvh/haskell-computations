@@ -8,7 +8,7 @@
  Update operations are not supported.
  For simplicity, a single `SqliteSrc` only supports one table.
 -}
-module Control.Computations.FlowImpls.SqliteSrc (
+module Control.Computations.Demos.FlowImpls.SqliteSrc (
   SqliteSrcCfg (..),
   SqliteSrcReq (..),
   SqliteSrc,

@@ -51,7 +51,6 @@ library
       Control.Computations.FlowImpls.FileStoreSink
       Control.Computations.FlowImpls.HashMapFlow
       Control.Computations.FlowImpls.IOSink
-      Control.Computations.FlowImpls.SqliteSrc
       Control.Computations.FlowImpls.TimeSrc
       Control.Computations.Utils.Ansi
       Control.Computations.Utils.Clock
@@ -147,6 +146,7 @@ executable incremental-computations-exe
       Control.Computations.Demos.Bench.Main
       Control.Computations.Demos.DirSync.Main
       Control.Computations.Demos.DirSync.Tests
+      Control.Computations.Demos.FlowImpls.SqliteSrc
       Control.Computations.Demos.Hospital.CompDefs
       Control.Computations.Demos.Hospital.Config
       Control.Computations.Demos.Hospital.FakeDiagnoses
@@ -273,7 +273,6 @@ test-suite incremental-computations-test
       Control.Computations.FlowImpls.FileStoreSink
       Control.Computations.FlowImpls.HashMapFlow
       Control.Computations.FlowImpls.IOSink
-      Control.Computations.FlowImpls.SqliteSrc
       Control.Computations.FlowImpls.TimeSrc
       Control.Computations.Utils.Ansi
       Control.Computations.Utils.Clock
