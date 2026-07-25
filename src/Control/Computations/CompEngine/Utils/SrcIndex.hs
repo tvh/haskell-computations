@@ -213,7 +213,10 @@ kiIntern ki key = do
           i <- readIORef (ki_count ki)
           writeIORef (ki_count ki) (i + 1)
           pure i
-      writeIORef (ki_forward ki) (HashMap.insert key i fwd)
+      -- Forced to WHNF at the write site -- see DefTable.hs's 'colWrite'
+      -- haddock for why a bare 'writeIORef' of a computed 'HashMap' update
+      -- is not, on its own, a strictness guarantee.
+      writeIORef (ki_forward ki) $! HashMap.insert key i fwd
       pure i
 
 -- | Release @key@'s interned id: delete the forward entry and push the id
@@ -230,7 +233,7 @@ kiRelease ki key = do
     Nothing ->
       error "Utils.SrcIndex.kiRelease: releasing a key that was never interned (or already released) -- a bug"
     Just i -> do
-      writeIORef (ki_forward ki) (HashMap.delete key fwd)
+      writeIORef (ki_forward ki) $! HashMap.delete key fwd
       modifyIORef' (ki_free ki) (i :)
 
 -- | Test/debug-only: number of currently-interned keys.

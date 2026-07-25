@@ -77,9 +77,18 @@ type OutputsReverseMap k =
 
 type OutputKeyHash = Int
 
+-- | Both fields strict: this map is rebuilt (via 'insert'\/'delete'\/
+-- 'insertWith') on essentially every cap finish in
+-- "SimpleStateIf.hs" (@commitPendingOutputsForKey@\/@freeRowCascade@),
+-- whose own write site is a bare 'Data.IORef.writeIORef' -- which gives
+-- zero forcing on its own. Strict fields here mean forcing the *record* to
+-- WHNF (which the write site now does explicitly, see 'colWrite''s haddock
+-- in "Utils/DefTable.hs" for the general rationale) forces both maps'
+-- top-level spines too, rather than leaving a chain of unevaluated
+-- @insert@\/@delete@ thunks to build up across rows.
 data OutputsMap k = OutputsMap
-  { om_forward :: OutputsForwardMap k
-  , om_reverse :: OutputsReverseMap k
+  { om_forward :: !(OutputsForwardMap k)
+  , om_reverse :: !(OutputsReverseMap k)
   }
   deriving (Show)
 

@@ -506,7 +506,12 @@ commitPendingOutputsForKey st ref capAny = do
         if nullAnyOutsMap newOutputs
           then OM.delete ref outs
           else OM.insert ref newOutputs outs
-  writeIORef (sifs_outputs st) outs'
+  -- Forced to WHNF at the write site -- see 'colWrite''s haddock in
+  -- "Utils/DefTable.hs" for why a bare 'writeIORef' of a computed value
+  -- gives no strictness guarantee on its own ('OutputsMap'\'s own fields
+  -- are now strict too, see "Utils/OutputsMap.hs", so WHNF here reaches
+  -- both maps).
+  writeIORef (sifs_outputs st) $! outs'
   modifyIORef' (sifs_pendingOutputs st) (Map.delete ref)
   let garbOutputs = OM.filterUnreferencedOutputs outs' delOutputs
   pure $
@@ -609,8 +614,17 @@ enqueueRefs st refs = fmap (HashSet.fromList . catMaybes) $ forM (HashSet.toList
         then pure Nothing
         else do
           q <- readIORef (sifs_stale st)
+          -- Unlike 'dequeueGivenCapImpl'/'dequeueNextCapImpl' above (whose
+          -- 'Paq.deleteView'/'Paq.dequeue' results come through the strict
+          -- ':!:' pair, forcing the new queue at the pattern match itself),
+          -- 'Paq.enqueue' returns a plain lazy @(,)@ -- this @let@ binds
+          -- @q'@ to an unforced thunk that a bare 'writeIORef' would not
+          -- force either. Force explicitly (see 'colWrite''s haddock in
+          -- "Utils/DefTable.hs"); the queue's now-strict fields (see
+          -- 'PriorityAgingQueue.hs') mean WHNF here reaches the sub-queue
+          -- actually being mutated.
           let (how, q') = Paq.enqueue (mkPaqEntry (compId_priority (comp_name comp)) ref) q
-          writeIORef (sifs_stale st) q'
+          writeIORef (sifs_stale st) $! q'
           pure $ case how of
             Paq.EnqueueAddedNewEntry -> Just ref
             Paq.EnqueueUpdatedEntry -> Nothing
@@ -689,7 +703,7 @@ freeRowCascade st defIdx row = do
           oldOutputs = fromMaybe mempty mOldOutputs
       DT.freeRow dt paramHash row
       let outs' = OM.delete ref outs
-      writeIORef (sifs_outputs st) outs'
+      writeIORef (sifs_outputs st) $! outs'
       removeFromStale st ref
       compGarbage <- fmap mconcat $ forM (VU.toList myCompDeps) $ \t -> removeRdep st t ref
       srcGarbageKeys <- fmap catMaybes $ forM (HashSet.toList mySrcDeps) $ \dep -> removeSrcDependent st dep ref
@@ -726,7 +740,7 @@ addSrcDependent st dep ref = do
     Just a -> pure a
     Nothing -> do
       a <- SI.newSrcKeyArena
-      writeIORef (sifs_srcEntries st) (IntMap.insert keyId a entries)
+      writeIORef (sifs_srcEntries st) $! IntMap.insert keyId a entries
       pure a
   SI.skaAppend arena ref ver
 
@@ -749,7 +763,7 @@ removeSrcDependent st dep ref = do
           empty <- SI.skaNull arena
           if empty
             then do
-              writeIORef (sifs_srcEntries st) (IntMap.delete keyId entries)
+              writeIORef (sifs_srcEntries st) $! IntMap.delete keyId entries
               SI.kiRelease (sifs_srcKeyIntern st) key
               pure (Just key)
             else pure Nothing

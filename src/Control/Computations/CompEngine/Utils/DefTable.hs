@@ -565,8 +565,22 @@ colRead :: Column e -> Int -> IO e
 colRead (ColBoxed ref) row = readIORef ref >>= \v -> VM.read v row
 colRead (ColUnboxed Refl ref) row = readIORef ref >>= \v -> VUM.read v row
 
+-- | Write a value into the column at @row@. The 'ColBoxed' case is the one
+-- that matters: 'Data.Vector.Mutable.write' carries no strictness contract
+-- (unlike the 'Data.HashMap.Strict' that used to hold param\/value data
+-- pre-Stage-3), so a caller that hands this an unforced thunk gets exactly
+-- 4h's bug -- a per-row retained closure invisible to every type signature
+-- and every correctness test, showing up only as time and allocation. In
+-- the current call paths @e@ is already forced by the time it gets here
+-- (both 'writeParam' and 'writeValue''s callers force a 'largeHash128' of
+-- the same value first, to compute the row's param\/result hash, which
+-- requires traversing -- hence forcing -- the whole value), but that is an
+-- accident of control flow elsewhere, not a guarantee this module owns; the
+-- bang here makes the column itself carry the same strictness contract the
+-- @.Strict@ container it replaced did, rather than depending on every
+-- present and future caller getting the ordering right.
 colWrite :: Column e -> Int -> e -> IO ()
-colWrite (ColBoxed ref) row e = readIORef ref >>= \v -> VM.write v row e
+colWrite (ColBoxed ref) row !e = readIORef ref >>= \v -> VM.write v row e
 colWrite (ColUnboxed Refl ref) row e = readIORef ref >>= \v -> VUM.write v row e
 
 --
@@ -942,7 +956,7 @@ newSrcDepIntern =
 -- haddock's "ordering hazard" note for why that separation matters when a
 -- write's old and new spans overlap.
 sdiIntern :: SrcDepIntern -> AnyCompSrcDep -> IO Int
-sdiIntern sdi dep = do
+sdiIntern sdi !dep = do
   fwd <- readIORef (sdi_forward sdi)
   case HashMap.lookup dep fwd of
     Just i -> pure i
@@ -960,7 +974,11 @@ sdiIntern sdi dep = do
       VM.write rv i (Just dep)
       rc <- readIORef (sdi_refcount sdi)
       VUM.write rc i 0
-      writeIORef (sdi_forward sdi) (HashMap.insert dep i fwd)
+      -- Forced to WHNF at the write site, not left to a later reader to
+      -- force transitively -- see 'colWrite''s haddock for the general
+      -- rationale (a plain 'writeIORef' of a computed 'HashMap' update
+      -- gives zero strictness guarantee on its own).
+      writeIORef (sdi_forward sdi) $! HashMap.insert dep i fwd
       pure i
 
 -- | Bump @i@'s refcount. Caller's responsibility: @i@ is a currently-live

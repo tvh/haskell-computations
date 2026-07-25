@@ -106,8 +106,23 @@ data PaqView k v = PaqView
 
 type PaqQueue k v = PSQ.HashPSQ k PaqPrioIndex v
 
+-- | Every field strict. This is 'SimpleStateIf.hs'\'s @sifs_stale@ -- the
+-- engine's single hottest piece of state, rebuilt by 'enqueue'\/'dequeue'\/
+-- 'deleteView' on every enqueue and every dequeue across both cold eval and
+-- every live rerun -- and its own write site there is a bare
+-- 'Data.IORef.writeIORef' of a lazily-pattern-matched tuple component
+-- (@let (how, q') = ...@), which gives zero forcing on its own. Before this,
+-- only 'paq_size' (added alongside its own fix, see the field's haddock) was
+-- strict; the four sub-queues and the counter were plain lazy fields
+-- inherited from this module's pre-Stage-0 origin, so record-update syntax
+-- like @paq'{paq_realTimeQueue = PSQ.insert ...}@ built a *thunk* for the
+-- touched field even though the surrounding constructor application looked
+-- like ordinary strict-looking code. Strict fields mean the write site's own
+-- explicit forcing (see 'colWrite''s haddock in "Utils/DefTable.hs" for the
+-- general rationale) actually reaches the sub-queues instead of stopping at
+-- the tuple/record boundary.
 data PriorityAgingQueue k v = PriorityAgingQueue
-  { paq_nextCounter :: {-# NOUNPACK #-} PaqCounter
+  { paq_nextCounter :: {-# NOUNPACK #-} !PaqCounter
   -- Total entry count across all four sub-queues, maintained incrementally
   -- by every operation that adds or removes a key (enqueue/deleteView/
   -- dequeue -- upgrade only moves entries between sub-queues, so it never
@@ -120,10 +135,10 @@ data PriorityAgingQueue k v = PriorityAgingQueue
   -- docs/benchmark-notes.md's live-update investigation for the
   -- measurement that caught this.
   , paq_size :: {-# UNPACK #-} !Int
-  , paq_realTimeQueue :: {-# NOUNPACK #-} (PaqQueue k v)
-  , paq_expressQueue :: {-# NOUNPACK #-} (PaqQueue k v)
-  , paq_regularQueue :: {-# NOUNPACK #-} (PaqQueue k v)
-  , paq_bulkQueue :: {-# NOUNPACK #-} (PaqQueue k v)
+  , paq_realTimeQueue :: {-# NOUNPACK #-} !(PaqQueue k v)
+  , paq_expressQueue :: {-# NOUNPACK #-} !(PaqQueue k v)
+  , paq_regularQueue :: {-# NOUNPACK #-} !(PaqQueue k v)
+  , paq_bulkQueue :: {-# NOUNPACK #-} !(PaqQueue k v)
   }
 
 instance (Show k, PaqKey k) => Show (PriorityAgingQueue k v) where
