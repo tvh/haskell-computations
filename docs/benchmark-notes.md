@@ -1121,6 +1121,79 @@ against per-row work. **The microbenchmark did not transfer** — a useful
 negative result, and a caution about sizing microbenchmarks by op count
 rather than by working-set pressure.
 
+### 4j — the 11.6% thunk cluster: understood, not a leak (no code change)
+
+Pure diagnosis, and it dissolves the last open lead — **the 11.6% was an
+artifact of how `-hT` classifies, not a distinct allocation source.**
+
+`-hT` buckets by RTS closure *representation*. A typeclass dictionary
+(`Show`/`Hashable`/`Eq`, bundled inside `ForAnyCompFlow`'s existential)
+compiles to a FUN/PAP closure, not a CONSTR — so `-hT` necessarily
+reported the dictionary payload of **the same existential cluster it
+already named at 18.1%** as a separate, unlabeled "generic boxed thunks"
+bucket. Re-sliced by cost centre (`-hc`, `-fprof-late`) and cross-checked
+by type (`-hy`), the heap resolves with no residual mass: arena/column
+62–70%, existential/dictionary cluster 25–31%, and a handful of named
+items each under 3%.
+
+Sampled across time in both phases (cold at 0.25; live at 0.1 with
+`PERSIST_BENCH_LIVE_LOOPS=200`, ~2.1M reruns over 238 s) to separate
+"growing" from "bounded". The live-phase heap is **essentially flat
+(41.5 → 44.0 MB across 2M reruns)** — rows are being recomputed, not
+created. Every non-arena item plateaus and stays flat: the ~4.9% per-call
+`wrapCompSrcDep`/`compSrcId` reconstruction (4e's known *construction*
+cost, never fully closed), MD5 scratch, `HashMapFlow` I/O,
+`PriorityAgingQueue` nodes. The one item with any sustained growth
+(+1.3 MB/150 s) was checked at the source: both `HashMapFlow` TVars are
+bounded and drained every round — census noise, not retention.
+
+Verdict: **(b) legitimate in-flight working state and (c) profiling
+artifact — not (a) a leak.** Contrast with 4h's real bug, which announced
+itself as a 10× time and 9× allocation blowup, not a diffuse few-percent
+heap fraction.
+
+Honest note on tooling: `-fprof-late` attached a spurious
+`htf_..._thisModulesTests` ancestor frame to ~2.4% of live bytes in arena
+call stacks. Traced and dismissed — the real call chain
+(`withRow`/`withDefFor`/`mkSimpleCompEngineStateIf`) is production code and
+nothing test-related runs in `bench` mode; it is GHC mislabeling a
+floated binding with a name borrowed from a nearby QuickCheck property.
+A naming coincidence, not a distinct source.
+
+## Campaign closed — final scoreboard
+
+| metric | Stage 0 (start) | final | vs Rust Stage 5 |
+|---|---|---|---|
+| cold eval | 42.8 s | **6.7 s** (6.4×) | 2.3× |
+| live update | 24.4 s | **0.82 s** (30×) | **1.7×** |
+| live heap | ~1,500 B/cap | **365 B/cap** (4.1×) | **1.11×** |
+| RSS | ~2.6 GB | **751 MB** (3.5×) | 2.2× |
+| tests | 70 | **145** | — |
+
+Kept: 4a (`-A64m`), 4b (CSR edge arenas), 4c (open-addressed index),
+4d (unboxed columns via `Typeable` dispatch), 4e (interned src-deps),
+4f (**the O(n)→O(1) queue-size fix, 13× on live update**), 4g
+(refcounted ids + coverage), 4h (columnar reverse index), 4i (strictness
+hardening). Tried and reverted: `hashtables` for `KeyIntern`
+(`tried/hashtables-keyintern`) — microbenchmark didn't transfer.
+
+**The remaining gap is structural, and every piece of it is accounted
+for**: GHC's copying-GC headroom over the live set (RTS-flag space:
+`-F`, `--nonmoving-gc`, `-c` — surveyed in 4a, all lost on time);
+the boxed existential/dictionary values 4h deliberately chose not to
+intern (now confirmed to be the *entire* remaining non-arena mass); and
+4e's bounded, non-leaking per-call `CompSrcId` reconstruction. No further
+data-layout work reaches any of them.
+
+Three findings outlived their stages and are the real transferable
+lessons: **(1)** an asymmetry between two phases over identical data
+structures means an algorithmic bug, not a constant factor — 4f;
+**(2)** migrating from a `.Strict` container to a mutable boxed column
+silently drops a strictness guarantee, and the resulting leak is
+invisible to correctness tests — 4h; **(3)** per-call reconstruction of
+"identity" values is invisible to a data-layout audit and can dwarf the
+layout itself — 4e, where it cost 683× duplication.
+
 ## Not tried yet / open items
 
 - **The Interlude-2 diet, measured.** The Rust notes list a ranked, concrete
