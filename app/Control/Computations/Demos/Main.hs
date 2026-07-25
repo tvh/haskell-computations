@@ -6,7 +6,6 @@ module Control.Computations.Demos.Main (main) where
 ----------------------------------------
 -- LOCAL
 ----------------------------------------
-import Control.Computations.Demos.Bench.Main
 import Control.Computations.Demos.DirSync.Main
 import Control.Computations.Demos.Hospital.Main
 import Control.Computations.Demos.Simple.Main
@@ -28,7 +27,6 @@ data Options = Options
 data Command
   = DirSync DirSyncOptions
   | Simple SimpleOptions
-  | Bench BenchOptions
   | HospitalPipeline HospitalPipelineOptions
   | HospitalSimulation HospitalSimulationOptions
   | HospitalVisiblePats HospitalVisiblePatsOptions
@@ -41,8 +39,6 @@ data DirSyncOptions = DirSyncOptions
   }
 
 data SimpleOptions = SimpleOptions -- empty for now
-
-data BenchOptions = BenchOptions -- empty for now; scale is read from PERSIST_BENCH_SCALE
 
 data TestOptions = TestOptions -- empty for now
 
@@ -72,15 +68,6 @@ optionsParser = do
                 <$> info
                   simpleCommand
                   (progDesc "Simple demo counting lines in files")
-            )
-          <> command
-            "bench"
-            ( Bench
-                <$> info
-                  benchCommand
-                  ( progDesc
-                      "Scale benchmark mirroring persist_bench: cold eval + one live incremental update"
-                  )
             )
           <> command
             "test"
@@ -117,8 +104,6 @@ optionsParser = do
     pure DirSyncOptions{..}
   simpleCommand :: Parser SimpleOptions
   simpleCommand = pure SimpleOptions
-  benchCommand :: Parser BenchOptions
-  benchCommand = pure BenchOptions
   hospitalPipelineCommand :: Parser HospitalPipelineOptions
   hospitalPipelineCommand = do
     hpo_rootDir <-
@@ -172,7 +157,6 @@ main =
     case opt_command opts of
       DirSync syncOpts -> syncDirs (dso_sourceDir syncOpts) (dso_targetDir syncOpts)
       Simple _ -> simpleMain
-      Bench _ -> benchMain
       RunTests _ -> testMain
       HospitalPipeline opts -> hospitalPipeline opts
       HospitalSimulation opts -> hospitalSimulation opts

@@ -1,7 +1,7 @@
 {-# OPTIONS_GHC -F -pgmF htfpp #-}
 
 {- | Regression coverage for the settle-detection race fixed in the
- @bench@ demo (see @app/Control/Computations/Demos/Bench/Main.hs@):
+ @bench@ demo (see @bench/Control/Computations/Demos/Bench/Main.hs@):
  'waitForRunAtLeast' only guarantees @rs_run result >= n@, never equality,
  because 'Control.Computations.CompEngine.Driver.compDriver'' posts a run's
  'RunStats' -- tagged with the *upcoming* run number, describing the
