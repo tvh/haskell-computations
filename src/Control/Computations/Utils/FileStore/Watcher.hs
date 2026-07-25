@@ -1,5 +1,4 @@
 {-# LANGUAGE TypeFamilies #-}
-{-# OPTIONS_GHC -F -pgmF htfpp #-}
 
 module Control.Computations.Utils.FileStore.Watcher (
   FileStoreWatcherCfg (..),
@@ -10,7 +9,6 @@ module Control.Computations.Utils.FileStore.Watcher (
   loadDoc,
   objFile,
   module Control.Computations.Utils.FileStore.Types,
-  htf_thisModulesTests,
 ) where
 
 ----------------------------------------
@@ -41,7 +39,6 @@ import qualified Data.HashSet as HashSet
 import Data.Int
 import qualified Data.Text as T
 import qualified Database.SQLite3 as SqliteLib
-import Test.Framework
 
 data FileStoreWatcherCfg = FileStoreWatcherCfg
   { fswc_rootDir :: FilePath

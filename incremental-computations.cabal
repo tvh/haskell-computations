@@ -249,6 +249,7 @@ test-suite incremental-computations-test
       Control.Computations.CompEngine.Tests.TestRun
       Control.Computations.CompEngine.Tests.TestStateIf
       Control.Computations.CompEngine.Utils.DefTableTest
+      Control.Computations.CompEngine.Utils.SrcIndexTest
       Control.Computations.FlowImpls.FileSinkTest
       Control.Computations.FlowImpls.FileSrcTest
       Control.Computations.FlowImpls.TimeSrcTest
