@@ -1003,6 +1003,76 @@ machinery, and constructing a dead-ref scenario would need more debug
 surface than it justifies; it is exercised transitively (never triggered,
 which is the correct outcome) by every engine test.
 
+### 4h — columnar reverse source index (commit `376caaa`) — **kept**
+
+The mirror of 4e, on the reverse side. `sifs_srcIndex ::
+HashMap AnyCompSrcKey (HashMap DefRef AnyCompSrcVer)` (~205k boxed entries
+in nested HAMTs) became a new `Utils/SrcIndex.hs`: a `KeyIntern`
+(`AnyCompSrcKey → Int`) plus `IntMap SrcKeyArena`, where each arena holds
+an unboxed `DefRef` column and a parallel boxed `AnyCompSrcVer` column.
+
+Two design calls, both argued from ownership rather than habit:
+
+- **No refcounting on `KeyIntern`** — and this is *not* repeating 4e's
+  mistake. Unlike `SrcDepIntern` (many rows independently retain one id),
+  a source-key id here has exactly **one owner at a time**: the single
+  arena created on first dependent, released on last. Plain
+  assign/recycle is the correct match for 1:1 ownership; refcounting
+  would be ceremony.
+- **Versions are not interned.** Per-dependent versions genuinely differ
+  — that is the entire reason per-dependent tracking exists
+  (`test_modifcationWhileWorkingOnQueue`) — so interning them would
+  reopen the many:1 sharing problem for no established payoff.
+
+Add/remove is single-entry (not `EdgeArena`'s whole-span replace), so
+removal is scan-then-swap-with-last: no tombstones, no compaction.
+
+| | before | after | Δ |
+|---|---|---|---|
+| 1.0 RSS settle | 785.8 MB | **751.0 MB** | **−4.4%** |
+| 1.0 max_live | 375.7 MB | **365.4 MB** | −2.7% |
+| 0.1 RSS settle | 157.8 MB | **146.0 MB** | −7.5% |
+| cold / live / GCs | — | — | flat |
+
+Tests **126 → 145**. Instance/rerun counts bit-identical.
+
+#### ⚠ The bug this stage caught: a missing bang worth 10×
+
+Mid-implementation, cold eval was **~10× slower with ~9× the allocation**
+— while instance and rerun counts stayed bit-identical, i.e. a pure space
+leak, not a correctness fault. Cause: **`Data.Vector.Mutable.write` has no
+strictness contract**, unlike the `Data.HashMap.Strict` it replaced. An
+unforced `ver` thunk retained each row's entire
+`AnyCompSrcDep`/`DepSet` closure. One bang pattern
+(`skaAppend ska ref !ver`) fixed it.
+
+Generalizable lesson, and the reason it is recorded here rather than in a
+commit message: **every migration from a `.Strict` container to a mutable
+boxed column silently drops a strictness guarantee.** The columnar work of
+Stages 3–4 did exactly that migration repeatedly. That makes a strictness
+audit of the remaining boxed columns (`dt_param`/`dt_value`'s `ColBoxed`
+path, `OutputsMap`) a high-confidence next move — this class of bug is
+invisible to correctness tests and to any data-layout audit, and shows up
+only as time and allocation.
+
+### Job B — the `hashtables` head-to-head, finally measured
+
+Standalone microbenchmark (300 keys, 205k ops, 5k churn cycles — sized to
+the real tables' post-4e/4g steady state), `Data.HashMap.Strict` vs
+`Data.HashTable.IO` `Basic`/`Cuckoo`, 3 runs each:
+
+- **single-field key shape** (`AnyCompSrcKey`, i.e. `KeyIntern`'s table):
+  `Basic` ~0.013 s vs HashMap ~0.020 s — a **consistent ~35% win**
+  (Cuckoo ~25–30%).
+- **two-field key shape** (`AnyCompSrcDep`, `sdi_forward`): all three tie
+  at ~0.041–0.043 s — **a wash**; the extra version field erases the
+  advantage.
+
+So the earlier rejection was right for `sdi_forward` and *wrong in
+general*: hashtables genuinely beats the HAMT for the simple-key table.
+Not wired in this pass (measured, not landed) — a small contained swap for
+`KeyIntern`, listed in open items.
+
 ## Not tried yet / open items
 
 - **The Interlude-2 diet, measured.** The Rust notes list a ranked, concrete
