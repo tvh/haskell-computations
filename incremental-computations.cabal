@@ -199,7 +199,7 @@ executable incremental-computations-exe
       TypeApplications
       TypeOperators
       ViewPatterns
-  ghc-options: -O2 -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-export-lists -Wmissing-home-modules -Wno-name-shadowing -Wpartial-fields -Wredundant-constraints -Wno-x-partial -Werror -threaded -rtsopts -with-rtsopts=-N2
+  ghc-options: -O2 -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-export-lists -Wmissing-home-modules -Wno-name-shadowing -Wpartial-fields -Wredundant-constraints -Wno-x-partial -Werror -threaded -rtsopts -with-rtsopts=-N2 -with-rtsopts=-A64m
   build-depends:
       HTF
     , QuickCheck
