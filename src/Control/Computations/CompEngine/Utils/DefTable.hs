@@ -24,24 +24,110 @@
  (as two 'Word64's each, since 'Hash128' itself has no 'Unbox' instance and
  splitting it avoids needing to write one) and @flags@), boxed where it
  can't be ('Data.Vector.Mutable' for the typed @param@/@value@ columns and
- for the edge columns). A boxed column's freshly-grown capacity is left as
- the @vector@ package's own "uninitialised element" error thunk (see
+ for the @srcDeps@ column). A boxed column's freshly-grown capacity is left
+ as the @vector@ package's own "uninitialised element" error thunk (see
  'growBoxed') -- exactly the loud-failure-on-premature-read canary this
  module established for row lifecycle in an earlier increment (dead ids
  there, dead cells here), now extended to row storage. Growth for the
- @flags@ column is the one exception: it is explicitly zeroed (not left as
- unboxed garbage), because a stray nonzero byte there would silently read
- as an occupied row.
+ @flags@ column (and, see below, the edge-arena @len@ columns) is the one
+ exception: it is explicitly zeroed (not left as unboxed garbage), because a
+ stray nonzero byte there would silently read as an occupied row or a
+ nonempty edge span.
+
+ = Edge storage: per-def CSR arenas, not per-row vectors
+
+ An earlier increment of this rewrite gave every row its own small unboxed
+ 'VU.Vector' for @compDeps@/@rdeps@ -- correct, but each such vector is its
+ own heap object (a boxed cell in a 'VM.Mutable' column holding a 'VU.Vector'
+ wrapper plus its own 'Data.Array.Byte.ByteArray#'), so a fan-in-3 row paid
+ for several small, separately-traced nursery allocations to hold ~24-72
+ bytes of actual edge payload. This module instead gives each def two
+ shared, growable, flat unboxed 'Word64' arenas (one for @compDeps@, one for
+ @rdeps@) plus two unboxed per-row columns (@offset@ :: 'Int32', @len@ ::
+ 'Word32') indexing into them -- CSR (compressed sparse row), with the
+ arena itself, not each row, as the unit of (de)allocation. A comp-dep edge
+ is 3 words (target 'DefRef', observed-hash hi, observed-hash lo, matching
+ exactly what the old per-row @VU.Vector (Int, Word64, Word64)@ carried --
+ see "Preserved semantics" below); an rdep edge is 1 word (target
+ 'DefRef'). One large arena is the point of this exercise: unlike a swarm of
+ small per-row vectors, a large flat array is a single object GHC's
+ allocator places in the large-object area once it crosses the pinned/large
+ threshold, where the copying collector never traces or copies it -- see the
+ module's "Small defs" note below for the one case where this doesn't apply.
+
+ __Mutation strategy: append-new-span, mark-old-span-dead, compact on a
+ dead-fraction threshold.__ Chosen over "CSR with per-row slack" because
+ every write here (@writeCompDeps@/@writeRdeps@, both called from
+ "SimpleStateIf.hs") replaces a row's /entire/ edge set at once -- there is
+ no in-place single-edge splice anywhere on the hot path for slack to help
+ with, only whole-row replacement, so append-only is both simpler and no
+ less dense. This is the same append-only-arena shape the Rust port's Stage
+ 5 uses for /param/ bytes (@persistence-benchmark-notes.md@, "Stage 5",
+ @param_off@/@param_len@ indexing into one @param_arena@ per def), applied
+ here to edges instead: a write appends the new span at the arena's current
+ end and bumps a per-def dead-word counter by the row's /previous/ span
+ length (if any); nothing is physically overwritten in place, so a stale
+ span is simply orphaned -- exactly like 'freeRow' already leaves a freed
+ row's other columns as untouched garbage, gated by flags. Unlike the Rust
+ param arena (deliberately never compacted -- params are small, so even
+ permanently-unreclaimed spans are cheap), edges here are compacted,
+ because this task's whole point is bounding the arena: repeated
+ recomputation of the /same/ live rows (exactly what the benchmark's live-
+ update phase does, tens of thousands of times over the same 999,760-row
+ graph) would otherwise make the arena grow without bound, one orphaned
+ span per rerun, forever.
+
+ Compaction ('eaCompact') rebuilds a def's arena from scratch, walking every
+ row 0..rowCount-1 and keeping only the /current/ span of every row that is
+ currently alive; a row that isn't alive contributes nothing, whether or
+ not it was ever given an explicit new write after going dead -- this is
+ what lets a freed-but-not-yet-reused row's orphaned span get reclaimed
+ too, not just rows some other write already knew were stale. This is why
+ "GC" (the row-lifecycle kind, 'freeRow') is the natural trigger the task
+ brief asks for: freeing a row doesn't touch its edge columns at all (see
+ "Row lifecycle and reuse" below), so the /existing/ garbage-tolerance
+ design already guarantees a dead row's stale span is inert and safe to
+ discard whenever compaction next runs, without freeRow itself needing to
+ know anything about edge arenas. 'maybeCompact' fires this whenever, after
+ an append, a def's dead-word count exceeds half its used length (and the
+ arena is past a minimum size not worth an O(rowCount) scan for) --
+ the standard amortized array-with-tombstones argument: a compaction
+ immediately halves (at least) the dead fraction, so the arena's peak size
+ is bounded to roughly 2x its live data, and the total compaction work
+ across N writes is O(N) amortized, tied to the write path itself rather
+ than a separately scheduled sweep.
+
+ __Small defs.__ A def with few rows (or few edges per row) never
+ accumulates enough words to reach GHC's large-object threshold (currently
+ a few kB), so its arena is a small nursery-resident array like everything
+ else -- this module does not special-case that, and it's fine: the whole
+ argument for "large arrays escape the nursery" only pays off where it's
+ needed, on the defs with many rows (this benchmark's front-loaded levels,
+ up to 205,000 rows), which is also exactly where the old per-row-vector
+ scheme paid the worst multiplicative overhead. A small def's arena stays
+ small precisely because its total edge payload is small; there is nothing
+ to reclaim by treating it differently.
+
+ __Preserved semantics.__ Per-edge observed-result-hash tracking on comp-dep
+ edges is unchanged bit-for-bit from the prior representation: each edge is
+ still (target 'DefRef', observed hash hi, observed hash lo), and
+ @test_modifcationWhileWorkingOnQueue@'s impure-cap detection (which
+ compares a row's previously-recorded per-edge observed version against
+ what it observes on the current run) depends on exactly this, per
+ "SimpleStateIf.hs"'s module haddock. Only the storage layout changed; nothing
+ was dropped to save bytes.
 
  = Row lifecycle and reuse
 
  A freed row is pushed onto a free list and its 'flags' cleared (not-alive,
  no result, not pending); every other column is left untouched -- stale
- param/value/edges from the previous occupant. This is safe under the
- invariant that every read of a possibly-stale column is gated behind a
- flags check (@alive@ for identity-ish columns, @hasResult@ for the
- value/result-hash columns) that is unconditionally cleared before the row
- can be reused, so the garbage can never be observed. Reuse does not
+ param/value/edges from the previous occupant, including its edge arena
+ span, which becomes reclaimable garbage handled by the edge-arena
+ compaction machinery above rather than by 'freeRow' itself. This is safe
+ under the invariant that every read of a possibly-stale column is gated
+ behind a flags check (@alive@ for identity-ish columns, @hasResult@ for
+ the value/result-hash columns) that is unconditionally cleared before the
+ row can be reused, so the garbage can never be observed. Reuse does not
  recycle the row's *hash* index entry (that is removed by the caller before
  freeing) but does recycle the row *number* -- new occupants of a freed row
  get a fresh index entry pointing at the recycled number.
@@ -108,18 +194,20 @@ import Control.Computations.Utils.Hash (Hash128 (..), largeHash128)
 -- EXTERNAL
 ----------------------------------------
 
+import Control.Monad (forM_, when)
 import Data.Bits
 import Data.HashMap.Strict (HashMap)
 import qualified Data.HashMap.Strict as HashMap
 import Data.HashSet (HashSet)
 import qualified Data.HashSet as HashSet
 import Data.IORef
+import Data.Int (Int32)
 import qualified Data.LargeHashable as LH
 import qualified Data.Vector.Generic.Mutable as GM
 import qualified Data.Vector.Mutable as VM
 import qualified Data.Vector.Unboxed as VU
 import qualified Data.Vector.Unboxed.Mutable as VUM
-import Data.Word (Word64, Word8)
+import Data.Word (Word32, Word64, Word8)
 import Test.Framework hiding ((.&.))
 
 --
@@ -221,12 +309,11 @@ growBoxed ref needed = do
   when (needed > cap) $ do
     vec' <- GM.unsafeGrow vec (max (needed - cap) (max 4 cap))
     writeIORef ref vec'
- where
-  when b act = if b then act else pure ()
 
--- | Grow an unboxed column so it has room for at least @needed@ rows.
+-- | Grow an unboxed column so it has room for at least @needed@ elements.
 -- Freshly grown capacity is unspecified garbage bytes -- safe only because
--- every unboxed column here is read strictly behind a flags check.
+-- every unboxed column grown this way is read strictly behind a flags (or
+-- edge-length) check that a legitimate write establishes first.
 growUnboxed :: VUM.Unbox e => IORef (VUM.IOVector e) -> Int -> IO ()
 growUnboxed ref needed = do
   vec <- readIORef ref
@@ -234,14 +321,15 @@ growUnboxed ref needed = do
   when (needed > cap) $ do
     vec' <- GM.unsafeGrow vec (max (needed - cap) (max 4 cap))
     writeIORef ref vec'
- where
-  when b act = if b then act else pure ()
 
 -- | Like 'growUnboxed', but explicitly zeroes the freshly grown region.
--- Used only for @flags@: a stray nonzero garbage byte there would silently
--- read as an occupied row, unlike every other unboxed column, which is
--- read only after a flags check has already gated it.
-growUnboxedZeroed :: IORef (VUM.IOVector Word8) -> Int -> IO ()
+-- Used for @flags@ (a stray nonzero garbage byte there would silently read
+-- as an occupied row) and for an edge arena's @len@ column (a stray
+-- nonzero garbage value there would silently read as a nonempty edge
+-- span) -- both are the "is this row's data safe to read" gate for their
+-- respective columns, unlike every other unboxed column here, which is
+-- read only after one of these two checks has already gated it.
+growUnboxedZeroed :: (VUM.Unbox e, Num e) => IORef (VUM.IOVector e) -> Int -> IO ()
 growUnboxedZeroed ref needed = do
   vec <- readIORef ref
   let cap = GM.length vec
@@ -250,8 +338,137 @@ growUnboxedZeroed ref needed = do
     vec' <- GM.unsafeGrow vec extra
     GM.set (GM.unsafeSlice cap extra vec') 0
     writeIORef ref vec'
- where
-  when b act = if b then act else pure ()
+
+--
+-- CSR-style per-def edge arenas -- see the module haddock's "Edge storage"
+-- section for the full design rationale. Everything below is stride-
+-- generic (stride 3 for compDeps, 1 for rdeps) and knows nothing about
+-- 'DefTable' or 'DefRef'; the typed (un)flattening into
+-- @VU.Vector (Int, Word64, Word64)@ / @VU.Vector Int@ happens at the
+-- DefTable column-access boundary further down.
+--
+
+data EdgeArena = EdgeArena
+  { ea_off :: !(IORef (VUM.IOVector Int32))
+  -- ^ per-row arena word-offset of the row's current span
+  , ea_len :: !(IORef (VUM.IOVector Word32))
+  -- ^ per-row edge count (0 => no span, @ea_off@ is meaningless)
+  , ea_data :: !(IORef (VUM.IOVector Word64))
+  -- ^ the shared, growable, append-only arena itself
+  , ea_used :: !(IORef Int)
+  -- ^ arena append point, in words
+  , ea_dead :: !(IORef Int)
+  -- ^ words within [0, ea_used) known to belong to an orphaned span
+  }
+
+newEdgeArena :: IO EdgeArena
+newEdgeArena =
+  EdgeArena
+    <$> (newIORef =<< VUM.new 0)
+    <*> (newIORef =<< VUM.new 0)
+    <*> (newIORef =<< VUM.new 0)
+    <*> newIORef 0
+    <*> newIORef 0
+
+-- | Grow an edge arena's per-row @offset@/@len@ columns to at least
+-- @needed@ rows. Does not touch the shared word arena itself -- that grows
+-- independently, on append, in 'eaWrite'.
+eaGrowRows :: EdgeArena -> Int -> IO ()
+eaGrowRows ea needed = do
+  growUnboxed (ea_off ea) needed
+  growUnboxedZeroed (ea_len ea) needed
+
+-- | Only compact once an arena has reached this many words -- below this,
+-- the O(rowCount) scan a compaction costs isn't worth it.
+compactMinWords :: Int
+compactMinWords = 4096
+
+-- | Compact iff the def's dead words are more than half of its used
+-- words (and the arena is large enough to bother) -- see the module
+-- haddock's amortized-cost argument.
+maybeCompact :: EdgeArena -> (Int -> IO Bool) -> Int -> Int -> IO ()
+maybeCompact ea isRowAlive rows stride = do
+  used <- readIORef (ea_used ea)
+  dead <- readIORef (ea_dead ea)
+  when (used >= compactMinWords && dead * 2 > used) $
+    eaCompact ea isRowAlive rows stride
+
+-- | Rebuild the arena keeping only the current span of every currently-
+-- alive row (in row order); every other row (dead, or alive with no
+-- edges) has its offset/len columns zeroed. A dead row contributes nothing
+-- regardless of whether it was ever given an explicit new write after
+-- going dead -- see the module haddock for why that's the key property
+-- that makes tying this to the write path (rather than row-free) correct.
+eaCompact :: EdgeArena -> (Int -> IO Bool) -> Int -> Int -> IO ()
+eaCompact ea isRowAlive rows stride = do
+  used <- readIORef (ea_used ea)
+  srcV <- readIORef (ea_data ea)
+  dstV <- VUM.new (max 4 used)
+  offV <- readIORef (ea_off ea)
+  lenV <- readIORef (ea_len ea)
+  writeIdxRef <- newIORef 0
+  forM_ [0 .. rows - 1] $ \row -> do
+    alive <- isRowAlive row
+    len <- VUM.read lenV row
+    if alive && len > 0
+      then do
+        off <- VUM.read offV row
+        writeIdx <- readIORef writeIdxRef
+        let n = fromIntegral len * stride
+        GM.unsafeCopy (VUM.slice writeIdx n dstV) (VUM.slice (fromIntegral off) n srcV)
+        VUM.write offV row (fromIntegral writeIdx)
+        writeIORef writeIdxRef (writeIdx + n)
+      else do
+        VUM.write offV row 0
+        VUM.write lenV row 0
+  finalUsed <- readIORef writeIdxRef
+  writeIORef (ea_data ea) dstV
+  writeIORef (ea_used ea) finalUsed
+  writeIORef (ea_dead ea) 0
+
+-- | Read a row's edge span as a flat, stride-major 'VU.Vector Word64' (a
+-- safe copy -- the arena keeps mutating after this call returns). Empty
+-- for a row with no edges.
+eaRead :: EdgeArena -> Int -> Int -> IO (VU.Vector Word64)
+eaRead ea row stride = do
+  lenV <- readIORef (ea_len ea)
+  len <- VUM.read lenV row
+  if len == 0
+    then pure VU.empty
+    else do
+      offV <- readIORef (ea_off ea)
+      off <- VUM.read offV row
+      dataV <- readIORef (ea_data ea)
+      VU.freeze (VUM.slice (fromIntegral off) (fromIntegral len * stride) dataV)
+
+-- | Overwrite a row's entire edge span with @flat@ (already stride-major
+-- flattened; its length must be a multiple of @stride@). An empty write
+-- just zeroes the row's offset/len -- clearing a row's edges never
+-- appends to (or grows) the arena. Otherwise appends a fresh span at the
+-- arena's current end, marks the row's previous span (if any) as dead
+-- weight, then lets 'maybeCompact' decide whether the def's dead fraction
+-- now warrants reclaiming it.
+eaWrite :: EdgeArena -> Int -> (Int -> IO Bool) -> Int -> Int -> VU.Vector Word64 -> IO ()
+eaWrite ea row isRowAlive rows stride flat = do
+  lenV <- readIORef (ea_len ea)
+  offV <- readIORef (ea_off ea)
+  oldLen <- VUM.read lenV row
+  when (oldLen > 0) $
+    modifyIORef' (ea_dead ea) (+ (fromIntegral oldLen * stride))
+  let numWords = VU.length flat
+  if numWords == 0
+    then do
+      VUM.write offV row 0
+      VUM.write lenV row 0
+    else do
+      used <- readIORef (ea_used ea)
+      growUnboxed (ea_data ea) (used + numWords)
+      dataV <- readIORef (ea_data ea)
+      VU.unsafeCopy (VUM.slice used numWords dataV) flat
+      writeIORef (ea_used ea) (used + numWords)
+      VUM.write offV row (fromIntegral used)
+      VUM.write lenV row (fromIntegral (numWords `div` stride))
+  maybeCompact ea isRowAlive rows stride
 
 --
 -- The table
@@ -264,20 +481,22 @@ data DefTable p a = DefTable
   , dt_param :: !(IORef (VM.IOVector p))
   , dt_value :: !(IORef (VM.IOVector a))
   -- ^ valid only when 'flagsResultState' is 'ResultValue'
-  , dt_compDeps :: !(IORef (VM.IOVector (VU.Vector (Int, Word64, Word64))))
-  -- ^ flat forward comp-dep edges: (packed 'DefRef' this row depends on,
-  -- the target's result hash *as observed* when this row last ran --
-  -- needed to replicate the old VerList-based "impure cap" detection,
-  -- which must distinguish "I depend on the same target at the same
-  -- version as before, yet produced a different result" (genuinely
-  -- impure) from "I depend on the same target but at a newly-changed
-  -- version" (an ordinary, expected recompute) -- a target-set comparison
-  -- alone can't tell those apart. A target with no result at observation
-  -- time (a failed dependency) is encoded as the sentinel
+  , dt_compDeps :: !EdgeArena
+  -- ^ flat forward comp-dep edges, stride 3: (packed 'DefRef' this row
+  -- depends on, the target's result hash *as observed* when this row last
+  -- ran, split hi/lo) -- needed to replicate the old VerList-based "impure
+  -- cap" detection, which must distinguish "I depend on the same target at
+  -- the same version as before, yet produced a different result"
+  -- (genuinely impure) from "I depend on the same target but at a newly-
+  -- changed version" (an ordinary, expected recompute) -- a target-set
+  -- comparison alone can't tell those apart. A target with no result at
+  -- observation time (a failed dependency) is encoded as the sentinel
   -- @(maxBound, maxBound)@; colliding with a real MD5-derived hash is not
-  -- a realistic concern.
-  , dt_rdeps :: !(IORef (VM.IOVector (VU.Vector Int)))
-  -- ^ flat reverse comp-dep edges (packed 'DefRef's depending on this row)
+  -- a realistic concern. See the module haddock's "Edge storage" section
+  -- for the CSR-arena layout this lives in.
+  , dt_rdeps :: !EdgeArena
+  -- ^ flat reverse comp-dep edges (packed 'DefRef's depending on this
+  -- row), stride 1.
   , dt_srcDeps :: !(IORef (VM.IOVector (HashSet AnyCompSrcDep)))
   , dt_index :: !(IORef (HashMap Hash128 Int))
   -- ^ this def's own param-hash -> row index (its share of what used to be
@@ -294,8 +513,8 @@ new = do
   fl <- newIORef =<< VUM.new 0
   pa <- newIORef =<< VM.new 0
   va <- newIORef =<< VM.new 0
-  cd <- newIORef =<< VM.new 0
-  rd <- newIORef =<< VM.new 0
+  cd <- newEdgeArena
+  rd <- newEdgeArena
   sd <- newIORef =<< VM.new 0
   ix <- newIORef HashMap.empty
   fr <- newIORef []
@@ -322,8 +541,8 @@ growAllTo dt needed = do
   growUnboxedZeroed (dt_flags dt) needed
   growBoxed (dt_param dt) needed
   growBoxed (dt_value dt) needed
-  growBoxed (dt_compDeps dt) needed
-  growBoxed (dt_rdeps dt) needed
+  eaGrowRows (dt_compDeps dt) needed
+  eaGrowRows (dt_rdeps dt) needed
   growBoxed (dt_srcDeps dt) needed
 
 -- | The table's current logical row count (rows 0 until this are valid
@@ -347,10 +566,11 @@ allocRow dt = do
 -- | Get-or-create the row for a given param hash. On a fresh row, writes
 -- the param hash, the (caller-supplied) typed param, initializes flags to
 -- alive/not-pending/no-result, resets the edge/src-dep columns to empty
--- (cheap, shared 'VU.empty'/'HashSet.empty' -- not per-row garbage, an
--- explicit reset, since a freshly *allocated* row -- as opposed to a
--- *reused* one -- has never had edges and there is nothing stale to gate),
--- and returns 'True' as the second component. Returns 'False' on a hit.
+-- (cheap -- an empty edge write never touches the arena, see 'eaWrite' --
+-- not per-row garbage, an explicit reset, since a freshly *allocated* row
+-- -- as opposed to a *reused* one -- has never had edges and there is
+-- nothing stale to gate), and returns 'True' as the second component.
+-- Returns 'False' on a hit.
 lookupOrInsertRow :: forall p a. DefTable p a -> Hash128 -> p -> IO (Int, Bool)
 lookupOrInsertRow dt h p = do
   idx <- readIORef (dt_index dt)
@@ -432,11 +652,29 @@ readValue dt row = readIORef (dt_value dt) >>= \v -> VM.read v row
 writeValue :: DefTable p a -> Int -> a -> IO ()
 writeValue dt row a = readIORef (dt_value dt) >>= \v -> VM.write v row a
 
+-- | Flatten a comp-dep edge set into stride-3 words (target, hash-hi,
+-- hash-lo) for 'eaWrite'.
+flattenCompDeps :: VU.Vector (Int, Word64, Word64) -> VU.Vector Word64
+flattenCompDeps xs = VU.generate (3 * VU.length xs) go
+ where
+  go i = case i `divMod` 3 of
+    (n, 0) -> let (t, _, _) = xs VU.! n in fromIntegral t
+    (n, 1) -> let (_, hi, _) = xs VU.! n in hi
+    (n, _) -> let (_, _, lo) = xs VU.! n in lo
+
+-- | Inverse of 'flattenCompDeps'.
+unflattenCompDeps :: VU.Vector Word64 -> VU.Vector (Int, Word64, Word64)
+unflattenCompDeps flat = VU.generate (VU.length flat `div` 3) go
+ where
+  go n = (fromIntegral (flat VU.! (3 * n)), flat VU.! (3 * n + 1), flat VU.! (3 * n + 2))
+
 readCompDeps :: DefTable p a -> Int -> IO (VU.Vector (Int, Word64, Word64))
-readCompDeps dt row = readIORef (dt_compDeps dt) >>= \v -> VM.read v row
+readCompDeps dt row = unflattenCompDeps <$> eaRead (dt_compDeps dt) row 3
 
 writeCompDeps :: DefTable p a -> Int -> VU.Vector (Int, Word64, Word64) -> IO ()
-writeCompDeps dt row xs = readIORef (dt_compDeps dt) >>= \v -> VM.write v row xs
+writeCompDeps dt row xs = do
+  n <- rowCount dt
+  eaWrite (dt_compDeps dt) row (isAlive dt) n 3 (flattenCompDeps xs)
 
 -- | Just the target refs of a comp-dep edge set, discarding the observed
 -- version -- what the rdeps graph (add/remove edges, GC liveness) cares
@@ -445,10 +683,12 @@ compDepTargets :: VU.Vector (Int, Word64, Word64) -> VU.Vector Int
 compDepTargets = VU.map (\(r, _, _) -> r)
 
 readRdeps :: DefTable p a -> Int -> IO (VU.Vector Int)
-readRdeps dt row = readIORef (dt_rdeps dt) >>= \v -> VM.read v row
+readRdeps dt row = VU.map fromIntegral <$> eaRead (dt_rdeps dt) row 1
 
 writeRdeps :: DefTable p a -> Int -> VU.Vector Int -> IO ()
-writeRdeps dt row xs = readIORef (dt_rdeps dt) >>= \v -> VM.write v row xs
+writeRdeps dt row xs = do
+  n <- rowCount dt
+  eaWrite (dt_rdeps dt) row (isAlive dt) n 1 (VU.map fromIntegral xs)
 
 readSrcDeps :: DefTable p a -> Int -> IO (HashSet AnyCompSrcDep)
 readSrcDeps dt row = readIORef (dt_srcDeps dt) >>= \v -> VM.read v row
@@ -703,3 +943,74 @@ test_freeRowResetsEdgesOnReuse = do
   rd <- readRdeps dt r2
   assertEqual VU.empty cd
   assertEqual VU.empty rd
+
+--
+-- Edge-arena specific: repeated overwrite (the pattern that drives the
+-- append-only arena's growth and eventually forces a compaction), and
+-- compaction's interaction with rows that are alive vs. freed.
+--
+
+test_manyOverwritesOfSameRowKeepLatestEdgesCorrect :: IO ()
+test_manyOverwritesOfSameRowKeepLatestEdgesCorrect = do
+  dt <- newTest
+  (r, _) <- lookupOrInsertRow dt (h 1) 1
+  -- comfortably past compactMinWords (4096) at stride 3, so this forces at
+  -- least one compaction of the compDeps arena along the way.
+  mapM_
+    ( \i -> do
+        let cd = VU.fromList [(i, fromIntegral i, fromIntegral (i + 1))]
+        writeCompDeps dt r cd
+        let rd = VU.fromList [i, i + 1, i + 2]
+        writeRdeps dt r rd
+    )
+    [1 .. 3000]
+  gotCd <- readCompDeps dt r
+  assertEqual (VU.fromList [(3000, 3000, 3001)]) gotCd
+  gotRd <- readRdeps dt r
+  assertEqual (VU.fromList [3000, 3001, 3002]) gotRd
+
+test_compactionDoesNotDisturbOtherAliveRowsEdges :: IO ()
+test_compactionDoesNotDisturbOtherAliveRowsEdges = do
+  dt <- newTest
+  (rHot, _) <- lookupOrInsertRow dt (h 0) 0
+  -- a handful of bystander rows, each given a distinct, stable edge set
+  -- that must still read back correctly after the hot row's repeated
+  -- overwrites force one or more compactions of the shared arena.
+  bystanders <- mapM (\i -> lookupOrInsertRow dt (h i) i) [1 .. 10]
+  mapM_
+    ( \(r, i) -> do
+        writeCompDeps dt r (VU.fromList [(100 + i, fromIntegral i, fromIntegral i)])
+        writeRdeps dt r (VU.fromList [200 + i])
+    )
+    (zip (map fst bystanders) [1 .. 10])
+  mapM_
+    ( \i -> writeCompDeps dt rHot (VU.fromList [(i, fromIntegral i, fromIntegral i)])
+    )
+    [1 .. 3000 :: Int]
+  mapM_
+    ( \(r, i) -> do
+        cd <- readCompDeps dt r
+        assertEqual (VU.fromList [(100 + i, fromIntegral i, fromIntegral i)]) cd
+        rd <- readRdeps dt r
+        assertEqual (VU.fromList [200 + i]) rd
+    )
+    (zip (map fst bystanders) [1 .. 10])
+
+test_freedRowsDontResurfaceAfterCompaction :: IO ()
+test_freedRowsDontResurfaceAfterCompaction = do
+  dt <- newTest
+  (rKeep, _) <- lookupOrInsertRow dt (h 0) 0
+  writeCompDeps dt rKeep (VU.fromList [(999, 1, 1)])
+  (rDoomed, _) <- lookupOrInsertRow dt (h 1) 1
+  writeCompDeps dt rDoomed (VU.fromList [(888, 2, 2)])
+  freeRow dt (h 1) rDoomed
+  -- force compaction via repeated overwrites of the surviving row
+  mapM_
+    (\i -> writeCompDeps dt rKeep (VU.fromList [(i, fromIntegral i, fromIntegral i)]))
+    [1 .. 3000 :: Int]
+  aliveKeep <- isAlive dt rKeep
+  assertBool aliveKeep
+  cd <- readCompDeps dt rKeep
+  assertEqual (VU.fromList [(3000, 3000, 3000)]) cd
+  aliveDoomed <- isAlive dt rDoomed
+  assertBool (not aliveDoomed)
