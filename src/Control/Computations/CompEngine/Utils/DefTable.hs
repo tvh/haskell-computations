@@ -1,4 +1,6 @@
 {-# LANGUAGE AllowAmbiguousTypes #-}
+{-# LANGUAGE DataKinds #-}
+{-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE EmptyCase #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeFamilies #-}
@@ -154,35 +156,45 @@
  length to @ea_dead@ -- see "Mutation strategy" just below. @rdeps@\/
  @srcDeps@ are the same picture at stride 1 (one word per edge, no hi\/lo).
 
- __Why 'EdgeArena''s stride isn't a phantom type.__ Considered and rejected.
- A @data EdgeArena (s :: StrideKind) = ...@ phantom parameter (with
- @dt_compDeps :: EdgeArena 'CompDepsK@, @dt_rdeps :: EdgeArena 'RdepsK@, a
- type class to recover the numeric stride from the tag) would statically
- rule out passing the wrong stride to 'eaWrite'\/'eaRead'\/'eaCompact'. But
- the actual hazard that would close is narrower than it sounds: 'EdgeArena'
- is not part of this module's public API (not in the export list at all --
- only 'DefTable' and its column accessors are), so every call to
- 'eaWrite'\/'eaRead'\/'eaCompact'\/'eaTakeRow' already lives in exactly one
- place each ('writeCompDeps'\/'readCompDeps', 'writeRdeps'\/'readRdeps',
- 'writeSrcDeps'\/'readSrcDeps'\/'freeRow'), each pairing one specific
- 'EdgeArena' field with one hardcoded 'Stride' constant ('compDepsStride' or
- 'singleStride') a few lines below its own definition, in a heavily-tested
- (see the "Edge-arena specific" test section) file a newcomer reads start to
- finish, not a boundary someone calls from a different module with a
- different-shaped value in hand. Introducing 'DataKinds', an extra type
- parameter threaded through 'DefTable''s three 'EdgeArena' fields, and a
- type-class dispatch to recover a numeric stride back out where compaction's
- word-count arithmetic still needs one would be real, permanent syntactic
- and cognitive weight
- for a transposition that would show up as an immediate, glaring test
- failure (wrong-stride reads desync every offset downstream) the first time
- anyone tried it -- not a silent-corruption risk like the pre-newtype
- 'DefRef'\/row\/def-index mixups this pass otherwise targets. The
- already-landed 'RowIdx'\/'RowCount'\/'Stride' newtypes (this pass) remove
- the *positional* version of the same hazard (an 'Int' meant as a stride can
- no longer be passed where a row count or row index is expected, or vice
- versa) at a fraction of the cost. Net judgment: more noise than safety
- here; skipped.
+ __'EdgeArena''s stride is a phantom type.__ A previous pass considered and
+ rejected this (see docs/benchmark-notes.md's Stage 4 archaeology for the
+ original argument), on the reasoning that 'EdgeArena' is not part of this
+ module's public API, so every call to 'eaWrite'\/'eaRead'\/'eaCompact'\/
+ 'eaTakeRow' already lived in exactly one place each, pairing one specific
+ 'EdgeArena' field with one hardcoded 'Stride' constant a few lines below
+ its own definition -- and a transposition there would show up as an
+ immediate, glaring test failure, not a silent-corruption risk. That
+ argument was correct as far as it went; what changed is the cost side of
+ the ledger, once actually attempted. @data EdgeArena (s :: 'StrideKind') =
+ ...@ (a real 'DataKinds' phantom parameter -- 'data', not 'newtype', since
+ 'EdgeArena' has five fields and 'newtype' only wraps one; the phantom
+ parameter is still erased identically either way, see below) plus a
+ 'KnownStride' class recovering the numeric 'Stride' from the tag does not
+ make 'eaWrite'\/'eaRead'\/'eaCompact'\/'eaTakeRow'\/'maybeCompact' /gain/ a
+ type parameter alongside their existing 'Stride' argument -- it makes the
+ explicit 'Stride' argument disappear from all five entirely, recovered
+ instead from @s@ via 'strideOf'. The net line count at each call site goes
+ down, not up: 'readCompDeps' no longer passes 'compDepsStride', 'readRdeps'
+ no longer passes 'singleStride', and so on. The previous pass weighed
+ "extra type parameter + class dispatch" against "a bug class that would
+ fail loudly anyway" and judged it not worth it; once it became clear the
+ change is a net simplification at every call site rather than a net
+ addition, and the user's priority shifted toward stronger types being
+ worth paying for even where the runtime risk was already low, the
+ calculus changed. 'dt_compDeps' \/ 'dt_rdeps' \/ 'dt_srcDeps' are typed
+ @'EdgeArena' ''CompDepsK'@ \/ @'EdgeArena' ''RdepsK'@ \/ @'EdgeArena'
+ ''SrcDepsK'@ respectively -- three tags, not two, even though @'RdepsK'@'s
+ and @'SrcDepsK'@'s numeric strides are both 1: giving them separate tags
+ closes an adjacent hazard the original two-tag sketch would have left
+ open (passing the reverse-comp-dep arena where the src-dep-id arena was
+ meant, or vice versa -- same word-per-edge shape, unrelated meaning) for
+ the cost of one more promoted constructor and one more one-line
+ 'KnownStride' instance. 'strideOf' is marked 'INLINE' on every instance,
+ so it inlines to the literal 'Stride' it returns at each (statically
+ known) call site -- verified, not assumed, by the A/B in this module's
+ commit history (git log this file for the commit introducing
+ 'StrideKind') rather than trusted on the strength of "phantom types are
+ free" alone.
 
  __Mutation strategy: append-new-span, mark-old-span-dead, compact on a
  dead-fraction threshold.__ Chosen over "CSR with per-row slack" because
@@ -711,23 +723,51 @@ unRowCount (RowCount i) = i
 rowIndices :: RowCount -> [RowIdx]
 rowIndices (RowCount n) = map RowIdx [0 .. n - 1]
 
--- | Words per edge in an 'EdgeArena': 3 for @compDeps@ (target 'DefRef' +
--- observed-hash hi\/lo), 1 for @rdeps@\/@srcDeps@ (target 'DefRef' or
--- interned id alone). A plain newtype rather than a phantom type parameter
--- on 'EdgeArena' itself -- see the module haddock's "Why EdgeArena's stride
--- isn't a phantom type" section for why that was considered and rejected.
+-- | Words per edge in an 'EdgeArena'. Still a plain newtype around the
+-- numeric word count -- what changed (see the module haddock's "'EdgeArena''s
+-- stride is a phantom type" section) is that a 'Stride' value is no longer
+-- threaded explicitly through 'eaWrite'\/'eaRead'\/'eaCompact'\/'eaTakeRow'\/
+-- 'maybeCompact' as an argument; those functions now recover it from
+-- 'EdgeArena''s own phantom 'StrideKind' tag via 'KnownStride'.
 newtype Stride = Stride Int
   deriving (Eq, Ord, Show)
 
+-- | The tag 'EdgeArena''s phantom parameter ranges over -- one promoted
+-- constructor per arena /identity/, not merely per distinct numeric stride:
+-- 'RdepsK' and 'SrcDepsK' both carry stride 1, but keeping them separate
+-- tags means @'EdgeArena' ''RdepsK'@ and @'EdgeArena' ''SrcDepsK'@ are
+-- genuinely different types, so a future call site can't pass @dt_rdeps@
+-- where @dt_srcDeps@ was meant (or vice versa) and have it typecheck just
+-- because the word-per-edge count happens to match.
+data StrideKind = CompDepsK | RdepsK | SrcDepsK
+
+-- | Recover an 'EdgeArena''s numeric 'Stride' from its phantom 'StrideKind'
+-- tag, so 'eaWrite'\/'eaRead'\/'eaCompact'\/'eaTakeRow'\/'maybeCompact' never
+-- take one as an explicit argument -- see the module haddock. Every instance
+-- is marked 'INLINE', so @'strideOf' \@''CompDepsK'@ (etc.) compiles down to
+-- the literal 'Stride' at each call site, not a runtime dictionary lookup --
+-- this module's own A\/B (docs/benchmark-notes.md) confirms the erasure
+-- rather than assuming it from "phantom types are free" alone.
+class KnownStride (s :: StrideKind) where
+  strideOf :: Stride
+
 -- | 'dt_compDeps''s stride: target 'DefRef', observed-hash hi, observed-hash
 -- lo.
-compDepsStride :: Stride
-compDepsStride = Stride 3
+instance KnownStride 'CompDepsK where
+  strideOf = Stride 3
+  {-# INLINE strideOf #-}
 
--- | 'dt_rdeps''s and 'dt_srcDeps''s stride: one word (a target 'DefRef' or
--- an interned src-dep id, respectively) per edge.
-singleStride :: Stride
-singleStride = Stride 1
+-- | 'dt_rdeps''s stride: one word (a target 'DefRef') per edge.
+instance KnownStride 'RdepsK where
+  strideOf = Stride 1
+  {-# INLINE strideOf #-}
+
+-- | 'dt_srcDeps''s stride: one word (an interned src-dep id) per edge --
+-- numerically the same as 'RdepsK', on a deliberately separate tag; see
+-- 'StrideKind''s haddock.
+instance KnownStride 'SrcDepsK where
+  strideOf = Stride 1
+  {-# INLINE strideOf #-}
 
 --
 -- Flags
@@ -939,7 +979,15 @@ colWrite (ColUnboxed Refl ref) row e = readIORef ref >>= \v -> VUM.write v (unRo
 -- concrete 'DefTable' looks like from an 'EdgeArena''s side.
 type IsRowAlive = RowIdx -> IO Bool
 
-data EdgeArena = EdgeArena
+-- | @s@ is a phantom parameter (see the module haddock's "'EdgeArena''s
+-- stride is a phantom type" section): it appears in none of the fields
+-- below, only in this data declaration's head, so it costs nothing at
+-- runtime -- a @'EdgeArena' ''CompDepsK'@ and an @'EdgeArena' ''RdepsK'@
+-- have identical machine representation, the type index exists purely for
+-- the typechecker. 'data', not 'newtype', because 'EdgeArena' has five
+-- fields; a phantom parameter is erased the same way regardless of which
+-- keyword introduces the type.
+data EdgeArena (s :: StrideKind) = EdgeArena
   { ea_off :: !(IORef (VUM.IOVector Int32))
   -- ^ per-row arena word-offset of the row's current span
   , ea_len :: !(IORef (VUM.IOVector Word32))
@@ -952,7 +1000,7 @@ data EdgeArena = EdgeArena
   -- ^ words within [0, ea_used) known to belong to an orphaned span
   }
 
-newEdgeArena :: IO EdgeArena
+newEdgeArena :: IO (EdgeArena s)
 newEdgeArena =
   EdgeArena
     <$> (newIORef =<< VUM.new 0)
@@ -963,8 +1011,9 @@ newEdgeArena =
 
 -- | Grow an edge arena's per-row @offset@/@len@ columns to at least
 -- @needed@ rows. Does not touch the shared word arena itself -- that grows
--- independently, on append, in 'eaWrite'.
-eaGrowRows :: EdgeArena -> RowCount -> IO ()
+-- independently, on append, in 'eaWrite'. No 'KnownStride' constraint --
+-- unlike every function below, this one never needs the numeric stride.
+eaGrowRows :: EdgeArena s -> RowCount -> IO ()
 eaGrowRows ea needed = do
   growUnboxed (ea_off ea) (unRowCount needed)
   growUnboxedZeroed (ea_len ea) (unRowCount needed)
@@ -976,13 +1025,15 @@ compactMinWords = 4096
 
 -- | Compact iff the def's dead words are more than half of its used
 -- words (and the arena is large enough to bother) -- see the module
--- haddock's amortized-cost argument.
-maybeCompact :: EdgeArena -> IsRowAlive -> RowCount -> Stride -> IO ()
-maybeCompact ea isRowAlive rows stride = do
+-- haddock's amortized-cost argument. The 'Stride' this needs to pass on to
+-- 'eaCompact' is recovered from @s@ via 'KnownStride', not taken as an
+-- argument -- see the module haddock.
+maybeCompact :: forall s. KnownStride s => EdgeArena s -> IsRowAlive -> RowCount -> IO ()
+maybeCompact ea isRowAlive rows = do
   used <- readIORef (ea_used ea)
   dead <- readIORef (ea_dead ea)
   when (used >= compactMinWords && dead * 2 > used) $
-    eaCompact ea isRowAlive rows stride
+    eaCompact ea isRowAlive rows
 
 -- | Rebuild the arena keeping only the current span of every currently-
 -- alive row (in row order); every other row (dead, or alive with no
@@ -990,8 +1041,9 @@ maybeCompact ea isRowAlive rows stride = do
 -- regardless of whether it was ever given an explicit new write after
 -- going dead -- see the module haddock for why that's the key property
 -- that makes tying this to the write path (rather than row-free) correct.
-eaCompact :: EdgeArena -> IsRowAlive -> RowCount -> Stride -> IO ()
-eaCompact ea isRowAlive rows (Stride stride) = do
+eaCompact :: forall s. KnownStride s => EdgeArena s -> IsRowAlive -> RowCount -> IO ()
+eaCompact ea isRowAlive rows = do
+  let Stride stride = strideOf @s
   used <- readIORef (ea_used ea)
   srcV <- readIORef (ea_data ea)
   dstV <- VUM.new (max 4 used)
@@ -1021,8 +1073,9 @@ eaCompact ea isRowAlive rows (Stride stride) = do
 -- | Read a row's edge span as a flat, stride-major 'VU.Vector Word64' (a
 -- safe copy -- the arena keeps mutating after this call returns). Empty
 -- for a row with no edges.
-eaRead :: EdgeArena -> RowIdx -> Stride -> IO (VU.Vector Word64)
-eaRead ea row (Stride stride) = do
+eaRead :: forall s. KnownStride s => EdgeArena s -> RowIdx -> IO (VU.Vector Word64)
+eaRead ea row = do
+  let Stride stride = strideOf @s
   lenV <- readIORef (ea_len ea)
   len <- VUM.read lenV (unRowIdx row)
   if len == 0
@@ -1043,9 +1096,10 @@ eaRead ea row (Stride stride) = do
 -- row (e.g. the reset write 'lookupOrInsertRow' issues when a freed row
 -- number is reused) sees an empty span rather than the same stale ids
 -- again.
-eaTakeRow :: EdgeArena -> RowIdx -> Stride -> IO (VU.Vector Word64)
-eaTakeRow ea row stride@(Stride strideN) = do
-  flat <- eaRead ea row stride
+eaTakeRow :: forall s. KnownStride s => EdgeArena s -> RowIdx -> IO (VU.Vector Word64)
+eaTakeRow ea row = do
+  flat <- eaRead ea row
+  let Stride strideN = strideOf @s
   lenV <- readIORef (ea_len ea)
   offV <- readIORef (ea_off ea)
   len <- VUM.read lenV (unRowIdx row)
@@ -1062,8 +1116,9 @@ eaTakeRow ea row stride@(Stride strideN) = do
 -- arena's current end, marks the row's previous span (if any) as dead
 -- weight, then lets 'maybeCompact' decide whether the def's dead fraction
 -- now warrants reclaiming it.
-eaWrite :: EdgeArena -> RowIdx -> IsRowAlive -> RowCount -> Stride -> VU.Vector Word64 -> IO ()
-eaWrite ea row isRowAlive rows stride@(Stride strideN) flat = do
+eaWrite :: forall s. KnownStride s => EdgeArena s -> RowIdx -> IsRowAlive -> RowCount -> VU.Vector Word64 -> IO ()
+eaWrite ea row isRowAlive rows flat = do
+  let Stride strideN = strideOf @s
   lenV <- readIORef (ea_len ea)
   offV <- readIORef (ea_off ea)
   oldLen <- VUM.read lenV (unRowIdx row)
@@ -1082,7 +1137,7 @@ eaWrite ea row isRowAlive rows stride@(Stride strideN) flat = do
       writeIORef (ea_used ea) (used + numWords)
       VUM.write offV (unRowIdx row) (fromIntegral used)
       VUM.write lenV (unRowIdx row) (fromIntegral (numWords `div` strideN))
-  maybeCompact ea isRowAlive rows stride
+  maybeCompact ea isRowAlive rows
 
 --
 -- Open-addressing hash->row index -- see the module haddock's "Hash index"
@@ -1438,7 +1493,7 @@ data DefTable p a = DefTable
   -- ^ valid only when 'flagsResultState' is 'ResultValue'. Unboxed when @a@
   -- is one of 'mkColumn''s recognized primitive types, boxed otherwise --
   -- see the "Typed value columns" section above.
-  , dt_compDeps :: !EdgeArena
+  , dt_compDeps :: !(EdgeArena 'CompDepsK)
   -- ^ flat forward comp-dep edges, stride 3: (packed 'DefRef' this row
   -- depends on, the target's result hash *as observed* when this row last
   -- ran, split hi/lo) -- needed to replicate the old VerList-based "impure
@@ -1451,10 +1506,10 @@ data DefTable p a = DefTable
   -- @(maxBound, maxBound)@; colliding with a real MD5-derived hash is not
   -- a realistic concern. See the module haddock's "Edge storage" section
   -- for the CSR-arena layout this lives in.
-  , dt_rdeps :: !EdgeArena
+  , dt_rdeps :: !(EdgeArena 'RdepsK)
   -- ^ flat reverse comp-dep edges (packed 'DefRef's depending on this
   -- row), stride 1.
-  , dt_srcDeps :: !EdgeArena
+  , dt_srcDeps :: !(EdgeArena 'SrcDepsK)
   -- ^ flat interned src-dep ids, stride 1 -- see the module haddock's
   -- "Src-dep interning" section.
   , dt_srcDepIntern :: !SrcDepIntern
@@ -1567,7 +1622,7 @@ lookupOrInsertRow dt h p = do
 freeRow :: DefTable p a -> Hash128 -> RowIdx -> IO ()
 freeRow dt h row = do
   hixDelete (dt_index dt) (readParamHash dt) h
-  oldSrc <- eaTakeRow (dt_srcDeps dt) row singleStride
+  oldSrc <- eaTakeRow (dt_srcDeps dt) row
   mapM_ (sdiRelease (dt_srcDepIntern dt) . mkSrcDepId . fromIntegral) (VU.toList oldSrc)
   modifyIORef' (dt_free dt) (unRowIdx row :)
   writeFlags dt row zeroFlags
@@ -1653,12 +1708,12 @@ unflattenCompDeps flat = VU.generate (VU.length flat `div` 3) go
   go n = (fromIntegral (flat VU.! (3 * n)), flat VU.! (3 * n + 1), flat VU.! (3 * n + 2))
 
 readCompDeps :: DefTable p a -> RowIdx -> IO (VU.Vector (Int, Word64, Word64))
-readCompDeps dt row = unflattenCompDeps <$> eaRead (dt_compDeps dt) row compDepsStride
+readCompDeps dt row = unflattenCompDeps <$> eaRead (dt_compDeps dt) row
 
 writeCompDeps :: DefTable p a -> RowIdx -> VU.Vector (Int, Word64, Word64) -> IO ()
 writeCompDeps dt row xs = do
   n <- rowCount dt
-  eaWrite (dt_compDeps dt) row (isAlive dt) n compDepsStride (flattenCompDeps xs)
+  eaWrite (dt_compDeps dt) row (isAlive dt) n (flattenCompDeps xs)
 
 -- | Just the target refs (raw, packed 'DefRef' 'Int's -- see
 -- 'flattenCompDeps''s haddock) of a comp-dep edge set, discarding the
@@ -1668,12 +1723,12 @@ compDepTargets :: VU.Vector (Int, Word64, Word64) -> VU.Vector Int
 compDepTargets = VU.map (\(r, _, _) -> r)
 
 readRdeps :: DefTable p a -> RowIdx -> IO (VU.Vector Int)
-readRdeps dt row = VU.map fromIntegral <$> eaRead (dt_rdeps dt) row singleStride
+readRdeps dt row = VU.map fromIntegral <$> eaRead (dt_rdeps dt) row
 
 writeRdeps :: DefTable p a -> RowIdx -> VU.Vector Int -> IO ()
 writeRdeps dt row xs = do
   n <- rowCount dt
-  eaWrite (dt_rdeps dt) row (isAlive dt) n singleStride (VU.map fromIntegral xs)
+  eaWrite (dt_rdeps dt) row (isAlive dt) n (VU.map fromIntegral xs)
 
 -- | Decode a row's interned src-dep arena span back into a 'HashSet' of
 -- full 'AnyCompSrcDep' values -- see the module haddock's "Src-dep
@@ -1681,7 +1736,7 @@ writeRdeps dt row xs = do
 -- id.
 readSrcDeps :: DefTable p a -> RowIdx -> IO (HashSet AnyCompSrcDep)
 readSrcDeps dt row = do
-  flat <- eaRead (dt_srcDeps dt) row singleStride
+  flat <- eaRead (dt_srcDeps dt) row
   deps <- mapM (sdiResolve (dt_srcDepIntern dt) . mkSrcDepId . fromIntegral) (VU.toList flat)
   pure (HashSet.fromList deps)
 
@@ -1703,12 +1758,12 @@ readSrcDeps dt row = do
 writeSrcDeps :: DefTable p a -> RowIdx -> HashSet AnyCompSrcDep -> IO ()
 writeSrcDeps dt row s = do
   let sdi = dt_srcDepIntern dt
-  oldFlat <- eaRead (dt_srcDeps dt) row singleStride
+  oldFlat <- eaRead (dt_srcDeps dt) row
   newIds <- mapM (sdiIntern sdi) (HashSet.toList s)
   mapM_ (sdiRetain sdi) newIds
   mapM_ (sdiRelease sdi . mkSrcDepId . fromIntegral) (VU.toList oldFlat)
   n <- rowCount dt
-  eaWrite (dt_srcDeps dt) row (isAlive dt) n singleStride (VU.fromList (map (fromIntegral . unSrcDepId) newIds))
+  eaWrite (dt_srcDeps dt) row (isAlive dt) n (VU.fromList (map (fromIntegral . unSrcDepId) newIds))
 
 -- | Test/debug-only: number of currently-live interned src-dep ids in this
 -- def's table -- see 'sdiLiveCount'. Exported (unlike the rest of
