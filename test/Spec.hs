@@ -24,10 +24,10 @@ import {-@ HTF_TESTS @-} Control.Computations.Utils.DataSizeTest
 import {-@ HTF_TESTS @-} Control.Computations.Utils.DispatcherTest
 import {-@ HTF_TESTS @-} Control.Computations.Utils.FailTest
 import {-@ HTF_TESTS @-} Control.Computations.Utils.FileStore.Tests
-import {-@ HTF_TESTS @-} Control.Computations.Utils.FileWatch
-import {-@ HTF_TESTS @-} Control.Computations.Utils.IOUtils
-import {-@ HTF_TESTS @-} Control.Computations.Utils.MultiMap
-import {-@ HTF_TESTS @-} Control.Computations.Utils.MultiSet
+import {-@ HTF_TESTS @-} Control.Computations.Utils.FileWatchTest
+import {-@ HTF_TESTS @-} Control.Computations.Utils.IOUtilsTest
+import {-@ HTF_TESTS @-} Control.Computations.Utils.MultiMapTest
+import {-@ HTF_TESTS @-} Control.Computations.Utils.MultiSetTest
 import {-@ HTF_TESTS @-} Control.Computations.Utils.TimeSpanTest
 
 main :: IO ()

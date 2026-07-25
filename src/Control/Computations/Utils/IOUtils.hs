@@ -1,5 +1,4 @@
 {-# LANGUAGE DeriveAnyClass #-}
-{-# OPTIONS_GHC -F -pgmF htfpp #-}
 {-# OPTIONS_GHC -Wno-orphans #-}
 
 module Control.Computations.Utils.IOUtils (
@@ -14,7 +13,6 @@ module Control.Computations.Utils.IOUtils (
   unCanonPath,
   canonPath,
   writeFileAtomically,
-  htf_thisModulesTests,
 ) where
 
 ----------------------------------------
@@ -42,7 +40,6 @@ import System.FilePath
 import System.IO.Temp
 import qualified System.Posix as Posix
 import qualified System.Posix.Types as PosixTypes
-import Test.Framework
 
 listDirectoryWithQualifiedNames :: FilePath -> IO [FilePath]
 listDirectoryWithQualifiedNames path = do
@@ -73,26 +70,6 @@ listDirectoryRecursive path =
             then pure newAcc
             else loop newAcc p
         _ -> pure newAcc
-
-test_listDirectoryRecursive :: IO ()
-test_listDirectoryRecursive =
-  withSysTempDir $ \rootDir ->
-    do
-      BS.writeFile (rootDir </> "x") "foo"
-      createDirectory (rootDir </> "A")
-      BS.writeFile (rootDir </> "A/x") "bar"
-      createDirectory (rootDir </> "A/B")
-      BS.writeFile (rootDir </> "A/B/x") "baz"
-      createDirectoryLink
-        (rootDir </> "A") -- target
-        (rootDir </> "A/B/c") -- name of link
-      createFileLink
-        (rootDir </> "x") -- target
-        (rootDir </> "A/B/y") -- name of link
-      l <- listDirectoryRecursive rootDir
-      assertListsEqualAsSets
-        (map (rootDir </>) ["x", "A", "A/x", "A/B", "A/B/x", "A/B/c", "A/B/y"])
-        (map fst l)
 
 withSysTempDir :: (FilePath -> IO a) -> IO a
 withSysTempDir = withTempDirectory "/tmp" "IncComp_"

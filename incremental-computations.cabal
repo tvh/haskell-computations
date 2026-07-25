@@ -253,6 +253,10 @@ test-suite incremental-computations-test
       Control.Computations.Utils.DispatcherTest
       Control.Computations.Utils.FailTest
       Control.Computations.Utils.FileStore.Tests
+      Control.Computations.Utils.FileWatchTest
+      Control.Computations.Utils.IOUtilsTest
+      Control.Computations.Utils.MultiMapTest
+      Control.Computations.Utils.MultiSetTest
       Control.Computations.Utils.TimeSpanTest
       Control.Computations.CompEngine
       Control.Computations.CompEngine.CacheBehaviors
