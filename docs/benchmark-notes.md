@@ -711,6 +711,43 @@ the win is unambiguous on the time axis only. One `--nonmoving-gc` run
 showed RSS *dropping* 1594 → 767 MB mid-run (pages returned to the OS),
 observed once, not chased.
 
+### 4b — CSR per-def edge arenas (commit `45899d2`) — **kept**
+
+The biggest remaining memory item. Both edge columns (per-row boxed vectors
+of unboxed vectors — each row's edges a separate nursery-resident heap
+object, and worse, `VU.Vector` of tuples is structure-of-arrays so a
+fan-in-3 row cost a `V_3` constructor plus **three** `ByteArray`s) became
+two shared growable per-def arenas: flat unboxed `VUM.IOVector Word64`,
+stride 3 for comp-deps (target `DefRef` + observed-hash hi/lo), stride 1
+for rdeps, with unboxed `Int32` offset / `Word32` len columns per row.
+
+Mutation: **append-new-span, mark-old-span-dead**, because every write
+replaces a row's whole edge set (no single-edge splice exists on the hot
+path, so per-row slack buys nothing). A per-def dead-word counter triggers
+compaction once dead words exceed half the used length — peak bounded at
+~2× live, amortized O(1) per write, and it hooks the write path rather
+than needing a GC callback. Per-edge observed-hash semantics preserved
+exactly. `DefTable`'s external API is unchanged, so `SimpleStateIf.hs`
+needed **zero** edits.
+
+| Scale | metric | before | after | Δ |
+|---|---|---|---|---|
+| 1.0 | max_live | 1107.0 MB | **886.5 MB** | **−20%** |
+| 1.0 | RSS settle | ~2000 MB | **~1530 MB** | **−23%** |
+| 1.0 | cold | 8.9 s | 8.2 s | −7% |
+| 1.0 | live | 10.75 s | 10.64 s | flat |
+| 0.1 | max_live | 104.6–112.8 MB | **75.2 MB** | **−28 to −33%** |
+
+Instance/rerun counts bit-identical. Tests 89/89.
+
+**The large-object hypothesis is confirmed**, which is the load-bearing
+part: at equal total allocation (~60 GB), `+RTS -s` shows bytes copied
+during GC **3.45 → 2.11 GB (−39%)** and GC time **2.67 → 1.51 s (−43%)`,
+with max slop rising 6.6 → 33.5 MB (block-rounded large-object
+allocations). The arenas really are sitting outside the copied path — the
+mechanism the roadmap said was needed to escape the copying multiplier,
+now demonstrated rather than assumed.
+
 ## Not tried yet / open items
 
 - **The Interlude-2 diet, measured.** The Rust notes list a ranked, concrete
