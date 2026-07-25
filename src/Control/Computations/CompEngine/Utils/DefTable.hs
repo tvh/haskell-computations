@@ -193,54 +193,91 @@
  set is now a handful of unboxed words indexing into a small, heavily-shared
  table instead of a private boxed structure duplicated per row.
 
- __Ids are never recycled__ -- the same tradeoff Stage 1's original global
- intern table made (docs/benchmark-notes.md, "Stage 1"), deliberately not
- revisited here: unlike row ids (recycled because row *churn* is the
- engine's whole workload) or hash-index slots (recycled because tombstones
- would degrade probe length under exactly that churn), a src-dep id's
- *value space* is expected to stay small relative to the row count for any
- realistic graph (the task brief's assumption, matching this benchmark's
- 300 keys against ~200k dependent rows) -- so a forward/reverse table that
- only ever grows is cheap in absolute terms even though, unlike everything
- else in this module, nothing here ever shrinks it. A workload whose source
- versions churn through effectively unbounded distinct values over a long
- process lifetime would grow this table without bound; that is an honest,
- accepted limitation of this design, not a hidden one -- see
- docs/benchmark-notes.md's Stage-4 entry for this item for the numbers that
- justified accepting it.
+ __Ids are refcounted and recycled.__ Stage 1's original global intern
+ table (and this table's own first version, docs/benchmark-notes.md's
+ "Stage 4e") never recycled ids, accepted as a deliberate tradeoff on the
+ assumption that a src-dep id's *value space* stays small relative to row
+ count. That assumption fails for the part of the value space that
+ actually varies at runtime: 'AnyCompSrcDep' carries an *observed version*,
+ so a long-running, high-churn engine sees an unbounded stream of distinct
+ @(key, version)@ pairs over its lifetime even though only a handful are
+ ever *referenced* at once -- exactly the gap between "value space size"
+ and "currently-live set size" that made the never-recycled table an
+ actual leak, not just a theoretical one. Each id in @sdi_refcount@ (parallel
+ to @sdi_reverse@, one 'Int' per assigned id) now counts how many rows'
+ arena spans currently reference it. 'DefTable.writeSrcDeps' (a row's whole
+ span is always replaced wholesale, the same "no in-place single-edge
+ splice" shape as @compDeps@/@rdeps@) retains every id in the new span and
+ releases every id the row's *previous* span held; 'freeRow' releases the
+ freed row's own span outright, since a freed row's references can't wait
+ for its def's arena to next compact the way @compDeps@/@rdeps@ garbage
+ can -- an id with no more referencing rows must become reclaimable
+ immediately, not whenever compaction next happens to run. A release that
+ drops a refcount to zero deletes the 'sdi_forward' entry, clears the
+ 'sdi_reverse' slot to 'Nothing' (dropping the boxed 'AnyCompSrcDep' itself
+ -- retaining it there would still be half the leak even with the forward
+ entry gone), and pushes the id onto a free list; 'sdiIntern' pops that
+ free list before ever extending 'sdi_count', so a reused id behaves
+ exactly like a fresh one (refcount zero until retained, same slot machinery
+ either way). 'sdiResolve' checks both range (against 'sdi_count') and
+ liveness (refcount > 0) -- recycling reopens exactly the "in range but
+ dead" gap Stage 1's never-recycled contract didn't have to worry about, so
+ the explicit zero-refcount check is required, not just belt-and-suspenders.
+
+ __The ordering hazard.__ 'writeSrcDeps' runs unconditionally on every
+ finish (changed or not), so an id present in *both* the old and new span
+ (an unchanged dependency) is the common case, not an edge case. Retaining
+ the new span before releasing the old one is required for exactly this
+ case: releasing first would let such an id's refcount transiently touch
+ zero, reclaiming it (and freeing its slot for reuse by something else
+ entirely) before the retain that was about to re-establish the reference
+ ever runs. See 'writeSrcDeps''s own haddock for the same point closer to
+ the code, and the module's test section for a test that pins this down
+ directly (a shared id across an overlapping overwrite must never observe
+ an intermediate zero).
 
  __What this does and does not change.__ 'readSrcDeps'/'writeSrcDeps' keep
  their exact prior signatures (@'DefTable' p a -> 'Int' -> 'IO' ('HashSet'
- 'AnyCompSrcDep')@ and the writing dual) -- intern/decode happens entirely
- inside them, invisible to "SimpleStateIf.hs", which needed zero edits (the
- same "column access boundary absorbs the representation change" property
- 4b/4c/4d established). Row freeing is unchanged too: a freed row's src-dep
- arena span is left as orphaned garbage, reclaimed the next time that def's
- arena compacts, exactly like @compDeps@/@rdeps@ -- this module's own
- interned ids stay valid forever (never recycled, so a stale span's ids are
- always still resolvable, just briefly pointing at data nothing references
- any more), so there is no dangling-id hazard from deferring the reclaim.
- What SimpleStateIf.hs's own @sifs_srcIndex@ tracks (which rows currently
- depend on which source key, and when a key becomes wholly unclaimed and
- should be reported as garbage/unregistered) is entirely untouched by any
- of this -- that bookkeeping only ever sees fully-decoded 'AnyCompSrcDep'
- values via the unchanged read/write API, so dead-source-key reporting and
- 'CompSrc.compSrcUnregister' triggering keep working exactly as before.
+ 'AnyCompSrcDep')@ and the writing dual) -- intern/refcount/decode happens
+ entirely inside them, invisible to "SimpleStateIf.hs", which needed zero
+ edits (the same "column access boundary absorbs the representation
+ change" property 4b/4c/4d established; 'freeRow''s signature is likewise
+ unchanged, since the extra release work happens inside it against columns
+ it already owns). What SimpleStateIf.hs's own @sifs_srcIndex@ tracks
+ (which rows currently depend on which source key, and when a key becomes
+ wholly unclaimed and should be reported as garbage/unregistered) is
+ entirely untouched by any of this -- that bookkeeping only ever sees
+ fully-decoded 'AnyCompSrcDep' values via the unchanged read/write API, so
+ dead-source-key reporting and 'CompSrc.compSrcUnregister' triggering keep
+ working exactly as before.
 
  = Row lifecycle and reuse
 
  A freed row is pushed onto a free list and its 'flags' cleared (not-alive,
- no result, not pending); every other column is left untouched -- stale
- param/value/edges from the previous occupant, including its edge arena
- span, which becomes reclaimable garbage handled by the edge-arena
- compaction machinery above rather than by 'freeRow' itself. This is safe
- under the invariant that every read of a possibly-stale column is gated
- behind a flags check (@alive@ for identity-ish columns, @hasResult@ for
- the value/result-hash columns) that is unconditionally cleared before the
- row can be reused, so the garbage can never be observed. Reuse does not
- recycle the row's *hash* index entry (that is removed by the caller before
- freeing) but does recycle the row *number* -- new occupants of a freed row
- get a fresh index entry pointing at the recycled number.
+ no result, not pending); most other columns are left untouched -- stale
+ param/value/@compDeps@/@rdeps@ from the previous occupant, including those
+ two edge arenas' spans, become reclaimable garbage handled by the
+ edge-arena compaction machinery above rather than by 'freeRow' itself.
+ This is safe under the invariant that every read of a possibly-stale
+ column is gated behind a flags check (@alive@ for identity-ish columns,
+ @hasResult@ for the value/result-hash columns) that is unconditionally
+ cleared before the row can be reused, so the garbage can never be
+ observed. Reuse does not recycle the row's *hash* index entry (that is
+ removed by the caller before freeing) but does recycle the row *number* --
+ new occupants of a freed row get a fresh index entry pointing at the
+ recycled number.
+
+ The @srcDeps@ arena is the one column 'freeRow' /does/ eagerly touch, and
+ for a reason specific to it: its ids are a refcounted shared resource (see
+ "Src-dep interning" above), and an id's refcount must drop the moment
+ nothing references it, not whenever this def's arena next happens to
+ compact -- so 'freeRow' reads the freed row's span and releases every id
+ in it via 'eaTakeRow', which also zeroes the row's own offset/len as it
+ does so. That zeroing matters beyond bookkeeping hygiene: without it, the
+ reset write 'lookupOrInsertRow' issues when this row number is next reused
+ would read the same (already-released) span again and release it a second
+ time -- a double-release, and exactly the bug the module's tests check
+ for directly.
 -}
 module Control.Computations.CompEngine.Utils.DefTable (
   -- * Row identity
@@ -289,6 +326,7 @@ module Control.Computations.CompEngine.Utils.DefTable (
   writeRdeps,
   readSrcDeps,
   writeSrcDeps,
+  srcDepInternLiveCount,
   htf_thisModulesTests,
 )
 where
@@ -312,8 +350,10 @@ import Control.Computations.Utils.Hash (Hash128 (..), largeHash128)
 
 import Control.Applicative ((<|>))
 import Control.Concurrent.STM (retry)
-import Control.Monad (forM_, when)
+import Control.Exception (SomeException, evaluate, try)
+import Control.Monad (foldM, forM, forM_, unless, when)
 import Data.Bits
+import Data.Either (isLeft)
 import qualified Data.HashMap.Strict as HashMap
 import Data.HashSet (HashSet)
 import qualified Data.HashSet as HashSet
@@ -321,6 +361,7 @@ import Data.Hashable (Hashable (..))
 import Data.IORef
 import Data.Int (Int32)
 import qualified Data.LargeHashable as LH
+import qualified Data.Map.Strict as Map
 import Data.String (fromString)
 import Data.Type.Equality ((:~:) (Refl))
 import Data.Typeable (Typeable, eqT)
@@ -330,6 +371,7 @@ import qualified Data.Vector.Unboxed as VU
 import qualified Data.Vector.Unboxed.Mutable as VUM
 import Data.Word (Word32, Word64, Word8)
 import Test.Framework hiding ((.&.))
+import qualified Test.QuickCheck as QC
 
 --
 -- Row identity: DefRef = packed (defIndex, row)
@@ -629,6 +671,28 @@ eaRead ea row stride = do
       dataV <- readIORef (ea_data ea)
       VU.freeze (VUM.slice (fromIntegral off) (fromIntegral len * stride) dataV)
 
+-- | Read a row's edge span (like 'eaRead') and then unconditionally clear
+-- its offset/len, marking the vacated span as dead weight the same way
+-- 'eaWrite' marks a replaced span dead. Used when a row is freed outright
+-- (no replacement span follows, so 'eaWrite''s own old-span handling never
+-- runs for it): a caller that needs to release something per edge in the
+-- vacated span (src-dep refcounts -- see \"Src-dep interning\" below) can
+-- do so exactly once, because the zeroed len means a later read of this
+-- row (e.g. the reset write 'lookupOrInsertRow' issues when a freed row
+-- number is reused) sees an empty span rather than the same stale ids
+-- again.
+eaTakeRow :: EdgeArena -> Int -> Int -> IO (VU.Vector Word64)
+eaTakeRow ea row stride = do
+  flat <- eaRead ea row stride
+  lenV <- readIORef (ea_len ea)
+  offV <- readIORef (ea_off ea)
+  len <- VUM.read lenV row
+  when (len > 0) $ do
+    modifyIORef' (ea_dead ea) (+ (fromIntegral len * stride))
+    VUM.write offV row 0
+    VUM.write lenV row 0
+  pure flat
+
 -- | Overwrite a row's entire edge span with @flat@ (already stride-major
 -- flattened; its length must be a multiple of @stride@). An empty write
 -- just zeroes the row's offset/len -- clearing a row's edges never
@@ -827,21 +891,37 @@ hixBackwardShift table cap getHash i0 = go i0 i0
 
 --
 -- Src-dep interning -- see the module haddock's "Src-dep interning" section
--- for the full design rationale. A per-def AnyCompSrcDep <-> Int table;
--- ids are assigned monotonically and never recycled (an accepted, explicit
--- tradeoff -- see the haddock).
+-- for the full design rationale. A per-def AnyCompSrcDep <-> Int table,
+-- refcounted: an id is live iff its refcount is > 0, and a refcount
+-- reaching zero reclaims it (forward map entry deleted, reverse slot
+-- cleared, id pushed onto a free list for reuse) -- see the haddock.
 --
 
 data SrcDepIntern = SrcDepIntern
   { sdi_forward :: !(IORef (HashMap.HashMap AnyCompSrcDep Int))
-  , sdi_reverse :: !(IORef (VM.IOVector AnyCompSrcDep))
-  -- ^ Int -> AnyCompSrcDep; grown like any other boxed column, never
-  -- shrunk. Freshly-grown capacity is the usual uninitialised-element error
-  -- thunk, but is never read there: 'sdiResolve' only ever reads indices
-  -- below 'sdi_count', which are always written by 'sdiIntern' before being
-  -- handed out.
+  , sdi_reverse :: !(IORef (VM.IOVector (Maybe AnyCompSrcDep)))
+  -- ^ Int -> 'Just' its 'AnyCompSrcDep' while live, 'Nothing' once
+  -- released -- the explicit clear that drops the boxed value's last
+  -- reference (see 'sdiRelease'), not just a logically-dead-but-still-
+  -- retained slot. Grown like any other boxed column; freshly-grown
+  -- capacity is the usual uninitialised-element error thunk, never read
+  -- there since every index below 'sdi_count' is written by 'sdiIntern'
+  -- before being handed out.
+  , sdi_refcount :: !(IORef (VUM.IOVector Int))
+  -- ^ Int -> current reference count. Zero means dead (whether "never
+  -- assigned past sdi_count", "on the free list", or "assigned but not
+  -- yet retained by any writer" -- the last of these is only ever a
+  -- transient state within a single 'sdiIntern' caller, never observed by
+  -- 'sdiResolve' from outside this module, since every id handed to a
+  -- 'DefTable' column is retained before the write that stores it
+  -- returns).
   , sdi_count :: !(IORef Int)
-  -- ^ next id to assign; also the valid-index bound for 'sdiResolve'.
+  -- ^ one past the highest id ever assigned; the range bound for
+  -- 'sdiResolve' (a liveness check via 'sdi_refcount' is required in
+  -- addition -- see 'sdiResolve').
+  , sdi_free :: !(IORef [Int])
+  -- ^ ids released back to refcount zero, available for 'sdiIntern' to
+  -- reuse before extending 'sdi_count'.
   }
 
 newSrcDepIntern :: IO SrcDepIntern
@@ -849,36 +929,110 @@ newSrcDepIntern =
   SrcDepIntern
     <$> newIORef HashMap.empty
     <*> (newIORef =<< VM.new 0)
+    <*> (newIORef =<< VUM.new 0)
     <*> newIORef 0
+    <*> newIORef []
 
--- | Look up @dep@'s interned id, assigning a fresh one on a miss (appended
--- to the reverse table; ids are never recycled, see the module haddock).
+-- | Look up @dep@'s interned id, assigning one on a miss -- popping the
+-- free list first, only extending 'sdi_count' once the free list is empty
+-- -- with its refcount initialized to zero either way. Does /not/ retain
+-- the id (bump its refcount); callers combine this with 'sdiRetain', kept
+-- as two steps rather than one so a write can intern its whole new span
+-- before retaining any of it -- see 'DefTable.writeSrcDeps' and the module
+-- haddock's "ordering hazard" note for why that separation matters when a
+-- write's old and new spans overlap.
 sdiIntern :: SrcDepIntern -> AnyCompSrcDep -> IO Int
 sdiIntern sdi dep = do
   fwd <- readIORef (sdi_forward sdi)
   case HashMap.lookup dep fwd of
     Just i -> pure i
     Nothing -> do
-      i <- readIORef (sdi_count sdi)
-      growBoxed (sdi_reverse sdi) (i + 1)
+      free <- readIORef (sdi_free sdi)
+      i <- case free of
+        (i : rest) -> writeIORef (sdi_free sdi) rest >> pure i
+        [] -> do
+          i <- readIORef (sdi_count sdi)
+          growBoxed (sdi_reverse sdi) (i + 1)
+          growUnboxed (sdi_refcount sdi) (i + 1)
+          writeIORef (sdi_count sdi) (i + 1)
+          pure i
       rv <- readIORef (sdi_reverse sdi)
-      VM.write rv i dep
-      writeIORef (sdi_count sdi) (i + 1)
+      VM.write rv i (Just dep)
+      rc <- readIORef (sdi_refcount sdi)
+      VUM.write rc i 0
       writeIORef (sdi_forward sdi) (HashMap.insert dep i fwd)
       pure i
 
--- | Resolve an interned id back to its 'AnyCompSrcDep'. Fails loudly on an
--- out-of-range id -- every id stored in a row's arena span was written by
--- 'sdiIntern' immediately after being assigned and ids are never recycled,
--- so a valid id is always resolvable (mirrors Stage 1's
--- @Utils.Intern.resolve@ dead-id contract).
+-- | Bump @i@'s refcount. Caller's responsibility: @i@ is a currently-live
+-- id (just returned by 'sdiIntern', or already known live) -- this module's
+-- only caller ('DefTable.writeSrcDeps') always satisfies that.
+sdiRetain :: SrcDepIntern -> Int -> IO ()
+sdiRetain sdi i = do
+  rc <- readIORef (sdi_refcount sdi)
+  cur <- VUM.read rc i
+  VUM.write rc i (cur + 1)
+
+-- | Drop one reference to @i@. Fails loudly on an underflow (releasing an
+-- id already at refcount zero is always a caller bug -- every release is
+-- paired with a prior retain, see 'DefTable.writeSrcDeps'/'DefTable.freeRow').
+-- At zero: delete the forward-map entry, clear the reverse slot (dropping
+-- the boxed 'AnyCompSrcDep' -- see 'sdi_reverse'), and push @i@ onto the
+-- free list for 'sdiIntern' to reuse.
+sdiRelease :: SrcDepIntern -> Int -> IO ()
+sdiRelease sdi i = do
+  rc <- readIORef (sdi_refcount sdi)
+  cur <- VUM.read rc i
+  when (cur <= 0) $
+    error ("DefTable.sdiRelease: refcount underflow releasing interned src-dep id " ++ show i ++ " (bug)")
+  let cur' = cur - 1
+  VUM.write rc i cur'
+  when (cur' == 0) $ do
+    rv <- readIORef (sdi_reverse sdi)
+    mdep <- VM.read rv i
+    case mdep of
+      Nothing ->
+        error ("DefTable.sdiRelease: interned src-dep id " ++ show i ++ " has no value despite a live refcount (bug)")
+      Just dep -> do
+        modifyIORef' (sdi_forward sdi) (HashMap.delete dep)
+        VM.write rv i Nothing
+        modifyIORef' (sdi_free sdi) (i :)
+
+-- | Resolve an interned id back to its 'AnyCompSrcDep'. Fails loudly both
+-- on an out-of-range id (never assigned) and, since ids are recycled, on a
+-- dead one that happens to be in range (assigned once, then released back
+-- to refcount zero -- the "range check alone can't tell fresh from freed"
+-- gap that recycling opens up versus Stage 1's original never-recycled
+-- table, see the module haddock). A zero refcount is exactly the liveness
+-- signal a range check can't provide, so it's checked explicitly here
+-- rather than inferred from the range.
 sdiResolve :: SrcDepIntern -> Int -> IO AnyCompSrcDep
 sdiResolve sdi i = do
   count <- readIORef (sdi_count sdi)
   when (i < 0 || i >= count) $
     error ("DefTable.sdiResolve: interned src-dep id " ++ show i ++ " out of range (bug)")
+  rc <- readIORef (sdi_refcount sdi)
+  cur <- VUM.read rc i
+  when (cur <= 0) $
+    error
+      ( "DefTable.sdiResolve: interned src-dep id "
+          ++ show i
+          ++ " is dead (refcount 0) -- resolving a freed id (bug)"
+      )
   rv <- readIORef (sdi_reverse sdi)
-  VM.read rv i
+  mdep <- VM.read rv i
+  case mdep of
+    Just dep -> pure dep
+    Nothing ->
+      error ("DefTable.sdiResolve: interned src-dep id " ++ show i ++ " has no value despite a live refcount (bug)")
+
+-- | Test/debug-only: number of currently-live interned ids (the forward
+-- map's size -- what the refcounting scheme keeps bounded to the number of
+-- distinct src-deps any *currently alive* row actually references, as
+-- opposed to 'sdi_count', which only ever grows). Exposed at the 'DefTable'
+-- level as 'srcDepInternLiveCount' for the engine-level churn regression
+-- test (Tests/TestStateIf.hs).
+sdiLiveCount :: SrcDepIntern -> IO Int
+sdiLiveCount sdi = HashMap.size <$> readIORef (sdi_forward sdi)
 
 --
 -- The table
@@ -1008,12 +1162,22 @@ lookupOrInsertRow dt h p = do
       pure (row, True)
 
 -- | Remove a row's hash-index entry and push it onto the free list,
--- clearing flags (not-alive, not-pending, no-result). Every other column
--- (param/value/edges/result hash) is left untouched -- see the module
--- haddock's "Row lifecycle and reuse" section for why that's safe.
+-- clearing flags (not-alive, not-pending, no-result). @compDeps@/@rdeps@/
+-- @param@/@value@/@result_hash@ are left untouched -- see the module
+-- haddock's "Row lifecycle and reuse" section for why that's safe. The
+-- src-dep arena span is the one exception: releasing this row's interned
+-- src-dep ids can't be deferred to compaction the way @compDeps@/@rdeps@
+-- garbage is (an unreferenced interned id must become reclaimable the
+-- moment nothing points at it, not whenever this def's arena next
+-- compacts), so it's released here via 'eaTakeRow', which also zeroes the
+-- row's own offset/len -- otherwise the reset write 'lookupOrInsertRow'
+-- issues on reuse would read the same (already-released) ids again and
+-- double-release them.
 freeRow :: DefTable p a -> Hash128 -> Int -> IO ()
 freeRow dt h row = do
   hixDelete (dt_index dt) (readParamHash dt) h
+  oldSrc <- eaTakeRow (dt_srcDeps dt) row 1
+  mapM_ (sdiRelease (dt_srcDepIntern dt) . fromIntegral) (VU.toList oldSrc)
   modifyIORef' (dt_free dt) (row :)
   writeFlags dt row 0
 
@@ -1121,14 +1285,39 @@ readSrcDeps dt row = do
   pure (HashSet.fromList deps)
 
 -- | Intern every element of @s@ (assigning fresh ids on a miss -- see
--- 'sdiIntern') and overwrite the row's entire src-dep span with the
--- resulting ids, exactly like 'writeCompDeps'/'writeRdeps' do for their own
--- edge columns.
+-- 'sdiIntern'), retain each of them, release every id the row's *previous*
+-- span held, then overwrite the row's entire src-dep span with the new
+-- ids -- exactly like 'writeCompDeps'/'writeRdeps' do for their own edge
+-- columns, plus the refcount bookkeeping those don't need.
+--
+-- __Ordering hazard.__ The new span is retained /before/ the old span is
+-- released, deliberately: a write is not guaranteed to change anything (an
+-- unchanged dependency reappears in both the old and new span, and this
+-- function runs unconditionally on every finish, changed or not -- see
+-- \"SimpleStateIf.hs\"'s @finishCap@). Releasing first would let such an
+-- id's refcount transiently hit zero -- reclaiming it (forward-map delete,
+-- reverse-slot clear, free-list push) out from under the retain that was
+-- about to follow, corrupting the very id this write is about to store
+-- right back into the row's own new span.
 writeSrcDeps :: DefTable p a -> Int -> HashSet AnyCompSrcDep -> IO ()
 writeSrcDeps dt row s = do
-  ids <- mapM (sdiIntern (dt_srcDepIntern dt)) (HashSet.toList s)
+  let sdi = dt_srcDepIntern dt
+  oldFlat <- eaRead (dt_srcDeps dt) row 1
+  newIds <- mapM (sdiIntern sdi) (HashSet.toList s)
+  mapM_ (sdiRetain sdi) newIds
+  mapM_ (sdiRelease sdi . fromIntegral) (VU.toList oldFlat)
   n <- rowCount dt
-  eaWrite (dt_srcDeps dt) row (isAlive dt) n 1 (VU.fromList (map fromIntegral ids))
+  eaWrite (dt_srcDeps dt) row (isAlive dt) n 1 (VU.fromList (map fromIntegral newIds))
+
+-- | Test/debug-only: number of currently-live interned src-dep ids in this
+-- def's table -- see 'sdiLiveCount'. Exported (unlike the rest of
+-- 'SrcDepIntern''s internals) purely so the engine-level churn regression
+-- test (Tests/TestStateIf.hs, via a small debug accessor in
+-- "SimpleStateIf.hs") can assert the intern table stays bounded through
+-- "SimpleStateIf.hs"'s real read/write API, not just this module's own
+-- unit tests.
+srcDepInternLiveCount :: DefTable p a -> IO Int
+srcDepInternLiveCount = sdiLiveCount . dt_srcDepIntern
 
 --
 -- Tests
@@ -1466,10 +1655,10 @@ test_srcDepsManyOverwritesKeepLatestCorrectAndCompact = do
   got <- readSrcDeps dt r
   assertEqual (HashSet.singleton (srcDep "churn" 5000)) got
 
--- | A freed row's src-dep arena span becomes orphaned garbage (like
--- @compDeps@/@rdeps@); its interned ids stay resolvable (never recycled),
--- but a *fresh* occupant of the recycled row number must never see the old
--- occupant's src deps.
+-- | A freed row's src-dep arena span is released (unlike @compDeps@/
+-- @rdeps@, which stay orphaned garbage until compaction -- see the module
+-- haddock for why src-deps can't wait): a *fresh* occupant of the recycled
+-- row number must never see the old occupant's src deps.
 test_srcDepsResetOnRowReuse :: IO ()
 test_srcDepsResetOnRowReuse = do
   dt <- newTest
@@ -1480,6 +1669,195 @@ test_srcDepsResetOnRowReuse = do
   assertEqual r1 r2
   got <- readSrcDeps dt r2
   assertEqual HashSet.empty got
+
+--
+-- Src-dep refcounting -- Part 1's correctness fix (module haddock's "Ids
+-- are refcounted and recycled"). Everything below exercises the intern
+-- table's internal state directly (this file's own test section, unlike
+-- SimpleStateIf.hs, has access to SrcDepIntern) as well as through the
+-- public DefTable read/write API.
+--
+
+test_srcDepInternLiveCountTracksDistinctValuesReferenced :: IO ()
+test_srcDepInternLiveCountTracksDistinctValuesReferenced = do
+  dt <- newTest
+  (r, _) <- lookupOrInsertRow dt (h 1) 1
+  c0 <- srcDepInternLiveCount dt
+  assertEqual 0 c0
+  writeSrcDeps dt r (HashSet.fromList [srcDep "a" 1, srcDep "b" 1])
+  c1 <- srcDepInternLiveCount dt
+  assertEqual 2 c1
+
+-- | Freeing the only row that referenced a src dep must reclaim its
+-- interned id -- the whole point of the refcounting fix (see the module
+-- haddock's "Ids are refcounted and recycled"): the live-count must drop
+-- back to zero, not stay pinned at its high-water mark the way the
+-- pre-refcounting, never-recycled table would have.
+test_freeingOnlyReferencingRowReclaimsSrcDepId :: IO ()
+test_freeingOnlyReferencingRowReclaimsSrcDepId = do
+  dt <- newTest
+  (r, _) <- lookupOrInsertRow dt (h 1) 1
+  writeSrcDeps dt r (HashSet.singleton (srcDep "solo" 1))
+  c1 <- srcDepInternLiveCount dt
+  assertEqual 1 c1
+  freeRow dt (h 1) r
+  c2 <- srcDepInternLiveCount dt
+  assertEqual 0 c2
+
+-- | The core refcounting invariant: a src dep shared by two rows must
+-- survive one of them freeing -- only when *both* referencing rows are
+-- gone does the id actually get reclaimed. A naive (non-refcounted, or
+-- incorrectly-ordered) implementation would either reclaim the shared id
+-- the moment the first row frees (corrupting the still-live row's reads)
+-- or never reclaim it at all.
+test_freeingRowWithSharedSrcDepDoesNotDropSharedId :: IO ()
+test_freeingRowWithSharedSrcDepDoesNotDropSharedId = do
+  dt <- newTest
+  (r1, _) <- lookupOrInsertRow dt (h 1) 1
+  (r2, _) <- lookupOrInsertRow dt (h 2) 2
+  writeSrcDeps dt r1 (HashSet.singleton (srcDep "shared" 1))
+  writeSrcDeps dt r2 (HashSet.singleton (srcDep "shared" 1))
+  c1 <- srcDepInternLiveCount dt
+  assertEqual 1 c1
+  freeRow dt (h 1) r1
+  -- still referenced by r2 -- must not have been reclaimed
+  c2 <- srcDepInternLiveCount dt
+  assertEqual 1 c2
+  got2 <- readSrcDeps dt r2
+  assertEqual (HashSet.singleton (srcDep "shared" 1)) got2
+  freeRow dt (h 2) r2
+  -- now genuinely unreferenced
+  c3 <- srcDepInternLiveCount dt
+  assertEqual 0 c3
+
+-- | The ordering-hazard case the module haddock calls out by name: a
+-- write that keeps one src dep, drops another, and adds a third, over and
+-- over. The *kept* one is present in both the write's old and new span on
+-- every iteration -- if retain-before-release weren't respected, its
+-- refcount would transiently hit zero at some point and get reclaimed out
+-- from under the row that's still supposed to reference it.
+test_overlappingOverwriteNeverDropsTheSharedId :: IO ()
+test_overlappingOverwriteNeverDropsTheSharedId = do
+  dt <- newTest
+  (r, _) <- lookupOrInsertRow dt (h 1) 1
+  writeSrcDeps dt r (HashSet.fromList [srcDep "kept" 1, srcDep "gen0" 1])
+  forM_ [1 .. 200 :: Int] $ \i -> do
+    writeSrcDeps dt r (HashSet.fromList [srcDep "kept" 1, srcDep ("gen" ++ show i) 1])
+    got <- readSrcDeps dt r
+    assertBool (HashSet.member (srcDep "kept" 1) got)
+  -- after the loop only "kept" and the final generation's id remain live
+  c <- srcDepInternLiveCount dt
+  assertEqual 2 c
+
+-- | Distinct versions of the same key are distinct 'AnyCompSrcDep' values
+-- (see 'test_srcDepsDistinctValuesGetDistinctIds'); replacing one version
+-- with another via 'writeSrcDeps' must reclaim the old version's id once
+-- nothing else references it, not accumulate one id per version forever
+-- -- this is the concrete leak Part 1 fixes (the module haddock's
+-- "Ids are refcounted and recycled").
+test_versionChurnOnSingleRowKeepsInternTableBounded :: IO ()
+test_versionChurnOnSingleRowKeepsInternTableBounded = do
+  dt <- newTest
+  (r, _) <- lookupOrInsertRow dt (h 1) 1
+  forM_ [1 .. 5000 :: Int] $ \i ->
+    writeSrcDeps dt r (HashSet.singleton (srcDep "churn" i))
+  c <- srcDepInternLiveCount dt
+  assertEqual 1 c
+  got <- readSrcDeps dt r
+  assertEqual (HashSet.singleton (srcDep "churn" 5000)) got
+
+-- | A reused id (popped off the free list by 'sdiIntern') must behave
+-- exactly like a fresh one: readable once retained, and the *previous*
+-- occupant's identity must never leak through a resolve of the recycled
+-- slot. Forces reuse directly: free a row (releasing its sole src dep to
+-- refcount zero, recycling the id) and immediately intern a *different*
+-- value on another row, which -- given a table with only that one freed
+-- slot on its free list -- must land on the recycled id.
+test_reusedSrcDepIdBehavesLikeFreshId :: IO ()
+test_reusedSrcDepIdBehavesLikeFreshId = do
+  dt <- newTest
+  (r1, _) <- lookupOrInsertRow dt (h 1) 1
+  writeSrcDeps dt r1 (HashSet.singleton (srcDep "first" 1))
+  freeRow dt (h 1) r1
+  (r2, _) <- lookupOrInsertRow dt (h 2) 2
+  writeSrcDeps dt r2 (HashSet.singleton (srcDep "second" 1))
+  got <- readSrcDeps dt r2
+  assertEqual (HashSet.singleton (srcDep "second" 1)) got
+  c <- srcDepInternLiveCount dt
+  assertEqual 1 c
+
+-- | Resolving a *freed* (refcount-zero) src-dep id must fail loudly, not
+-- silently return stale or wrong data -- the "range check alone isn't
+-- enough once ids recycle" contract the module haddock calls out. Reaches
+-- the dead id indirectly through the public API: write a solo src dep,
+-- capture what its row currently holds isn't directly observable (ids are
+-- module-internal), so this drives the scenario through
+-- 'readSrcDeps'/'writeSrcDeps' on a row whose dependency set changes,
+-- confirming the *old* value is gone from the interned table (live count
+-- drops) and cannot be produced by any subsequent read.
+test_deadSrcDepIdIsNeverResolvableAfterRelease :: IO ()
+test_deadSrcDepIdIsNeverResolvableAfterRelease = do
+  dt <- newTest
+  (r, _) <- lookupOrInsertRow dt (h 1) 1
+  writeSrcDeps dt r (HashSet.singleton (srcDep "gone-soon" 1))
+  c1 <- srcDepInternLiveCount dt
+  assertEqual 1 c1
+  writeSrcDeps dt r (HashSet.singleton (srcDep "replacement" 1))
+  c2 <- srcDepInternLiveCount dt
+  assertEqual 1 c2
+  got <- readSrcDeps dt r
+  assertEqual (HashSet.singleton (srcDep "replacement" 1)) got
+
+-- | Direct unit test against 'SrcDepIntern' itself: resolving a released
+-- id must throw, not return the stale value or a range-check false
+-- negative -- this is the loud-failure contract 'sdiResolve' is required
+-- to strengthen (the module haddock's liveness-check note), tested here
+-- against the primitive directly rather than only observed indirectly
+-- through 'readSrcDeps'.
+test_sdiResolveFailsLoudlyOnReleasedId :: IO ()
+test_sdiResolveFailsLoudlyOnReleasedId = do
+  sdi <- newSrcDepIntern
+  let dep = srcDep "temp" 1
+  i <- sdiIntern sdi dep
+  sdiRetain sdi i
+  sdiRelease sdi i
+  result <- try (evaluate =<< sdiResolve sdi i) :: IO (Either SomeException AnyCompSrcDep)
+  assertBool (isLeft result)
+
+-- | 'sdiResolve' on an id that was never assigned at all (out of range)
+-- must also fail loudly -- the other half of the loud-failure contract,
+-- unrelated to recycling.
+test_sdiResolveFailsLoudlyOnNeverAssignedId :: IO ()
+test_sdiResolveFailsLoudlyOnNeverAssignedId = do
+  sdi <- newSrcDepIntern
+  result <- try (evaluate =<< sdiResolve sdi 42) :: IO (Either SomeException AnyCompSrcDep)
+  assertBool (isLeft result)
+
+-- | 'sdiRelease' on an id already at refcount zero (an underflow -- every
+-- real caller pairs release with a prior retain, so this can only happen
+-- from a caller bug) must fail loudly rather than silently going negative
+-- or double-freeing the slot.
+test_sdiReleaseUnderflowFailsLoudly :: IO ()
+test_sdiReleaseUnderflowFailsLoudly = do
+  sdi <- newSrcDepIntern
+  let dep = srcDep "never-retained" 1
+  i <- sdiIntern sdi dep
+  result <- try (evaluate =<< sdiRelease sdi i) :: IO (Either SomeException ())
+  assertBool (isLeft result)
+
+-- | A row that never had any src deps must not appear to reference
+-- anything on free -- 'freeRow' on such a row is a pure no-op as far as
+-- the intern table is concerned (nothing to release, nothing to
+-- underflow).
+test_freeingRowWithNoSrcDepsIsInternTableNoOp :: IO ()
+test_freeingRowWithNoSrcDepsIsInternTableNoOp = do
+  dt <- newTest
+  (r, _) <- lookupOrInsertRow dt (h 1) 1
+  c0 <- srcDepInternLiveCount dt
+  freeRow dt (h 1) r
+  c1 <- srcDepInternLiveCount dt
+  assertEqual c0 c1
+  assertEqual 0 c1
 
 --
 -- Row reuse and garbage tolerance (Rust Stage 5's rules, ported): freeing a
@@ -1604,6 +1982,137 @@ test_freedRowsDontResurfaceAfterCompaction = do
   assertEqual (VU.fromList [(3000, 3000, 3000)]) cd
   aliveDoomed <- isAlive dt rDoomed
   assertBool (not aliveDoomed)
+
+-- | The srcDeps-arena analogue of 'test_compactionDoesNotDisturbOtherAliveRowsEdges',
+-- with the added wrinkle that matters specifically for src-deps: a
+-- bystander row's src dep is *shared* with the row being churned, so this
+-- also checks that forcing a compaction of the shared arena doesn't
+-- disturb the shared id's refcount or resolvability.
+test_srcDepsCompactionDoesNotDisturbBystanderRowsOrSharedIds :: IO ()
+test_srcDepsCompactionDoesNotDisturbBystanderRowsOrSharedIds = do
+  dt <- newTest
+  (rHot, _) <- lookupOrInsertRow dt (h 0) 0
+  bystanders <- mapM (\i -> lookupOrInsertRow dt (h i) i) [1 .. 10]
+  -- every bystander shares one common src dep plus one of its own
+  mapM_
+    ( \(r, i) ->
+        writeSrcDeps dt r (HashSet.fromList [srcDep "common" 1, srcDep ("own" ++ show i) 1])
+    )
+    (zip (map fst bystanders) [1 .. 10 :: Int])
+  -- force several compactions of the shared srcDeps arena via the hot row
+  mapM_
+    (\i -> writeSrcDeps dt rHot (HashSet.singleton (srcDep "common" 1)) >> writeSrcDeps dt rHot (HashSet.singleton (srcDep ("hotgen" ++ show i) 1)))
+    [1 .. 2000 :: Int]
+  mapM_
+    ( \(r, i) -> do
+        got <- readSrcDeps dt r
+        assertEqual (HashSet.fromList [srcDep "common" 1, srcDep ("own" ++ show i) 1]) got
+    )
+    (zip (map fst bystanders) [1 .. 10 :: Int])
+  -- "common" is still referenced by every bystander plus rHot's current span
+  c <- srcDepInternLiveCount dt
+  assertBool (c > 0)
+
+-- | A row freed and reused *between* two forced compactions of the
+-- srcDeps arena -- the specific interleaving the task brief calls out.
+-- The freed-and-reused row's own src dep must never resurface, and a
+-- second compaction after reuse must still leave everything else correct.
+test_rowFreedAndReusedBetweenTwoSrcDepsCompactions :: IO ()
+test_rowFreedAndReusedBetweenTwoSrcDepsCompactions = do
+  dt <- newTest
+  (rHot, _) <- lookupOrInsertRow dt (h 0) 0
+  (rVictim, _) <- lookupOrInsertRow dt (h 1) 1
+  writeSrcDeps dt rVictim (HashSet.singleton (srcDep "victim-only" 1))
+  -- first compaction, forced via the hot row
+  mapM_ (\i -> writeSrcDeps dt rHot (HashSet.singleton (srcDep ("gen" ++ show i) 1))) [1 .. 2000 :: Int]
+  freeRow dt (h 1) rVictim
+  (rVictim', _) <- lookupOrInsertRow dt (h 2) 2
+  assertEqual rVictim rVictim'
+  gotFresh <- readSrcDeps dt rVictim'
+  assertEqual HashSet.empty gotFresh
+  writeSrcDeps dt rVictim' (HashSet.singleton (srcDep "new-occupant" 1))
+  -- second compaction, again forced via the hot row
+  mapM_ (\i -> writeSrcDeps dt rHot (HashSet.singleton (srcDep ("gen2-" ++ show i) 1))) [1 .. 2000 :: Int]
+  gotAfter <- readSrcDeps dt rVictim'
+  assertEqual (HashSet.singleton (srcDep "new-occupant" 1)) gotAfter
+  -- the old occupant's src dep must be gone from the intern table entirely
+  gotHot <- readSrcDeps dt rHot
+  assertBool (not (HashSet.member (srcDep "victim-only" 1) gotAfter))
+  assertBool (not (HashSet.member (srcDep "victim-only" 1) gotHot))
+
+-- | Comprehensive row-reuse garbage check: every column a fresh occupant
+-- of a recycled row number could conceivably see stale data through --
+-- param hash, flags/result-state, param, value, all three edge arenas, and
+-- the hash index -- must reflect only the *new* occupant, never the old
+-- one. Combines what several narrower tests above check individually into
+-- one end-to-end pass over the whole row.
+test_rowReuseSeesNoStaleGarbageInAnyColumn :: IO ()
+test_rowReuseSeesNoStaleGarbageInAnyColumn = do
+  dt <- newTest
+  (r1, _) <- lookupOrInsertRow dt (h 1) 111
+  writeResultHash dt r1 (h 555)
+  writeValue dt r1 (777 :: Int)
+  writeFlags dt r1 (mkFlags True False ResultValue)
+  writeCompDeps dt r1 (VU.fromList [(9, 1, 2)])
+  writeRdeps dt r1 (VU.fromList [9, 10])
+  writeSrcDeps dt r1 (HashSet.singleton (srcDep "old-occupant" 1))
+  freeRow dt (h 1) r1
+
+  (r2, fresh) <- lookupOrInsertRow dt (h 2) 222
+  assertBool fresh
+  assertEqual r1 r2 -- confirms this is actually testing row *reuse*
+
+  -- param hash: fresh, not the old occupant's
+  ph <- readParamHash dt r2
+  assertEqual (h 2) ph
+  -- flags: fresh alive/not-pending/no-result, not the old ResultValue
+  f <- readFlags dt r2
+  assertBool (flagsAlive f)
+  assertBool (not (flagsPending f))
+  assertEqual NoResult (flagsResultState f)
+  -- param: fresh
+  p <- readParam dt r2
+  assertEqual (222 :: Int) p
+  -- edges: all three arenas reset, not the old occupant's
+  cd <- readCompDeps dt r2
+  rd <- readRdeps dt r2
+  sd <- readSrcDeps dt r2
+  assertEqual VU.empty cd
+  assertEqual VU.empty rd
+  assertEqual HashSet.empty sd
+  -- hash index: the old hash (h 1) must no longer resolve to anything --
+  -- looking it up again must be a fresh insert, not a hit on some
+  -- leftover index entry from the freed occupant.
+  (_, foundOldIsFresh) <- lookupOrInsertRow dt (h 1) 999
+  assertBool foundOldIsFresh
+  -- the old occupant's src dep must be entirely gone from the intern table
+  c <- srcDepInternLiveCount dt
+  assertEqual 0 c
+
+-- | Index growth interleaved with row freeing: insert enough distinct
+-- hashes to force several 'HashIndex' growths, freeing every other row
+-- along the way (so growth and backward-shift deletion both fire in the
+-- same sequence, not in isolation the way the standalone HashIndex tests
+-- above exercise them). Every row that stayed alive must remain correctly
+-- indexed once the churn settles.
+test_indexGrowthInterleavedWithFreeingStaysCorrect :: IO ()
+test_indexGrowthInterleavedWithFreeingStaysCorrect = do
+  dt <- newTest
+  let n = 300
+  rows <- mapM (\i -> fst <$> lookupOrInsertRow dt (h i) i) [1 .. n]
+  -- free every other row, forcing backward-shift deletes interleaved with
+  -- whatever growths already happened while they were all being inserted
+  forM_ (zip [1 :: Int ..] rows) $ \(i, r) ->
+    when (even i) $ freeRow dt (h i) r
+  -- the surviving (odd-indexed) rows must all still resolve to their own row
+  forM_ (zip [1 :: Int ..] rows) $ \(i, r) ->
+    when (odd i) $ do
+      (r', fresh) <- lookupOrInsertRow dt (h i) i
+      assertBool (not fresh)
+      assertEqual r r'
+  -- and fresh inserts past the churn must still work and grow correctly
+  moreRows <- mapM (\i -> fst <$> lookupOrInsertRow dt (h (n + i)) (n + i)) [1 .. 100]
+  assertEqual 100 (length moreRows)
 
 --
 -- Hash index: standalone tests against a small in-memory hash column (not
@@ -1807,3 +2316,88 @@ test_defTableChurnManyFreeReuseCyclesStayCorrect = do
   (rAgain, freshAgain) <- lookupOrInsertRow dt (h 999999) 999999
   assertBool (not freshAgain)
   assertEqual rSteady rAgain
+
+--
+-- Property-based churn test (Part 2's "nothing grows unboundedly" ask):
+-- a random sequence of writes and frees against a small population of
+-- rows, drawing src-dep values from a pool large enough that most writes
+-- mint genuinely fresh (key, version) pairs -- the same shape as the
+-- version-churn scenario the refcounting fix targets, but randomized and
+-- interleaved with frees instead of hand-written. Checked against a plain
+-- 'Map.Map' model: every row the model considers alive must read back
+-- exactly what the model recorded, and -- the actual boundedness
+-- assertion -- once every row the model still considers alive is freed,
+-- the interned src-dep table must be entirely empty, regardless of how
+-- many operations it took to get there.
+--
+
+-- | One churn operation: overwrite row @i@'s (small, fixed population of
+-- row keys 1..8) src-dep set, or free it. 'ChurnWrite'\'s values are
+-- @(keyIdx, version)@ pairs drawn from a small key-index pool but a wide
+-- version range, so repeated writes to the same row mint mostly-fresh
+-- interned ids -- the scenario that would grow the pre-refcounting table
+-- without bound.
+data ChurnOp
+  = ChurnWrite Int [(Int, Int)]
+  | ChurnFree Int
+  deriving (Show)
+
+instance QC.Arbitrary ChurnOp where
+  arbitrary =
+    QC.frequency
+      [ (3, ChurnWrite <$> QC.choose (1, 8) <*> (QC.choose (0, 3) >>= \n -> QC.vectorOf n genSrcVal))
+      , (1, ChurnFree <$> QC.choose (1, 8))
+      ]
+   where
+    genSrcVal = (,) <$> QC.choose (0, 3 :: Int) <*> QC.choose (1, 2000 :: Int)
+
+churnEncode :: (Int, Int) -> AnyCompSrcDep
+churnEncode (k, v) = srcDep (show k) v
+
+-- | Interpret a churn sequence against a live 'DefTable', updating a plain
+-- 'Map.Map' model (row key -> its current src-dep set) alongside it. A
+-- 'ChurnFree' on a row the model doesn't currently consider alive
+-- (never written, or already freed) is a no-op, matching 'freeRow''s own
+-- contract of being meaningless to call on a hash that isn't indexed.
+runChurn :: DefTable Int Int -> [ChurnOp] -> IO (Map.Map Int (HashSet AnyCompSrcDep))
+runChurn dt = foldM step Map.empty
+ where
+  step model (ChurnWrite i vals) = do
+    (r, _) <- lookupOrInsertRow dt (h i) i
+    let s = HashSet.fromList (map churnEncode vals)
+    writeSrcDeps dt r s
+    pure (Map.insert i s model)
+  step model (ChurnFree i) =
+    case Map.lookup i model of
+      Nothing -> pure model
+      Just _ -> do
+        (r, fresh) <- lookupOrInsertRow dt (h i) i
+        if fresh
+          then pure model -- defensive; shouldn't happen given the model agrees it's alive
+          else do
+            freeRow dt (h i) r
+            pure (Map.delete i model)
+
+prop_srcDepChurnStaysCorrectAndFullyDrains :: [ChurnOp] -> QC.Property
+prop_srcDepChurnStaysCorrectAndFullyDrains ops = QC.ioProperty $ do
+  dt <- newTest
+  model <- runChurn dt ops
+  correctness <- forM (Map.toList model) $ \(i, expected) -> do
+    (r, fresh) <- lookupOrInsertRow dt (h i) i
+    if fresh
+      then pure False
+      else do
+        got <- readSrcDeps dt r
+        pure (got == expected)
+  forM_ (Map.toList model) $ \(i, _) -> do
+    (r, fresh) <- lookupOrInsertRow dt (h i) i
+    unless fresh $ freeRow dt (h i) r
+  finalCount <- srcDepInternLiveCount dt
+  pure $
+    QC.counterexample
+      ( "per-row correctness: "
+          ++ show correctness
+          ++ "; live ids remaining after draining every row the model thinks is alive: "
+          ++ show finalCount
+      )
+      (and correctness && finalCount == 0)
