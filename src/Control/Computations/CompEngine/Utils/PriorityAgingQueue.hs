@@ -62,7 +62,7 @@ import qualified Data.Strict.Tuple as S
 import Data.LargeHashable
 import Data.Word (Word64)
 import GHC.Generics (Generic)
-import Test.Framework
+import Test.QuickCheck (Arbitrary (..), elements, frequency)
 import Prelude hiding (null)
 
 type PaqKey k = (Hashable k, Ord k)

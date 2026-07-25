@@ -101,8 +101,7 @@ library
       ViewPatterns
   ghc-options: -O2 -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-export-lists -Wmissing-home-modules -Wno-name-shadowing -Wpartial-fields -Wredundant-constraints -Wno-x-partial -Werror
   build-depends:
-      HTF
-    , QuickCheck
+      QuickCheck
     , aeson
     , async
     , base >=4.7 && <5

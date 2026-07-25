@@ -15,8 +15,6 @@ category:            Control
 description:         Please see the README on GitHub at <https://github.com/githubuser/incremental-computations>
 
 dependencies:
-  - HTF
-  - QuickCheck
   - aeson
   - async
   - base >= 4.7 && < 5
@@ -92,6 +90,19 @@ default-extensions:
 
 library:
   source-dirs: src
+  dependencies:
+    - QuickCheck
+    # ^ Not test-only: a handful of library types (TimeSpan, DataSize,
+    # MultiMap, PriorityAgingQueue and its satellite types) carry an
+    # `Arbitrary` instance defined alongside the type itself rather than in
+    # a test module. TimeSpan's is exercised by test/TimeSpanTest.hs's
+    # prop_timeSpanP; DataSize/MultiMap/PriorityAgingQueue's are not used by
+    # any test in this repo -- they look like downstream convenience
+    # instances (so a library consumer can `arbitrary` these types in their
+    # own QuickCheck properties without writing the instance themselves).
+    # Flagged rather than silently dropped -- see the packaging job's report
+    # for the full breakdown; keeping them makes QuickCheck a real,
+    # non-test dependency of the published library, which HTF is not.
 
 executables:
   incremental-computations-exe:
@@ -104,6 +115,7 @@ executables:
     - -with-rtsopts=-A64m
     dependencies:
     - HTF
+    - QuickCheck
     - binary
     - http-types
     - incremental-computations
@@ -119,6 +131,9 @@ tests:
     source-dirs:
     - test
     - src
+    dependencies:
+    - HTF
+    - QuickCheck
     ghc-options:
     - -threaded
     - -rtsopts

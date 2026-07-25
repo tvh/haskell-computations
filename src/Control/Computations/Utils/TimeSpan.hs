@@ -50,7 +50,7 @@ import qualified Data.Text as T
 import Data.Time.Clock
 import Data.Void (Void)
 import GHC.Generics (Generic)
-import Test.Framework
+import Test.QuickCheck (Arbitrary (..))
 import qualified Text.Megaparsec as P
 import qualified Text.Megaparsec.Char as P
 import qualified Text.Megaparsec.Char.Lexer as L

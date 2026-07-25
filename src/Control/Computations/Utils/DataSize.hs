@@ -29,7 +29,7 @@ import Data.Hashable (Hashable)
 import Data.LargeHashable
 import qualified Data.Text as T
 import Data.Word (Word64)
-import Test.Framework
+import Test.QuickCheck (Arbitrary (..))
 import Text.Printf
 
 newtype DataSize = DataSize

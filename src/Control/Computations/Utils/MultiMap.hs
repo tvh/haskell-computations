@@ -34,7 +34,7 @@ import Data.HashSet (HashSet)
 import qualified Data.HashSet as HashSet
 import Data.Hashable
 import qualified Data.List as L
-import Test.Framework
+import Test.QuickCheck (Arbitrary (..))
 import Prelude hiding (filter, lookup)
 
 newtype MultiMap k v = MultiMap (HashMap k (HashSet v))
