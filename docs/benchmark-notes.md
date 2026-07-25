@@ -674,6 +674,43 @@ API/semantics changes: `CompCacheMeta` → hash-only newtype;
 row ids are recycled (Stage 1 never recycled; the free-list + loud
 dead-resolve contract covers it).
 
+## Stage 4 — post-columnar optimization campaign (running log)
+
+Ranked items from the Stage-3 code read + library research, tried one at a
+time, benchmarked between, reverted if they don't improve. Ground rule for
+this campaign: **no new type constraints on the public interface**
+(opportunities that would need one get flagged, not implemented).
+
+### 4a — RTS flag sweep: `-A64m` becomes the default (commit `e3f500a`)
+
+Pure measurement, no engine code. Swept `--nonmoving-gc`, `-c`, `-F1.2/1.5`,
+`-n4m`, `-A16/32/64m` and combinations, triaged at 0.1 and confirmed at 1.0
+(2–4 runs each).
+
+**Winner: `-A64m`**, now baked into the executable's rtsopts alongside
+`-N2`. Scale 1.0: cold **9.69–10.21 → 7.93–8.08 s (~20%)**, live
+**11.90–12.01 → 10.87–11.14 s (~7–8%)**, every run, no overlap; RSS never
+worse than default's range. Tests 86/86.
+
+Rejected, with reasons: `-c` (compacting) costs +25–30% cold;
+`--nonmoving-gc` loses on both axes here **and reports a badly inflated
+`max_live_bytes` — 2059 MB vs the moving collector's 842–871 MB (~2.4×)**,
+almost certainly floating garbage under this workload's churn rather than
+a real live set (worth remembering before trusting that stat under a
+concurrent collector); `-n4m` no effect at `-N2` (needs many more
+capabilities to matter); `-F` variants no better.
+
+Gotcha found: Cabal's legacy `ghc-options` word-splits tokens, so
+`-with-rtsopts=-N2 -A64m` as one entry **silently drops everything after
+the space** — no build error, just a wrong runtime default. Two separate
+`-with-rtsopts=` entries concatenate correctly (verified via
+`+RTS --info`).
+
+Also noted: `-A64m`'s RSS-after-settle is noisy run to run (1056–1492 MB);
+the win is unambiguous on the time axis only. One `--nonmoving-gc` run
+showed RSS *dropping* 1594 → 767 MB mid-run (pages returned to the OS),
+observed once, not chased.
+
 ## Not tried yet / open items
 
 - **The Interlude-2 diet, measured.** The Rust notes list a ranked, concrete
