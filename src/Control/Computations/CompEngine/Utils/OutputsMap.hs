@@ -77,15 +77,19 @@ type OutputsReverseMap k =
 
 type OutputKeyHash = Int
 
--- | Both fields strict: this map is rebuilt (via 'insert'\/'delete'\/
--- 'insertWith') on essentially every cap finish in
--- "SimpleStateIf.hs" (@commitPendingOutputsForKey@\/@freeRowCascade@),
--- whose own write site is a bare 'Data.IORef.writeIORef' -- which gives
--- zero forcing on its own. Strict fields here mean forcing the *record* to
--- WHNF (which the write site now does explicitly, see 'colWrite''s haddock
--- in "Utils/DefTable.hs" for the general rationale) forces both maps'
--- top-level spines too, rather than leaving a chain of unevaluated
--- @insert@\/@delete@ thunks to build up across rows.
+-- | Both fields explicitly strict, though (see "Utils/PriorityAgingQueue.hs"
+-- for the same correction) this project's @-XStrictData@ default
+-- (package.yaml) already made them strict without the explicit @!@ -- kept
+-- as documentation\/robustness rather than because it changed observed
+-- behavior. This map is rebuilt (via 'insert'\/'delete'\/'insertWith') on
+-- essentially every cap finish in "SimpleStateIf.hs"
+-- (@commitPendingOutputsForKey@\/@freeRowCascade@), whose own write site is a
+-- bare 'Data.IORef.writeIORef' -- which gives zero forcing *of the IORef's
+-- new contents* regardless of the referenced value's own field strictness
+-- (see 'colWrite''s haddock in "Utils/DefTable.hs"); the write site now
+-- forces explicitly with @$!@, and it's that forcing -- not the field
+-- annotations here -- that stops a chain of unevaluated @insert@\/@delete@
+-- thunks from building up across rows.
 data OutputsMap k = OutputsMap
   { om_forward :: !(OutputsForwardMap k)
   , om_reverse :: !(OutputsReverseMap k)

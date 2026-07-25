@@ -620,9 +620,10 @@ enqueueRefs st refs = fmap (HashSet.fromList . catMaybes) $ forM (HashSet.toList
           -- 'Paq.enqueue' returns a plain lazy @(,)@ -- this @let@ binds
           -- @q'@ to an unforced thunk that a bare 'writeIORef' would not
           -- force either. Force explicitly (see 'colWrite''s haddock in
-          -- "Utils/DefTable.hs"); the queue's now-strict fields (see
-          -- 'PriorityAgingQueue.hs') mean WHNF here reaches the sub-queue
-          -- actually being mutated.
+          -- "Utils/DefTable.hs"); the queue's strict fields (this project
+          -- builds with @-XStrictData@ on by default -- see
+          -- "Utils/PriorityAgingQueue.hs") mean WHNF here reaches the
+          -- sub-queue actually being mutated, not just the outer record.
           let (how, q') = Paq.enqueue (mkPaqEntry (compId_priority (comp_name comp)) ref) q
           writeIORef (sifs_stale st) $! q'
           pure $ case how of

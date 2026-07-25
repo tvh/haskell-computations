@@ -106,21 +106,26 @@ data PaqView k v = PaqView
 
 type PaqQueue k v = PSQ.HashPSQ k PaqPrioIndex v
 
--- | Every field strict. This is 'SimpleStateIf.hs'\'s @sifs_stale@ -- the
--- engine's single hottest piece of state, rebuilt by 'enqueue'\/'dequeue'\/
--- 'deleteView' on every enqueue and every dequeue across both cold eval and
--- every live rerun -- and its own write site there is a bare
--- 'Data.IORef.writeIORef' of a lazily-pattern-matched tuple component
--- (@let (how, q') = ...@), which gives zero forcing on its own. Before this,
--- only 'paq_size' (added alongside its own fix, see the field's haddock) was
--- strict; the four sub-queues and the counter were plain lazy fields
--- inherited from this module's pre-Stage-0 origin, so record-update syntax
--- like @paq'{paq_realTimeQueue = PSQ.insert ...}@ built a *thunk* for the
--- touched field even though the surrounding constructor application looked
--- like ordinary strict-looking code. Strict fields mean the write site's own
--- explicit forcing (see 'colWrite''s haddock in "Utils/DefTable.hs" for the
--- general rationale) actually reaches the sub-queues instead of stopping at
--- the tuple/record boundary.
+-- | Every field explicitly strict. Correction to an earlier version of this
+-- comment: this project builds with @-XStrictData@ on by default
+-- (package.yaml's @default-extensions@), so every field here -- including
+-- the four sub-queues and the counter -- was /already/ forced to WHNF on
+-- construction even before the explicit @!@\/'paq_size''s own bang were
+-- added; there was no latent laziness bug in this record itself (confirmed
+-- empirically: this project's A/B benchmark for the strictness-audit change
+-- that added these explicit bangs showed no measurable movement). The
+-- explicit @!@ is kept anyway as a documentation/robustness belt-and-
+-- suspenders measure -- it makes the invariant survive a hypothetical future
+-- @NoStrictData@ pragma on this module rather than depending silently on a
+-- package-wide default a reader of this file alone wouldn't see. The one
+-- genuine gap this module's write side had was in 'SimpleStateIf.hs'\'s
+-- @sifs_stale@ write site: 'enqueue' (unlike 'dequeue'\/'deleteView', whose
+-- results are pattern-matched through the strict @:!:@ pair) returns a plain
+-- lazy tuple, and @let (how, q') = ...@ leaves @q'@ an unforced *selector
+-- thunk* regardless of how strict 'PriorityAgingQueue'\'s own fields are --
+-- that thunk was the real fix (see 'colWrite''s haddock in
+-- "Utils/DefTable.hs" for the general rationale, and @sifs_stale@'s own
+-- write site for this specific one).
 data PriorityAgingQueue k v = PriorityAgingQueue
   { paq_nextCounter :: {-# NOUNPACK #-} !PaqCounter
   -- Total entry count across all four sub-queues, maintained incrementally
