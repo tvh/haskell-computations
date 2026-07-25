@@ -30,6 +30,7 @@ module Control.Computations.Utils.TimeSpan (
   diffTimeSpan,
   plusTimeSpan,
   multiplyTimeSpan,
+  parseTimeSpan,
   htf_thisModulesTests,
 ) where
 
@@ -45,6 +46,7 @@ import Control.Computations.Utils.Types
 
 import Data.Hashable
 import Data.LargeHashable
+import qualified Data.Text as T
 import Data.Time.Clock
 import GHC.Generics (Generic)
 import Test.Framework
@@ -151,6 +153,14 @@ test_timeSpanP =
 prop_timeSpanP :: TimeSpan -> Bool
 prop_timeSpanP f =
   parseM timeSpanP "" (showText f) == Ok f
+
+-- | Parse a 'TimeSpan' from its textual form (e.g. @"3days3h"@), the
+-- megaparsec-free entry point for callers such as config-file parsing that
+-- shouldn't need to know this module is implemented with 'Parser'. On
+-- failure, the 'Fail' string is megaparsec's own parse-error message, which
+-- is far more informative than a generic "invalid input" string.
+parseTimeSpan :: T.Text -> Fail TimeSpan
+parseTimeSpan = parseM timeSpanP ""
 
 instance Read TimeSpan where
   readsPrec _ = parserToReadsPrec timeSpanP

@@ -20,7 +20,6 @@ import qualified Data.ByteString.Lazy as BSL
 import Data.LargeHashable
 import Data.Maybe
 import GHC.Generics (Generic)
-import Safe
 
 data Config = Config
   { c_recentTimeSpan :: TimeSpan
@@ -64,9 +63,9 @@ instance FromJSON Config where
       case ms of
         Nothing -> pure Nothing
         Just s ->
-          case readMay s of
-            Just ts -> pure $ Just (ts :: TimeSpan)
-            Nothing -> fail ("Invalid timespan: " ++ s)
+          case parseTimeSpan s of
+            Ok ts -> pure $ Just ts
+            Fail err -> fail ("Invalid timespan " ++ show s ++ ": " ++ err)
 
 parseConfig :: BS.ByteString -> Fail Config
 parseConfig bs =
