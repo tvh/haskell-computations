@@ -4,9 +4,12 @@
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE Rank2Types #-}
 {-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE UndecidableInstances #-}
 {-# OPTIONS_GHC -Wno-redundant-constraints #-}
 
 module Control.Computations.CompEngine.CompSrc (
+  IsDep (..),
+  IsDepConstraints,
   Dep (..),
   CompSrcDep,
   CompSrcDeps,
@@ -33,7 +36,6 @@ module Control.Computations.CompEngine.CompSrc (
 ---------------------------------------
 
 import Control.Computations.CompEngine.CompFlow
-import Control.Computations.CompEngine.Utils.DepMap (IsDep (..), IsDepConstraints)
 import Control.Computations.Utils.Types
 
 ----------------------------------------
@@ -48,6 +50,34 @@ import qualified Data.LargeHashable as LH
 import Data.String
 import qualified Data.Text as T
 import GHC.Generics (Generic)
+
+type IsDepConstraints a = (Show a, Eq a, Hashable a)
+
+{- | A dependency @a@ that can be split into a key (identifying what's
+ depended on) and a version (what state it was observed in).
+
+ Moved here from the former @CompEngine\/Utils\/DepMap.hs@ (now deleted),
+ which used to also define a @DepMap@ container -- a forward+reverse
+ dependency index, its reverse side bucketed by dependency version via a
+ since-deleted @VerList@ -- that the columnar rewrite replaced with per-def
+ "Control.Computations.CompEngine.Utils.DefTable" columns; see
+ "Control.Computations.CompEngine.SimpleStateIf"'s module haddock for that
+ history. Only the class survives, unrelated to the dead container: it's
+ load-bearing for this module's own 'Dep'\/'SomeCompSrcDep'\/'AnyCompSrcDep'
+ instances below and for "Control.Computations.CompEngine.Types"'s
+ 'CompDep'\/'CompEngDep' instances.
+-}
+class
+  ( IsDepConstraints a
+  , IsDepConstraints (DepKey a)
+  , IsDepConstraints (DepVer a)
+  ) =>
+  IsDep a
+  where
+  type DepKey a
+  type DepVer a
+  depKey :: a -> DepKey a
+  depVer :: a -> DepVer a
 
 data Dep a b = Dep
   { dep_key :: a

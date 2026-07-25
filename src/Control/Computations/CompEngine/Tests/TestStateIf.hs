@@ -18,7 +18,6 @@ import Control.Computations.CompEngine.CompSrc
 import Control.Computations.CompEngine.Core
 import Control.Computations.CompEngine.SimpleStateIf
 import Control.Computations.CompEngine.Types
-import Control.Computations.CompEngine.Utils.DepMap (IsDep (..))
 import Control.Computations.Utils.Fail
 
 ----------------------------------------

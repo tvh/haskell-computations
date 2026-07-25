@@ -90,7 +90,6 @@ module Control.Computations.CompEngine.Types (
 
 import Control.Computations.CompEngine.CompSink
 import Control.Computations.CompEngine.CompSrc
-import Control.Computations.CompEngine.Utils.DepMap (IsDep (..))
 import Control.Computations.CompEngine.Utils.PriorityAgingQueue (PaqPriority (..))
 import Control.Computations.Utils.Hash
 import Control.Computations.Utils.Logging

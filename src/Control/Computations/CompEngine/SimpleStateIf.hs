@@ -63,14 +63,17 @@
  = The other Stage-0/1 machinery this rewrite retires
 
  @SifCache@, the old global @Control.Computations.CompEngine.Utils.Intern@
- table, and @Control.Computations.CompEngine.Utils.DepMap@/@VerList@'s
- container operations are all unused now: interning is intrinsic to
- 'DT.lookupOrInsertRow' (per-def, keyed by param hash -- structurally the
- same per-definition index Rust's Stage 5 uses instead of one global
- table), and comp-dep edges are flat 'DT.DefTable' columns instead of a
- generic reverse-index map. (@DepMap.hs@'s 'IsDep' class stays -- it's load
- -bearing for "Types.hs"'s 'CompEngDep'/'CompDep' instances, unrelated to
- its now-dead container.) @sifs_vermap@ is gone -- a row's result hash
+ table, and the former @Control.Computations.CompEngine.Utils.DepMap@'s
+ @DepMap@/@VerList@ container operations are all unused now: interning is
+ intrinsic to 'DT.lookupOrInsertRow' (per-def, keyed by param hash --
+ structurally the same per-definition index Rust's Stage 5 uses instead of
+ one global table), and comp-dep edges are flat 'DT.DefTable' columns
+ instead of a generic reverse-index map. (@DepMap.hs@ itself is deleted;
+ its one surviving piece, the 'IsDep' class, moved into
+ "Control.Computations.CompEngine.CompSrc" -- still load-bearing for
+ "Types.hs"'s 'CompEngDep'/'CompDep' instances and this module's own
+ 'depKey'\/'depVer' calls, unrelated to the now-dead container.)
+ @sifs_vermap@ is gone -- a row's result hash
  (gated by its result-state flag) is the vermap entry now.
  @sifs_pendingCaps@ is gone -- \"currently mid-evaluation\" is a per-row
  flag bit instead of a separate 'Set'. The output containers
@@ -120,7 +123,6 @@ import Control.Computations.CompEngine.Utils.DefTable (
   ResultState (..),
  )
 import qualified Control.Computations.CompEngine.Utils.DefTable as DT
-import Control.Computations.CompEngine.Utils.DepMap (IsDep (..))
 import qualified Control.Computations.CompEngine.Utils.OutputsMap as OM
 import Control.Computations.CompEngine.Utils.PriorityAgingQueue (PaqPriority)
 import qualified Control.Computations.CompEngine.Utils.PriorityAgingQueue as Paq
