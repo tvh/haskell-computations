@@ -82,7 +82,6 @@ library
       Control.Computations.Utils.Parser
       Control.Computations.Utils.SourceLocation
       Control.Computations.Utils.SqliteUtils
-      Control.Computations.Utils.StrictList
       Control.Computations.Utils.TimeSpan
       Control.Computations.Utils.TimeUtils
       Control.Computations.Utils.Types

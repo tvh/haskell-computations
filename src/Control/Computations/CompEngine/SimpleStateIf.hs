@@ -127,7 +127,6 @@ import qualified Control.Computations.CompEngine.Utils.PriorityAgingQueue as Paq
 import qualified Control.Computations.CompEngine.Utils.SrcIndex as SI
 import Control.Computations.Utils.Hash (Hash128)
 import Control.Computations.Utils.Logging
-import qualified Control.Computations.Utils.StrictList as SL
 import Control.Computations.Utils.Types
 
 ----------------------------------------
@@ -155,6 +154,7 @@ import Data.Type.Equality ((:~:) (Refl))
 import Data.Typeable (Typeable, eqT)
 import qualified Data.Vector.Unboxed as VU
 import Data.Word (Word64)
+import qualified StrictList as SL
 
 --
 -- Existential per-definition entry: a Comp p a (needed to reconstruct an
@@ -504,7 +504,7 @@ commitPendingOutputsForKey st ref capAny = do
             case SL.filter (/= ref) revLookupResult of
               SL.Nil -> pure Nothing
               otherRefs -> do
-                otherCaps <- mapM (resolveRefToAny st) (SL.toList otherRefs)
+                otherCaps <- mapM (resolveRefToAny st) (F.toList otherRefs)
                 pure $
                   Just
                     ( "MULTIPLE_COMPAPS_ONE_OUTPUT: The output "

@@ -21,7 +21,6 @@ import Control.Computations.FlowImpls.SqliteSrc
 import Control.Computations.FlowImpls.TimeSrc
 import Control.Computations.Utils.Fail
 import Control.Computations.Utils.FileStore.Writer
-import qualified Control.Computations.Utils.StrictList as SL
 import Control.Computations.Utils.TimeSpan
 import Control.Computations.Utils.TimeUtils
 import Control.Computations.Utils.Types
@@ -45,6 +44,7 @@ import Data.Proxy
 import Data.Strict.Tuple (Pair (..), (:!:))
 import qualified Data.Text as T
 import Data.Time.Clock
+import GHC.Exts (fromList)
 
 type PatMap = HashMap PatId Pat
 type PatSet = HashSet Pat
@@ -188,7 +188,7 @@ overviewCompDef patMapC recentPatsC patC =
       recentPats <- evalCompOrFail recentPatsC ()
       sectAll <- renderSection "All patients" (HashMap.elems pm)
       sectRecent <- renderSection "Recent patients" (HashSet.toList recentPats)
-      let doc = MDoc "Overview" (SL.fromList [sectRecent, sectAll])
+      let doc = MDoc "Overview" (fromList [sectRecent, sectAll])
       void $ publishMDoc MDocIdRoot doc
  where
   sortPats :: [Pat] -> [Pat]
@@ -197,8 +197,8 @@ overviewCompDef patMapC recentPatsC patC =
   renderSection title pats =
     do
       links <- catMaybes <$> forM (sortPats pats) renderPat
-      let list = MList (SL.fromList links)
-      pure (MSection (Some title) (SL.singleton (MContentList list)))
+      let list = MList (fromList links)
+      pure (MSection (Some title) (fromList [MContentList list]))
   renderPat :: Pat -> CompM (Maybe MListItem)
   renderPat pat =
     do
@@ -243,29 +243,30 @@ detailsCompDef getPatC getPatNotesC =
       let formattedName = formatName (p_name pat)
           sectGeneral =
             MSection None $
-              SL.singleton $
-                MContentList $
-                  MList $
-                    SL.fromList
-                      [ textItem ("ID: " <> formatPatId (p_patId pat))
-                      , textItem ("Name: " <> formattedName)
-                      , textItem ("Date of birth: " <> formatDay (p_birthdate pat))
-                      , textItem ("Sex: " <> formatSex (p_sex pat))
-                      , textItem ("Admission: " <> formatUTCTimeNoSeconds (p_admissionDateTime pat))
-                      , textItem
-                          ( "Discharge: "
-                              <> fromOption "-" (fmap formatUTCTimeNoSeconds (p_dischargeDateTime pat))
-                          )
-                      , textItem ("Diagnosis: " <> p_primaryDiagnose pat)
-                      ]
+              fromList
+                [ MContentList $
+                    MList $
+                      fromList
+                        [ textItem ("ID: " <> formatPatId (p_patId pat))
+                        , textItem ("Name: " <> formattedName)
+                        , textItem ("Date of birth: " <> formatDay (p_birthdate pat))
+                        , textItem ("Sex: " <> formatSex (p_sex pat))
+                        , textItem ("Admission: " <> formatUTCTimeNoSeconds (p_admissionDateTime pat))
+                        , textItem
+                            ( "Discharge: "
+                                <> fromOption "-" (fmap formatUTCTimeNoSeconds (p_dischargeDateTime pat))
+                            )
+                        , textItem ("Diagnosis: " <> p_primaryDiagnose pat)
+                        ]
+                ]
           sectNotes = map formatNote (L.sortOn (Data.Ord.Down . pn_time) (HashSet.toList notes))
-          doc = MDoc ("Patient " <> formattedName) (SL.fromList (sectGeneral : sectNotes))
+          doc = MDoc ("Patient " <> formattedName) (fromList (sectGeneral : sectNotes))
       publishMDoc (MDocIdPat patId) doc
  where
   textItem t = MListItem None t
   formatNote note =
     let title = "Note " <> formatUTCTimeNoSeconds (pn_time note)
-     in MSection (Some title) $ SL.singleton $ MContentText $ pn_text note
+     in MSection (Some title) $ fromList [MContentText $ pn_text note]
 
 cfgFileSrcId :: TypedCompSrcId FileSrc
 cfgFileSrcId = typedCompSrcId (Proxy @FileSrc) "cfgFileSrc"

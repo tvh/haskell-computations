@@ -37,8 +37,6 @@ where
 
 import Control.Computations.CompEngine.CompFlow
 import Control.Computations.CompEngine.CompSink
-import Control.Computations.Utils.StrictList (SL)
-import qualified Control.Computations.Utils.StrictList as SL
 import Control.Computations.Utils.Types
 
 ----------------------------------------
@@ -59,6 +57,7 @@ import Data.Maybe
 import qualified Data.Text as T
 import Data.Typeable
 import GHC.Generics (Generic)
+import qualified StrictList as SL
 import Test.Framework
 import qualified Test.QuickCheck as QC
 import Prelude hiding (lookup)
@@ -72,7 +71,7 @@ import Prelude hiding (lookup)
 
 type OutputsForwardMap k = HashMap k AnyCompSinkOutsMap
 type OutputsReverseMap k =
-  IntMap (SL k)
+  IntMap (SL.List k)
   -- ^ the strict list must be in ascending order
 
 type OutputKeyHash = Int
@@ -112,7 +111,7 @@ lookupOutputKey
   :: (CompSink s, Hashable k)
   => (Proxy s, CompSinkId, CompSinkOut s)
   -> OutputsMap k
-  -> SL k
+  -> SL.List k
 lookupOutputKey outputIdent@(_proxy, _dataIfKey, outputKey) om =
   SL.filter (hasOutput outputIdent om) $
     fromMaybe mempty $
@@ -130,11 +129,30 @@ empty =
 mkSingletonReverseMap :: k -> AnyCompSinkOutsMap -> OutputsReverseMap k
 mkSingletonReverseMap key (AnyCompSinkOutsMap outsMap) =
   IntMap.fromList $
-    map (\hash -> (hash, SL.singleton key)) $
+    map (\hash -> (hash, SL.Cons key SL.Nil)) $
       Map.elems outsMap >>= hashAnyOutputs
 
 outputKeyHash :: CompSink s => Proxy s -> CompSinkOut s -> OutputKeyHash
 outputKeyHash _ = hash
+
+-- | Merges two ascending 'SL.List's into one ascending list, dropping
+-- neither side's duplicates. Used to combine the per-hash key lists in
+-- 'om_reverse', which the 'OutputsReverseMap' comment above requires to
+-- stay in ascending order (formerly "Utils/StrictList.hs"'s @merge@\/
+-- @mergeBy@, moved here as this is the only remaining call site).
+merge :: Ord a => SL.List a -> SL.List a -> SL.List a
+merge = mergeBy compare
+
+mergeBy :: (a -> a -> Ordering) -> SL.List a -> SL.List a -> SL.List a
+mergeBy cmp = go
+ where
+  go as@(SL.Cons a as') bs@(SL.Cons b bs') =
+    case cmp a b of
+      LT -> SL.Cons a (go as' bs)
+      GT -> SL.Cons b (go as bs')
+      EQ -> SL.Cons a (go as' bs')
+  go SL.Nil bs = bs
+  go as SL.Nil = as
 
 hashAnyOutputs :: AnyCompSinkOuts -> [OutputKeyHash]
 hashAnyOutputs (ForAnyCompFlow _ p outputsWithIdent) =
@@ -175,7 +193,7 @@ fromForwardMapGeneric toKVPairs m =
   let pairs = toKVPairs m
    in OutputsMap
         { om_forward = HashMap.fromList pairs
-        , om_reverse = IntMap.unionsWith SL.merge $ map (uncurry mkSingletonReverseMap) pairs
+        , om_reverse = IntMap.unionsWith merge $ map (uncurry mkSingletonReverseMap) pairs
         }
 
 fromForwardMap
@@ -204,7 +222,7 @@ cleanReverse changedOutputs om =
   let hashes = mapAnyOutsMap outputKeyHash changedOutputs
    in om{om_reverse = foldl' (flip cleanReverseForHash) (om_reverse om) hashes}
  where
-  cleanReverseForHash :: OutputKeyHash -> IntMap.IntMap (SL k) -> IntMap.IntMap (SL k)
+  cleanReverseForHash :: OutputKeyHash -> IntMap.IntMap (SL.List k) -> IntMap.IntMap (SL.List k)
   cleanReverseForHash h im =
     IntMap.adjust (SL.filter (hasOutputByHash om h)) h im
 
@@ -222,7 +240,7 @@ insertWith combine key outputs om =
    in cleanReverse deletedOutputs $
         OutputsMap
           { om_forward = HashMap.insert key currentOutputs (om_forward om)
-          , om_reverse = IntMap.unionWith SL.merge (mkSingletonReverseMap key outputs) (om_reverse om)
+          , om_reverse = IntMap.unionWith merge (mkSingletonReverseMap key outputs) (om_reverse om)
           }
 
 insert
@@ -253,7 +271,7 @@ filterUnreferencedOutputs om = filterAnyOutsMap notReferenced
  where
   notReferenced :: CompSink s => Proxy s -> CompSinkId -> CompSinkOut s -> Bool
   notReferenced p k output =
-    SL.null (lookupOutputKey (p, k, output) om)
+    null (lookupOutputKey (p, k, output) om)
 
 --
 --
@@ -400,7 +418,7 @@ checkLookupOutputKey
 checkLookupOutputKey tom om tok =
   let tomResult = toy_lookupOutputKey tok tom
       omResult = lookupOutputKey (toyToRealOutputKey tok) om
-   in tomResult QC.=== HashSet.fromList (SL.toList omResult)
+   in tomResult QC.=== HashSet.fromList (toList omResult)
 
 checkLookupAllKeys :: ToyOutputsMap ToyKey -> OutputsMap ToyKey -> QC.Property
 checkLookupAllKeys tom om =
