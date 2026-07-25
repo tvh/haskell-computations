@@ -2,6 +2,7 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE EmptyCase #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# OPTIONS_GHC -F -pgmF htfpp #-}
@@ -584,11 +585,14 @@ import Data.IORef
 import Data.Int (Int32)
 import qualified Data.LargeHashable as LH
 import qualified Data.Map.Strict as Map
+import Data.Primitive.Types (Prim)
 import Data.String (fromString)
 import Data.Type.Equality ((:~:) (Refl))
 import Data.Typeable (Typeable, eqT)
+import qualified Data.Vector.Generic as VG
 import qualified Data.Vector.Generic.Mutable as GM
 import qualified Data.Vector.Mutable as VM
+import qualified Data.Vector.Primitive as VP
 import qualified Data.Vector.Unboxed as VU
 import qualified Data.Vector.Unboxed.Mutable as VUM
 import Data.Word (Word32, Word64, Word8)
@@ -626,7 +630,24 @@ newtype RowIdx = RowIdx Int
 -- hatch below.
 newtype DefRef = DefRef Int
   deriving (Eq, Ord, Show)
-  deriving newtype (Hashable)
+  deriving newtype (Hashable, Prim)
+
+-- | 'DefRef''s 'VU.Unbox' instance, via vector's 'VU.UnboxViaPrim' -- see
+-- 'unDefRef''s haddock for why this instance exists at all (the claim it
+-- corrects) and where it's actually used. The recipe: give the newtype a
+-- 'Prim' instance for free via 'GeneralizedNewtypeDeriving' (the deriving
+-- clause above -- 'Prim' has no associated data family, so, unlike
+-- 'VU.Unbox' itself, GND can derive it directly), back the unboxed
+-- 'VU.MVector'\/'VU.Vector' representations with 'Data.Vector.Primitive'
+-- (which already knows how to store any 'Prim' instance), and connect the
+-- two with @deriving via@. Verified against the actual installed
+-- vector-0.13.2.0 API (not just the module this pattern was sketched
+-- from) by compiling this exact recipe standalone before landing it here.
+newtype instance VU.MVector s DefRef = MV_DefRef (VP.MVector s DefRef)
+newtype instance VU.Vector DefRef = V_DefRef (VP.Vector DefRef)
+deriving via (VU.UnboxViaPrim DefRef) instance GM.MVector VU.MVector DefRef
+deriving via (VU.UnboxViaPrim DefRef) instance VG.Vector VU.Vector DefRef
+instance VU.Unbox DefRef
 
 rowBits :: Int
 rowBits = 44
@@ -650,18 +671,29 @@ refRow :: DefRef -> RowIdx
 refRow = snd . unpackRef
 {-# INLINE refRow #-}
 
--- | Escape hatch to the raw 'Int' a 'DefRef' packs. Exists for exactly two
--- call sites outside this module's own column storage: "Utils/SrcIndex.hs"'s
--- @SrcKeyArena@, which stores one 'DefRef' per dependent in an /unboxed/
--- column (so it must hold a raw 'Int', not a 'DefRef' -- giving 'DefRef' its
--- own 'Data.Vector.Unboxed.Unbox' instance would mean writing one by hand,
--- since 'Unbox' has associated data families that newtype-deriving can't
--- shortcut without a Template Haskell dependency this codebase deliberately
--- avoids), and this module's own 'EdgeArena'-packed @Word64@ triples (see
--- 'flattenCompDeps'\/'unflattenCompDeps'). Not needed, and not used, by
+-- | Escape hatch to the raw 'Int' a 'DefRef' packs. Exists for this
+-- module's own 'EdgeArena'-packed @Word64@ triples (see
+-- 'flattenCompDeps'\/'unflattenCompDeps') -- a bulk, stride-major payload
+-- 'DefRef' genuinely doesn't fit (see 'flattenCompDeps''s own haddock), not
+-- a place a typed column would help. Not needed, and not used, by
 -- "SimpleStateIf.hs" -- every container it keys by row identity (the stale
 -- queue, the outputs map, the pending-outputs map) is already generic in
 -- its key type, so 'DefRef' flows through them unwrapped.
+--
+-- __Formerly also "Utils/SrcIndex.hs"'s @SrcKeyArena@, no longer.__ That
+-- module used to store one 'DefRef' per dependent as a raw 'Int', on the
+-- claim that giving 'DefRef' its own 'VU.Unbox' instance "would mean
+-- writing one by hand, since 'Unbox' has associated data families that
+-- newtype-deriving can't shortcut without a Template Haskell dependency
+-- this codebase deliberately avoids". That claim was half right and half
+-- stale: 'GeneralizedNewtypeDeriving' genuinely cannot derive 'VU.Unbox'
+-- directly (it \/is\/ a method-less class over associated /data/ families,
+-- so there's no dictionary shape for GND to reuse) -- but vector >= 0.13
+-- (this project is on 0.13.2.0) ships 'VU.UnboxViaPrim'\/'VU.As'\/
+-- 'VU.IsoUnbox' for exactly this gap, no TH required. See the 'VU.Unbox'
+-- 'DefRef' instance a few lines below for the actual working recipe, now
+-- also used by @SrcKeyArena@\'s @ska_refs@ column directly as 'DefRef'
+-- rather than a raw 'Int' coerced at the edge.
 unDefRef :: DefRef -> Int
 unDefRef (DefRef i) = i
 {-# INLINE unDefRef #-}

@@ -213,7 +213,7 @@ import Control.Computations.CompEngine.CompSrc (
   compSrcId,
  )
 import Control.Computations.CompEngine.CompFlow (ForAnyCompFlow (..))
-import Control.Computations.CompEngine.Utils.DefTable (DefRef, mkDefRefUnsafe, unDefRef)
+import Control.Computations.CompEngine.Utils.DefTable (DefRef, mkDefRefUnsafe)
 
 ----------------------------------------
 -- EXTERNAL
@@ -326,17 +326,17 @@ kiAssignedCount ki = readIORef (ki_count ki)
 -- another EdgeArena" section.
 --
 
--- | @ska_refs@ stores each dependent's 'DefRef' as a raw 'Int' -- not
--- 'DefRef' itself, which has no 'Data.Vector.Unboxed.Unbox' instance (see
+-- | @ska_refs@ stores each dependent's 'DefRef' directly -- 'DefRef' now has
+-- a real 'Data.Vector.Unboxed.Unbox' instance (via vector's
+-- 'Data.Vector.Unboxed.UnboxViaPrim', see
 -- "DefTable.hs"'s 'Control.Computations.CompEngine.Utils.DefTable.unDefRef'
--- haddock for why one is deliberately not hand-written). 'skaAppend'\/
--- 'skaRemove'\/'skaToList' -- this module's actual API boundary -- take\/
--- return 'DefRef', converting via 'unDefRef'\/'mkDefRefUnsafe' at exactly
--- this column's read\/write, the same "raw inside storage, typed at the
--- edge" split "DefTable.hs" itself uses for its own 'DefRef'-packed
--- @Word64@ arenas.
+-- haddock for the recipe and the stale claim it corrects), so this column
+-- no longer needs to store a raw 'Int' and coerce at every read\/write.
+-- 'skaAppend'\/'skaRemove'\/'skaToList' -- this module's actual API boundary
+-- -- take\/return 'DefRef' exactly as this column now does; there is no
+-- longer a representation seam between them.
 data SrcKeyArena = SrcKeyArena
-  { ska_refs :: !(IORef (VUM.IOVector Int))
+  { ska_refs :: !(IORef (VUM.IOVector DefRef))
   , ska_vers :: !(IORef (VM.IOVector AnyCompSrcVer))
   , ska_len :: !(IORef Int)
   }
@@ -396,7 +396,7 @@ skaAppend ska ref !ver = do
   growBoth ska (len + 1)
   rv <- readIORef (ska_refs ska)
   vv <- readIORef (ska_vers ska)
-  VUM.write rv len (unDefRef ref)
+  VUM.write rv len ref
   VM.write vv len ver
   writeIORef (ska_len ska) (len + 1)
 
@@ -412,12 +412,11 @@ skaRemove :: SrcKeyArena -> DefRef -> IO Bool
 skaRemove ska ref = do
   len <- readIORef (ska_len ska)
   rv <- readIORef (ska_refs ska)
-  let refInt = unDefRef ref
-      go i
+  let go i
         | i >= len = pure Nothing
         | otherwise = do
             r <- VUM.read rv i
-            if r == refInt then pure (Just i) else go (i + 1)
+            if r == ref then pure (Just i) else go (i + 1)
   found <- go 0
   case found of
     Nothing -> pure False
@@ -441,7 +440,7 @@ skaToList ska = do
   len <- readIORef (ska_len ska)
   rv <- readIORef (ska_refs ska)
   vv <- readIORef (ska_vers ska)
-  mapM (\i -> (,) <$> (mkDefRefUnsafe <$> VUM.read rv i) <*> VM.read vv i) [0 .. len - 1]
+  mapM (\i -> (,) <$> VUM.read rv i <*> VM.read vv i) [0 .. len - 1]
 
 skaNull :: SrcKeyArena -> IO Bool
 skaNull ska = (== 0) <$> readIORef (ska_len ska)
