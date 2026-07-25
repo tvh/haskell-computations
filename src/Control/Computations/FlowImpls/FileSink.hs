@@ -1,13 +1,16 @@
 {-# LANGUAGE DeriveAnyClass #-}
 {-# LANGUAGE TypeFamilies #-}
-{-# OPTIONS_GHC -F -pgmF htfpp #-}
 
 module Control.Computations.FlowImpls.FileSink (
   FileSinkReq (..),
-  FileSink,
-  FileSinkOut,
+  FileSink (..),
+  FileSinkOut (..),
+  FileOrDir (..),
   makeFileSink,
-  htf_thisModulesTests,
+  mkOutPath,
+  executeImpl,
+  deleteImpl,
+  listExistingOutputsImpl,
 ) where
 
 ----------------------------------------
@@ -32,7 +35,6 @@ import qualified Data.Text.Encoding as T
 import GHC.Generics (Generic)
 import System.Directory
 import System.FilePath
-import Test.Framework
 
 {- | A request for writing a file or creating a directory. All paths are interpreted relatively to
  to root of the file sink. Using absolute paths is an error.
@@ -227,53 +229,3 @@ listExistingOutputsImpl sink =
           do
             logDebug ("Ignoring path of kind " ++ show k)
             pure acc
-
-test_basics :: IO ()
-test_basics =
-  withSysTempDir $ \rootDir ->
-    do
-      sink <- makeFileSink "ident" rootDir
-      void $ executeImpl sink (WriteFile "x" "1")
-      (out2, Ok ()) <- executeImpl sink (MakeDirs "d1/d2")
-      void $ executeImpl sink (WriteFile "d1/d2/y" "2")
-      subAssert $
-        assertContent
-          sink
-          [("x", File), ("d1", Dir), ("d1/d2", Dir), ("d1/d2/y", File)]
-          [("x", "1"), ("d1/d2/y", "2")]
-      deleteImpl sink out2
-      deleteImpl sink out2 -- no error
-      subAssert $
-        assertContent
-          sink
-          [("x", File), ("d1", Dir)]
-          [("x", "1")]
-      void $ executeImpl sink (WriteFile "d1" "3")
-      subAssert $
-        assertContent
-          sink
-          [("x", File), ("d1", File)]
-          [("x", "1"), ("d1", "3")]
-      void $ executeImpl sink (MakeDirs "x")
-      subAssert $
-        assertContent
-          sink
-          [("x", Dir), ("d1", File)]
-          [("d1", "3")]
- where
-  assertContent :: FileSink -> [(FilePath, FileOrDir)] -> [(FilePath, BS.ByteString)] -> IO ()
-  assertContent sink outs fileContents =
-    do
-      realOuts <- listExistingOutputsImpl sink
-      outs' <- forM outs $ \(p, t) ->
-        do
-          outP <- mkOutPath p
-          pure (FileSinkOut outP t)
-      assertEqual (HashSet.fromList outs') realOuts
-      subAssert $ forM_ fileContents (assertFileContent sink)
-  assertFileContent :: FileSink -> (FilePath, BS.ByteString) -> IO ()
-  assertFileContent sink (p, c) =
-    do
-      let fullP = unCanonPath (fcs_root sink) </> p
-      bs <- BS.readFile fullP
-      assertEqual c bs

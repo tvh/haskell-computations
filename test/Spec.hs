@@ -16,8 +16,8 @@ import {-@ HTF_TESTS @-} Control.Computations.CompEngine.Utils.DefTableTest
 import {-@ HTF_TESTS @-} Control.Computations.CompEngine.Utils.OutputsMap
 import {-@ HTF_TESTS @-} Control.Computations.CompEngine.Utils.PriorityAgingQueue
 import {-@ HTF_TESTS @-} Control.Computations.CompEngine.Utils.SrcIndex
-import {-@ HTF_TESTS @-} Control.Computations.FlowImpls.FileSink
-import {-@ HTF_TESTS @-} Control.Computations.FlowImpls.FileSrc
+import {-@ HTF_TESTS @-} Control.Computations.FlowImpls.FileSinkTest
+import {-@ HTF_TESTS @-} Control.Computations.FlowImpls.FileSrcTest
 import {-@ HTF_TESTS @-} Control.Computations.FlowImpls.TimeSrcTest
 import {-@ HTF_TESTS @-} Control.Computations.Utils.DataSizeTest
 import {-@ HTF_TESTS @-} Control.Computations.Utils.DispatcherTest
