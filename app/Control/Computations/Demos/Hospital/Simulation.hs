@@ -23,7 +23,6 @@ import Control.Computations.Utils.Logging
 import qualified Control.Computations.Utils.SqliteUtils as Sqlite
 import Control.Computations.Utils.TimeSpan
 import Control.Computations.Utils.TimeUtils
-import Control.Computations.Utils.Tuple
 import Control.Computations.Utils.Types
 
 ----------------------------------------
@@ -37,6 +36,7 @@ import Data.HashMap.Strict (HashMap)
 import qualified Data.HashMap.Strict as HashMap
 import Data.HashSet (HashSet)
 import qualified Data.HashSet as HashSet
+import Data.Strict.Tuple (Pair (..), (:!:))
 import qualified Data.Text as T
 import Data.Time.Calendar
 import Data.Time.Clock

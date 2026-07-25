@@ -18,7 +18,6 @@ module Control.Computations.Utils.Dispatcher (
 
 import Control.Computations.Utils.Clock
 import Control.Computations.Utils.TimeSpan
-import Control.Computations.Utils.Tuple
 import Control.Computations.Utils.Types
 
 ----------------------------------------
@@ -27,6 +26,8 @@ import Control.Computations.Utils.Types
 import Control.Concurrent.Async
 import Control.Concurrent.STM
 import Control.Exception
+import Data.Strict.Tuple (Pair (..), (:!:))
+import qualified Data.Strict.Tuple as S
 import Test.Framework
 
 data Dispatcher a = Dispatcher
@@ -59,7 +60,7 @@ data Listener a = Listener
 mkListener :: Dispatcher a -> IO (Listener a)
 mkListener d = do
   cur <- readTVarIO (d_var d)
-  start <- newTVarIO $ (option 0 fst' cur) - 1
+  start <- newTVarIO $ (option 0 S.fst cur) - 1
   pure (Listener start (d_var d))
 
 waitListener :: Listener a -> STM a

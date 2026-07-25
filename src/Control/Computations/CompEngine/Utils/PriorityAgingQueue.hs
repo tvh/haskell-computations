@@ -48,7 +48,6 @@ where
 -- LOCAL
 ----------------------------------------
 
-import Control.Computations.Utils.Tuple
 import Control.Computations.Utils.Types
 
 ----------------------------------------
@@ -58,6 +57,8 @@ import Control.Computations.Utils.Types
 import qualified Data.Foldable as F
 import qualified Data.HashPSQ as PSQ
 import Data.Hashable (Hashable)
+import Data.Strict.Tuple (Pair (..), (:!:))
+import qualified Data.Strict.Tuple as S
 import Data.LargeHashable
 import Data.Word (Word64)
 import GHC.Generics (Generic)
@@ -236,7 +237,7 @@ null :: PriorityAgingQueue k v -> Bool
 null = all PSQ.null . getQueues
 
 delete :: PaqKey k => k -> PriorityAgingQueue k v -> PriorityAgingQueue k v
-delete k paq = option paq snd' (deleteView k paq)
+delete k paq = option paq S.snd (deleteView k paq)
 
 -- | Decrements 'paq_size' on a hit -- 'setQ' (from 'loopQs'\/'setQueues')
 -- is a plain record update of one sub-queue field, so it carries the
@@ -497,7 +498,7 @@ instance (PaqKey k, Arbitrary k, Arbitrary v) => Arbitrary (PriorityAgingQueue k
   arbitrary =
     do
       (ops :: [PaqAction k v]) <- arbitrary
-      return $! fst' $! F.foldl' applyAction (empty :!: PaqTime 0) ops
+      return $! S.fst $! F.foldl' applyAction (empty :!: PaqTime 0) ops
    where
     applyAction (paq :!: t0) action =
       case action of

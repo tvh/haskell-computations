@@ -24,7 +24,6 @@ import Control.Computations.Utils.FileStore.Writer
 import qualified Control.Computations.Utils.StrictList as SL
 import Control.Computations.Utils.TimeSpan
 import Control.Computations.Utils.TimeUtils
-import Control.Computations.Utils.Tuple
 import Control.Computations.Utils.Types
 
 ----------------------------------------
@@ -43,6 +42,7 @@ import qualified Data.List as L
 import Data.Maybe
 import qualified Data.Ord
 import Data.Proxy
+import Data.Strict.Tuple (Pair (..), (:!:))
 import qualified Data.Text as T
 import Data.Time.Clock
 

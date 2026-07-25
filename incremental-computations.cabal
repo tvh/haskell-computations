@@ -85,7 +85,6 @@ library
       Control.Computations.Utils.StrictList
       Control.Computations.Utils.TimeSpan
       Control.Computations.Utils.TimeUtils
-      Control.Computations.Utils.Tuple
       Control.Computations.Utils.Types
       Control.Computations.Utils.VirtualTime
   other-modules:

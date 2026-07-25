@@ -128,7 +128,6 @@ import qualified Control.Computations.CompEngine.Utils.SrcIndex as SI
 import Control.Computations.Utils.Hash (Hash128)
 import Control.Computations.Utils.Logging
 import qualified Control.Computations.Utils.StrictList as SL
-import Control.Computations.Utils.Tuple
 import Control.Computations.Utils.Types
 
 ----------------------------------------
@@ -151,6 +150,7 @@ import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Maybe
 import Data.Proxy (Proxy (..))
+import Data.Strict.Tuple (Pair (..))
 import Data.Type.Equality ((:~:) (Refl))
 import Data.Typeable (Typeable, eqT)
 import qualified Data.Vector.Unboxed as VU
