@@ -797,7 +797,7 @@ updateEdges
   :: DefTable p a
   -> SifState
   -> DefRef
-  -> VU.Vector (Int, Word64, Word64)
+  -> VU.Vector DT.CompDepEdge
   -- ^ old comp-deps (with observed versions)
   -> IntMap CompDepVer
   -- ^ new comp-deps (target -> observed version)
@@ -811,11 +811,11 @@ updateEdges dt st row oldCompVer newCompVerMap oldSrc newSrc = do
       removedComp = IntSet.difference oldCompTargets newCompTargets
       addedSrc = HashSet.difference newSrc oldSrc
       removedSrc = HashSet.difference oldSrc newSrc
-      newTriples =
+      newEdges =
         VU.fromList
-          [(t, hi, lo) | (t, v) <- IntMap.toList newCompVerMap, let (hi, lo) = encodeVer v]
+          [DT.CompDepEdge t (encodeVer v) | (t, v) <- IntMap.toList newCompVerMap]
 
-  DT.writeCompDeps dt (DT.refRow row) newTriples
+  DT.writeCompDeps dt (DT.refRow row) newEdges
   DT.writeSrcDeps dt (DT.refRow row) newSrc
 
   -- Removes before adds, deliberately: removedSrc/addedSrc are diffed on
@@ -923,7 +923,10 @@ finishCap st cap defIdx dt row deps mres = do
           Some _ -> ResultValue
           None -> ResultMetaOnly
       oldCompDepsMap =
-        IntMap.fromList [(t, decodeVer (hi, lo)) | (t, hi, lo) <- VU.toList oldCompDepsVer]
+        IntMap.fromList
+          [ (DT.cdeTarget e, decodeVer (DT.cdeObservedVer e))
+          | e <- VU.toList oldCompDepsVer
+          ]
       sameDeps = oldCompDepsMap == newCompDepsVer && oldSrcDeps == newSrcDeps
       impure = sameDeps && oldResultState /= NoResult && oldHash /= newHash
 

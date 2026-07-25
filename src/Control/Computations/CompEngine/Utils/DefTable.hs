@@ -2,6 +2,7 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE EmptyCase #-}
+{-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeFamilies #-}
@@ -539,6 +540,7 @@ module Control.Computations.CompEngine.Utils.DefTable (
   readParam,
   readValue,
   writeValue,
+  CompDepEdge (..),
   readCompDeps,
   writeCompDeps,
   compDepTargets,
@@ -999,8 +1001,8 @@ colWrite (ColUnboxed Refl ref) row e = readIORef ref >>= \v -> VUM.write v (unRo
 -- section for the full design rationale. Everything below is stride-
 -- generic (stride 3 for compDeps, 1 for rdeps) and knows nothing about
 -- 'DefTable' or 'DefRef'; the typed (un)flattening into
--- @VU.Vector (Int, Word64, Word64)@ / @VU.Vector Int@ happens at the
--- DefTable column-access boundary further down.
+-- @VU.Vector 'CompDepEdge'@ \/ @VU.Vector Int@ happens at the DefTable
+-- column-access boundary further down.
 --
 
 -- | A row's current liveness, as a callback rather than a direct
@@ -1719,35 +1721,94 @@ readValue dt row = colRead (dt_value dt) row
 writeValue :: DefTable p a -> RowIdx -> a -> IO ()
 writeValue dt row a = colWrite (dt_value dt) row a
 
+-- | One comp-dep edge: 'cdeTarget' is a packed 'DefRef' this row depends on
+-- (kept as a raw 'Int', not a 'DefRef' -- see 'flattenCompDeps''s note
+-- below), 'cdeObservedVer' is the target's result hash /as observed/ when
+-- this row last ran, as the same opaque @(hi, lo)@ pair 'hashToPair'\/
+-- 'pairToHash' already use. A named record instead of the bare
+-- @(Int, Word64, Word64)@ tuple this replaced specifically because the
+-- tuple's three positionally-interchangeable slots let a hi\/lo swap at a
+-- construction or destructuring site compile silently: "SimpleStateIf.hs"'s
+-- @updateEdges@\/@finishCap@ used to round-trip through
+-- @let (hi, lo) = encodeVer v@ then @(t, hi, lo)@, and separately
+-- @(t, hi, lo) <- ...@ then @decodeVer (hi, lo)@, by hand, at exactly the
+-- point a transposition would have gone unnoticed by the type checker.
+-- Keeping 'cdeObservedVer' as one opaque pair field (not two named
+-- @cdeHashHi@\/@cdeHashLo@ fields) removes that reconstruction step
+-- entirely, rather than merely labeling its two halves: nothing outside
+-- 'hashToPair'\/'pairToHash'\/'encodeVer'\/'decodeVer' ever needs to know or
+-- reassemble which half is which.
+data CompDepEdge = CompDepEdge
+  { cdeTarget :: !Int
+  , cdeObservedVer :: !(Word64, Word64)
+  }
+  deriving (Eq, Show)
+
+-- | 'CompDepEdge''s 'VU.Unbox' instance, via vector's 'VU.IsoUnbox'\/'VU.As'
+-- rather than 'VU.UnboxViaPrim' ("DefTable.hs"'s 'DefRef' instance, or
+-- "Utils/SrcIndex.hs"'s haddock pointing back to it, for that recipe):
+-- unlike a single-field newtype over a 'Prim' scalar, 'CompDepEdge' is a
+-- genuine two-field product with no 'Data.Primitive.Types.Prim' instance of
+-- its own to borrow -- but it \/is\/ isomorphic to the
+-- @(Int, Word64, Word64)@ tuple that already has 'VU.Unbox' (vector
+-- provides 'VU.Unbox' for tuples of 'VU.Unbox' elements), so 'VU.IsoUnbox'
+-- (an explicit @toURepr@\/@fromURepr@ isomorphism to an /existing/ 'VU.Unbox'
+-- type, as opposed to 'VU.UnboxViaPrim''s "borrow a 'Prim' instance") is the
+-- right member of the same vector>=0.13 family for this shape.
+instance VU.IsoUnbox CompDepEdge (Int, Word64, Word64) where
+  toURepr (CompDepEdge t (hi, lo)) = (t, hi, lo)
+  fromURepr (t, hi, lo) = CompDepEdge t (hi, lo)
+  {-# INLINE toURepr #-}
+  {-# INLINE fromURepr #-}
+
+newtype instance VU.MVector s CompDepEdge = MV_CompDepEdge (VU.MVector s (Int, Word64, Word64))
+newtype instance VU.Vector CompDepEdge = V_CompDepEdge (VU.Vector (Int, Word64, Word64))
+deriving via
+  (VU.As CompDepEdge (Int, Word64, Word64))
+  instance
+    GM.MVector VU.MVector CompDepEdge
+deriving via
+  (VU.As CompDepEdge (Int, Word64, Word64))
+  instance
+    VG.Vector VU.Vector CompDepEdge
+instance VU.Unbox CompDepEdge
+
 -- | Flatten a comp-dep edge set into stride-3 words (target, hash-hi,
 -- hash-lo) for 'eaWrite'. The target component is a packed 'DefRef' stored
 -- as a raw 'Word64' -- like the rest of this section, a bulk unboxed
 -- payload deliberately left in its raw machine representation (see
--- 'unDefRef''s haddock: giving 'DefRef' its own 'Unbox' instance is exactly
--- the friction this module avoids), not a scalar call-site argument where a
--- transposition would be the risk. 'DefTable'\'s own row-identity API
+-- 'unDefRef''s haddock: an 'EdgeArena''s shared @Word64@ arena is a
+-- different shape from 'CompDepEdge' above -- stride-major, pushed through
+-- 'IntSet'\/'IntMap' algebra in "SimpleStateIf.hs", with a ref packed
+-- alongside two hash words rather than each edge as its own addressable
+-- element -- 'DefRef' doesn't fit that layout and there is no positional
+-- hazard for a named type to close there, unlike 'CompDepEdge' above, which
+-- /is/ addressed element-wise). 'DefTable'\'s own row-identity API
 -- ('packRef'\/'unpackRef'\/'refDefIdx'\/'refRow') is the actual 'DefRef'
 -- boundary; callers reconstruct a typed 'DefRef' from a target 'Int' via
 -- 'mkDefRefUnsafe' only where they cross back into scalar, single-ref logic
 -- (e.g. "SimpleStateIf.hs"'s @resolveRefToAny@).
-flattenCompDeps :: VU.Vector (Int, Word64, Word64) -> VU.Vector Word64
+flattenCompDeps :: VU.Vector CompDepEdge -> VU.Vector Word64
 flattenCompDeps xs = VU.generate (3 * VU.length xs) go
  where
   go i = case i `divMod` 3 of
-    (n, 0) -> let (t, _, _) = xs VU.! n in fromIntegral t
-    (n, 1) -> let (_, hi, _) = xs VU.! n in hi
-    (n, _) -> let (_, _, lo) = xs VU.! n in lo
+    (n, 0) -> fromIntegral (cdeTarget (xs VU.! n))
+    (n, 1) -> fst (cdeObservedVer (xs VU.! n))
+    (n, _) -> snd (cdeObservedVer (xs VU.! n))
 
 -- | Inverse of 'flattenCompDeps'.
-unflattenCompDeps :: VU.Vector Word64 -> VU.Vector (Int, Word64, Word64)
+unflattenCompDeps :: VU.Vector Word64 -> VU.Vector CompDepEdge
 unflattenCompDeps flat = VU.generate (VU.length flat `div` 3) go
  where
-  go n = (fromIntegral (flat VU.! (3 * n)), flat VU.! (3 * n + 1), flat VU.! (3 * n + 2))
+  go n =
+    CompDepEdge
+      (fromIntegral (flat VU.! (3 * n)))
+      (flat VU.! (3 * n + 1), flat VU.! (3 * n + 2))
 
-readCompDeps :: DefTable p a -> RowIdx -> IO (VU.Vector (Int, Word64, Word64))
+readCompDeps :: DefTable p a -> RowIdx -> IO (VU.Vector CompDepEdge)
 readCompDeps dt row = unflattenCompDeps <$> eaRead (dt_compDeps dt) row
 
-writeCompDeps :: DefTable p a -> RowIdx -> VU.Vector (Int, Word64, Word64) -> IO ()
+writeCompDeps :: DefTable p a -> RowIdx -> VU.Vector CompDepEdge -> IO ()
 writeCompDeps dt row xs = do
   n <- rowCount dt
   eaWrite (dt_compDeps dt) row (isAlive dt) n (flattenCompDeps xs)
@@ -1756,8 +1817,8 @@ writeCompDeps dt row xs = do
 -- 'flattenCompDeps''s haddock) of a comp-dep edge set, discarding the
 -- observed version -- what the rdeps graph (add/remove edges, GC liveness)
 -- cares about.
-compDepTargets :: VU.Vector (Int, Word64, Word64) -> VU.Vector Int
-compDepTargets = VU.map (\(r, _, _) -> r)
+compDepTargets :: VU.Vector CompDepEdge -> VU.Vector Int
+compDepTargets = VU.map cdeTarget
 
 readRdeps :: DefTable p a -> RowIdx -> IO (VU.Vector Int)
 readRdeps dt row = VU.map fromIntegral <$> eaRead (dt_rdeps dt) row
@@ -2053,7 +2114,7 @@ test_compDepsAndRdepsRoundTrip :: IO ()
 test_compDepsAndRdepsRoundTrip = do
   dt <- newTest
   (r, _) <- lookupOrInsertRow dt (h 1) 1
-  let cd = VU.fromList [(10, 1, 2), (20, 3, 4)]
+  let cd = VU.fromList [CompDepEdge 10 (1, 2), CompDepEdge 20 (3, 4)]
   writeCompDeps dt r cd
   got <- readCompDeps dt r
   assertEqual cd got
@@ -2405,7 +2466,7 @@ test_freeRowResetsEdgesOnReuse :: IO ()
 test_freeRowResetsEdgesOnReuse = do
   dt <- newTest
   (r1, _) <- lookupOrInsertRow dt (h 1) 1
-  writeCompDeps dt r1 (VU.fromList [(5, 1, 2)])
+  writeCompDeps dt r1 (VU.fromList [CompDepEdge 5 (1, 2)])
   writeRdeps dt r1 (VU.fromList [7, 8])
   freeRow dt (h 1) r1
   (r2, _) <- lookupOrInsertRow dt (h 2) 2
@@ -2429,14 +2490,14 @@ test_manyOverwritesOfSameRowKeepLatestEdgesCorrect = do
   -- least one compaction of the compDeps arena along the way.
   mapM_
     ( \i -> do
-        let cd = VU.fromList [(i, fromIntegral i, fromIntegral (i + 1))]
+        let cd = VU.fromList [CompDepEdge i (fromIntegral i, fromIntegral (i + 1))]
         writeCompDeps dt r cd
         let rd = VU.fromList [i, (i + 1), (i + 2)]
         writeRdeps dt r rd
     )
     [1 .. 3000]
   gotCd <- readCompDeps dt r
-  assertEqual (VU.fromList [(3000, 3000, 3001)]) gotCd
+  assertEqual (VU.fromList [CompDepEdge 3000 (3000, 3001)]) gotCd
   gotRd <- readRdeps dt r
   assertEqual (VU.fromList [3000, 3001, 3002]) gotRd
 
@@ -2450,18 +2511,18 @@ test_compactionDoesNotDisturbOtherAliveRowsEdges = do
   bystanders <- mapM (\i -> lookupOrInsertRow dt (h i) i) [1 .. 10]
   mapM_
     ( \(r, i) -> do
-        writeCompDeps dt r (VU.fromList [((100 + i), fromIntegral i, fromIntegral i)])
+        writeCompDeps dt r (VU.fromList [CompDepEdge (100 + i) (fromIntegral i, fromIntegral i)])
         writeRdeps dt r (VU.fromList [(200 + i)])
     )
     (zip (map fst bystanders) [1 .. 10])
   mapM_
-    ( \i -> writeCompDeps dt rHot (VU.fromList [(i, fromIntegral i, fromIntegral i)])
+    ( \i -> writeCompDeps dt rHot (VU.fromList [CompDepEdge i (fromIntegral i, fromIntegral i)])
     )
     [1 .. 3000 :: Int]
   mapM_
     ( \(r, i) -> do
         cd <- readCompDeps dt r
-        assertEqual (VU.fromList [((100 + i), fromIntegral i, fromIntegral i)]) cd
+        assertEqual (VU.fromList [CompDepEdge (100 + i) (fromIntegral i, fromIntegral i)]) cd
         rd <- readRdeps dt r
         assertEqual (VU.fromList [(200 + i)]) rd
     )
@@ -2471,18 +2532,18 @@ test_freedRowsDontResurfaceAfterCompaction :: IO ()
 test_freedRowsDontResurfaceAfterCompaction = do
   dt <- newTest
   (rKeep, _) <- lookupOrInsertRow dt (h 0) 0
-  writeCompDeps dt rKeep (VU.fromList [(999, 1, 1)])
+  writeCompDeps dt rKeep (VU.fromList [CompDepEdge 999 (1, 1)])
   (rDoomed, _) <- lookupOrInsertRow dt (h 1) 1
-  writeCompDeps dt rDoomed (VU.fromList [(888, 2, 2)])
+  writeCompDeps dt rDoomed (VU.fromList [CompDepEdge 888 (2, 2)])
   freeRow dt (h 1) rDoomed
   -- force compaction via repeated overwrites of the surviving row
   mapM_
-    (\i -> writeCompDeps dt rKeep (VU.fromList [(i, fromIntegral i, fromIntegral i)]))
+    (\i -> writeCompDeps dt rKeep (VU.fromList [CompDepEdge i (fromIntegral i, fromIntegral i)]))
     [1 .. 3000 :: Int]
   aliveKeep <- isAlive dt rKeep
   assertBool aliveKeep
   cd <- readCompDeps dt rKeep
-  assertEqual (VU.fromList [(3000, 3000, 3000)]) cd
+  assertEqual (VU.fromList [CompDepEdge 3000 (3000, 3000)]) cd
   aliveDoomed <- isAlive dt rDoomed
   assertBool (not aliveDoomed)
 
@@ -2556,7 +2617,7 @@ test_rowReuseSeesNoStaleGarbageInAnyColumn = do
   writeResultHash dt r1 (h 555)
   writeValue dt r1 (777 :: Int)
   writeFlags dt r1 (mkFlags True False ResultValue)
-  writeCompDeps dt r1 (VU.fromList [(9, 1, 2)])
+  writeCompDeps dt r1 (VU.fromList [CompDepEdge 9 (1, 2)])
   writeRdeps dt r1 (VU.fromList [9, 10])
   writeSrcDeps dt r1 (HashSet.singleton (srcDep "old-occupant" 1))
   freeRow dt (h 1) r1
