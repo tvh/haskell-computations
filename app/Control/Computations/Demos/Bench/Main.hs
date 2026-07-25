@@ -473,4 +473,39 @@ benchMain = do
       "bytes/instance (GHC max_live_bytes / instances): %.1f B/instance\n"
       (fromIntegral (max_live_bytes rtsStats) / fromIntegral coldReruns :: Double)
 
+  -- OPTIONAL DIAGNOSTIC, off by default: repeats the mutate-and-settle step
+  -- so a profile taken over the whole process is dominated by live-phase
+  -- propagation rather than cold eval (docs/benchmark-notes.md, the
+  -- live-path investigation). Runs strictly after every number reported
+  -- above, so it never perturbs the existing measurements; a run with
+  -- PERSIST_BENCH_LIVE_LOOPS unset (or <=1) reproduces them byte-for-byte.
+  -- Cycles source keys "0".."299" (a fresh value each time) so each
+  -- iteration is a genuine distinct-key mutation, matching the shape of the
+  -- single-key measurement above rather than a no-op repeat.
+  liveLoops <- maybe 1 (max 1) . (>>= readMaybe) <$> lookupEnv "PERSIST_BENCH_LIVE_LOOPS"
+  when (liveLoops > 1) $ do
+    nextRunRef <- newIORef (rs_run rs2 + 1)
+    loopRerunsRef <- newIORef (0 :: Int)
+    tLoopStart <- getCurrentTime
+    forM_ [1 .. liveLoops - 1] $ \n -> do
+      let key = BSC.pack (show (n `mod` fromIntegral srcKeys :: Int))
+          val = BSC.pack (show (1000000 + n :: Int))
+      before <- readIORef counterRef
+      nextRun <- readIORef nextRunRef
+      hmfInsert kv key val
+      rsN <- waitForFullSettle runVar nextRun
+      writeIORef nextRunRef (rs_run rsN + 1)
+      after <- readIORef counterRef
+      modifyIORef' loopRerunsRef (+ (after - before))
+    tLoopEnd <- getCurrentTime
+    loopReruns <- readIORef loopRerunsRef
+    let loopWall = realToFrac (diffUTCTime tLoopEnd tLoopStart) :: Double
+    putStrLn ""
+    putStrLn "--- 2b. live incremental loop (diagnostic, PERSIST_BENCH_LIVE_LOOPS) ---"
+    printf "loop iterations: %d\n" (liveLoops - 1)
+    printf "loop wall time: %.4f s\n" loopWall
+    printf "loop reruns: %d\n" loopReruns
+    when (loopReruns > 0) $
+      printf "loop us/rerun: %.3f\n" (loopWall * 1e6 / fromIntegral loopReruns :: Double)
+
   cancel engineHandle

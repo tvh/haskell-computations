@@ -108,6 +108,18 @@ type PaqQueue k v = PSQ.HashPSQ k PaqPrioIndex v
 
 data PriorityAgingQueue k v = PriorityAgingQueue
   { paq_nextCounter :: {-# NOUNPACK #-} PaqCounter
+  -- Total entry count across all four sub-queues, maintained incrementally
+  -- by every operation that adds or removes a key (enqueue/deleteView/
+  -- dequeue -- upgrade only moves entries between sub-queues, so it never
+  -- touches this). Exists purely so 'size' is O(1): the underlying
+  -- Data.HashPSQ.size is O(n) (it folds the whole tree), and 'size' used to
+  -- be called from there directly -- once per dequeued cap on the engine's
+  -- hot per-rerun path (Control.Computations.CompEngine.Impl's
+  -- stepCompEngine) -- an O(queue size) cost paid on every single rerun,
+  -- i.e. quadratic in the size of a propagation round. See
+  -- docs/benchmark-notes.md's live-update investigation for the
+  -- measurement that caught this.
+  , paq_size :: {-# UNPACK #-} !Int
   , paq_realTimeQueue :: {-# NOUNPACK #-} (PaqQueue k v)
   , paq_expressQueue :: {-# NOUNPACK #-} (PaqQueue k v)
   , paq_regularQueue :: {-# NOUNPACK #-} (PaqQueue k v)
@@ -156,7 +168,7 @@ data PaqEntry k v = PaqEntry
   deriving (Eq, Show)
 
 empty :: PriorityAgingQueue k v
-empty = PriorityAgingQueue emptyCounter PSQ.empty PSQ.empty PSQ.empty PSQ.empty
+empty = PriorityAgingQueue emptyCounter 0 PSQ.empty PSQ.empty PSQ.empty PSQ.empty
 
 view :: PaqKey k => PriorityAgingQueue k v -> PaqView k v
 view paq =
@@ -195,8 +207,10 @@ loopQs def f paq = loop (zip (getQueues paq) (setQueues paq))
       (q : qs) -> f q (loop qs)
       [] -> def
 
+-- | /O(1)/ -- see 'paq_size'\'s haddock for why this used to be /O(n)/ and
+-- why that mattered.
 size :: PriorityAgingQueue k v -> Int
-size = sum . map PSQ.size . getQueues
+size = paq_size
 
 null :: PriorityAgingQueue k v -> Bool
 null = all PSQ.null . getQueues
@@ -204,6 +218,11 @@ null = all PSQ.null . getQueues
 delete :: PaqKey k => k -> PriorityAgingQueue k v -> PriorityAgingQueue k v
 delete k paq = option paq snd' (deleteView k paq)
 
+-- | Decrements 'paq_size' on a hit -- 'setQ' (from 'loopQs'\/'setQueues')
+-- is a plain record update of one sub-queue field, so it carries the
+-- pre-deletion 'paq_size' through unchanged; this is the one place that
+-- actually removes an entry, so it's also the one place that has to
+-- account for it.
 deleteView
   :: PaqKey k
   => k
@@ -212,14 +231,16 @@ deleteView
 deleteView k =
   loopQs None $ \(q, setQ) loop ->
     case PSQ.deleteView k q of
-      Just (PaqPrioIndex t p _, v, q') -> Some (PaqEntry t p k v :!: setQ q')
+      Just (PaqPrioIndex t p _, v, q') ->
+        let paq' = setQ q' in Some (PaqEntry t p k v :!: paq'{paq_size = paq_size paq' - 1})
       Nothing -> loop
 
 dequeue :: PaqKey k => PriorityAgingQueue k v -> (Option (PaqEntry k v :!: PriorityAgingQueue k v))
 dequeue =
   loopQs None $ \(q, setQ) loop ->
     case PSQ.minView q of
-      Just (k, PaqPrioIndex t p _, v, q') -> Some (PaqEntry t p k v :!: setQ q')
+      Just (k, PaqPrioIndex t p _, v, q') ->
+        let paq' = setQ q' in Some (PaqEntry t p k v :!: paq'{paq_size = paq_size paq' - 1})
       Nothing -> loop
 
 data EnqueueInfo
@@ -241,6 +262,10 @@ enqueue e@(PaqEntry t1 p1 k v) paq =
     Some (PaqEntry t0 p0 _ _ :!: paq') ->
       (EnqueueUpdatedEntry, enqueueNew (PaqEntry (min t0 t1) (min p0 p1) k v) paq')
  where
+  -- +1 unconditionally: called either on the never-deleted original 'paq'
+  -- (genuinely new key, 0 -> 1) or on 'deleteView'\'s already-decremented
+  -- result (same key replaced, net 0) -- both correct by construction, no
+  -- need to case on 'EnqueueAddedNewEntry'\/'EnqueueUpdatedEntry' here.
   enqueueNew (PaqEntry t p k v) paq =
     case p of
       PaqRealTime -> paq'{paq_realTimeQueue = PSQ.insert k pi v (paq_realTimeQueue paq)}
@@ -248,7 +273,7 @@ enqueue e@(PaqEntry t1 p1 k v) paq =
       PaqRegular -> paq'{paq_regularQueue = PSQ.insert k pi v (paq_regularQueue paq)}
       PaqBulk -> paq'{paq_bulkQueue = PSQ.insert k pi v (paq_bulkQueue paq)}
    where
-    paq' = paq{paq_nextCounter = nextCounter (paq_nextCounter paq)}
+    paq' = paq{paq_nextCounter = nextCounter (paq_nextCounter paq), paq_size = paq_size paq + 1}
     pi = PaqPrioIndex t p (paq_nextCounter paq)
 
 nextCounter :: PaqCounter -> PaqCounter
@@ -256,7 +281,11 @@ nextCounter c = PaqCounter (unPaqCounter c + 1)
 
 -- | Upgrades old work to higher priority queues according to the given 'UpgradeCfg'.
 upgrade :: forall k v. PaqKey k => PaqUpgradeCfg -> PriorityAgingQueue k v -> PriorityAgingQueue k v
-upgrade ucfg paq@(PriorityAgingQueue c _ xq rq bq) =
+-- 'upgrade' only moves entries between sub-queues (dequeueOld/enqueueOld
+-- below insert straight into a raw 'PaqQueue', bypassing the top-level
+-- 'enqueue'/'deleteView'), so 'paq_size' is untouched here -- the closing
+-- record update below inherits it unchanged from 'paq'.
+upgrade ucfg paq@(PriorityAgingQueue c _sz _rt xq rq bq) =
   let (bToR, bq') = dequeueOld (paqu_bulkToRegularTime ucfg) PaqBulk bq
       (rToX, rq') = dequeueOld (paqu_regularToExpressTime ucfg) PaqRegular rq
       (bToX, rq'') = dequeueOld (paqu_bulkToExpressTime ucfg) PaqBulk rq'
