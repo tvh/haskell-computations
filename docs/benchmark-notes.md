@@ -816,6 +816,58 @@ unchanged, and `ByteString`/`String` params keep working via the fallback
 Bigger win at small scale, where the param/value columns are a larger
 share next to still-small edge arenas. Tests 99 → **103**.
 
+### 4e — interned CSR arena for source deps (commit `40a754a`) — **kept, and the biggest surprise of the campaign**
+
+`dt_srcDeps :: IORef (VM.IOVector (HashSet AnyCompSrcDep))` — the last
+conspicuously boxed per-row column — became an `EdgeArena` (the same CSR
+machinery 4b built, stride 1) storing **interned ids**, backed by a per-def
+`SrcDepIntern` (forward `HashMap AnyCompSrcDep Int`, reverse growable
+vector, monotonic counter). `readSrcDeps`/`writeSrcDeps` keep their exact
+`HashSet AnyCompSrcDep` signatures — interning is entirely internal — so
+`SimpleStateIf.hs` again needed zero edits.
+
+| | before | after | Δ |
+|---|---|---|---|
+| 1.0 max_live | 817.3 MB | **375.7 MB** | **−54.0%** |
+| 1.0 RSS settle | ~1395 MB | **784.9 MB** | **−44%** |
+| 0.1 max_live | 81.7 MB | **38.0–40.1 MB** | **−51 to −53%** |
+| cold / live | — | — | flat within noise |
+
+**The estimate was wrong by 13×** — this section predicted ~34 B/cap;
+actual saving is **~442 B/cap**. Root cause of the discrepancy, found by
+the agent and worth recording as a bug-shaped finding rather than a tuning
+result: `wrapCompSrcDep`/`compSrcId` **reconstruct a fresh
+`CompSrcId`/`Text` on every call** instead of sharing one, so ~205k
+populated rows referencing only 300 distinct source keys were carrying
+~683× duplication. Interning collapses that to near zero. The lesson
+generalizes: per-call reconstruction of "identity" values is invisible in
+a data-layout audit and can dwarf the layout itself.
+
+Accepted limitation, documented in the module haddock rather than hidden:
+interned src-dep ids are **never recycled** (Stage 1's original tradeoff).
+Because `AnyCompSrcDep` carries an observed version, ids scale with
+distinct `(key, version)` pairs ever seen — negligible here, unbounded in
+principle for a long-running high-churn system. Refcounted reclaim was
+considered and deliberately deferred: memory-management complexity with no
+correctness stakes.
+
+Semantics verified rather than assumed: 5 new DefTable tests (round-trip,
+dedup, same-key-different-version, compaction under 5000 overwrites, row
+reuse); the existing `test_gc`/`test_impureComputation`/
+`test_modifcationWhileWorkingOnQueue`/`test_olderVersionInsertedLater`
+suites exercise src-dep versioning and GC through real round trips; and
+the DirSync app test confirmed `compSrcUnregister` still fires
+(`Deleting 3 deps of CompSrcId "FileSrc" "fileSrc"`). Tests **108/108**.
+
+### Campaign scoreboard after 4a–4e
+
+**375.8 B/cap live at 1M caps, vs Rust Stage 5's ~330 B/node — live-heap
+parity is essentially reached** (1.14×), the roadmap's headline goal.
+RSS 785 MB vs Rust's 328–354 MB is ~2.2×, and that residue is now
+dominated by GHC's copying headroom rather than by data layout. Cold eval
+6.8 s vs Rust ~2.9 s (2.3×). Live update 10.5 s vs ~0.5 s — **still ~20×,
+and now conspicuously the only metric that has not moved all campaign.**
+
 ## Not tried yet / open items
 
 - **The Interlude-2 diet, measured.** The Rust notes list a ranked, concrete
