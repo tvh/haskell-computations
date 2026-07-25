@@ -1034,6 +1034,7 @@ maybeCompact ea isRowAlive rows = do
   dead <- readIORef (ea_dead ea)
   when (used >= compactMinWords && dead * 2 > used) $
     eaCompact ea isRowAlive rows
+{-# INLINE maybeCompact #-}
 
 -- | Rebuild the arena keeping only the current span of every currently-
 -- alive row (in row order); every other row (dead, or alive with no
@@ -1069,6 +1070,7 @@ eaCompact ea isRowAlive rows = do
   writeIORef (ea_data ea) dstV
   writeIORef (ea_used ea) finalUsed
   writeIORef (ea_dead ea) 0
+{-# INLINE eaCompact #-}
 
 -- | Read a row's edge span as a flat, stride-major 'VU.Vector Word64' (a
 -- safe copy -- the arena keeps mutating after this call returns). Empty
@@ -1085,6 +1087,7 @@ eaRead ea row = do
       off <- VUM.read offV (unRowIdx row)
       dataV <- readIORef (ea_data ea)
       VU.freeze (VUM.slice (fromIntegral off) (fromIntegral len * stride) dataV)
+{-# INLINE eaRead #-}
 
 -- | Read a row's edge span (like 'eaRead') and then unconditionally clear
 -- its offset/len, marking the vacated span as dead weight the same way
@@ -1108,6 +1111,7 @@ eaTakeRow ea row = do
     VUM.write offV (unRowIdx row) 0
     VUM.write lenV (unRowIdx row) 0
   pure flat
+{-# INLINE eaTakeRow #-}
 
 -- | Overwrite a row's entire edge span with @flat@ (already stride-major
 -- flattened; its length must be a multiple of @stride@). An empty write
@@ -1138,6 +1142,7 @@ eaWrite ea row isRowAlive rows flat = do
       VUM.write offV (unRowIdx row) (fromIntegral used)
       VUM.write lenV (unRowIdx row) (fromIntegral (numWords `div` strideN))
   maybeCompact ea isRowAlive rows
+{-# INLINE eaWrite #-}
 
 --
 -- Open-addressing hash->row index -- see the module haddock's "Hash index"
