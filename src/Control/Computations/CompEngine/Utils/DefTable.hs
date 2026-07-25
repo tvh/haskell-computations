@@ -1,5 +1,7 @@
 {-# LANGUAGE AllowAmbiguousTypes #-}
+{-# LANGUAGE EmptyCase #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TypeFamilies #-}
 {-# OPTIONS_GHC -F -pgmF htfpp #-}
 
 {- | Per-definition columnar row storage: the "Tier 2" memory redesign from
@@ -24,16 +26,16 @@
  allows it ('Data.Vector.Unboxed.Mutable' for @param_hash@/@result_hash@
  (as two 'Word64's each, since 'Hash128' itself has no 'Unbox' instance and
  splitting it avoids needing to write one) and @flags@), boxed where it
- can't be ('Data.Vector.Mutable' for the typed @param@/@value@ columns and
- for the @srcDeps@ column). A boxed column's freshly-grown capacity is left
- as the @vector@ package's own "uninitialised element" error thunk (see
- 'growBoxed') -- exactly the loud-failure-on-premature-read canary this
- module established for row lifecycle in an earlier increment (dead ids
- there, dead cells here), now extended to row storage. Growth for the
- @flags@ column (and, see below, the edge-arena @len@ columns) is the one
- exception: it is explicitly zeroed (not left as unboxed garbage), because a
- stray nonzero byte there would silently read as an occupied row or a
- nonempty edge span.
+ can't be ('Data.Vector.Mutable' for the typed @param@/@value@ columns). A
+ boxed column's freshly-grown capacity is left as the @vector@ package's own
+ "uninitialised element" error thunk (see 'growBoxed') -- exactly the
+ loud-failure-on-premature-read canary this module established for row
+ lifecycle in an earlier increment (dead ids there, dead cells here), now
+ extended to row storage. Growth for the @flags@ column (and, see below, the
+ edge-arena @len@ columns) is the one exception: it is explicitly zeroed
+ (not left as unboxed garbage), because a stray nonzero byte there would
+ silently read as an occupied row or a nonempty edge span. @srcDeps@ is
+ neither of the above -- see "Src-dep interning" below.
 
  = Edge storage: per-def CSR arenas, not per-row vectors
 
@@ -166,6 +168,65 @@
  in response to churn. See 'hixBackwardShift' for the algorithm (Knuth's
  backward-shift deletion for linear probing, adapted to not store keys).
 
+ = Src-dep interning
+
+ @dt_srcDeps@ used to be a boxed per-row column of persistent
+ 'Data.HashSet.HashSet' 'AnyCompSrcDep's -- correct, but sparse and
+ expensive where populated: in the benchmark graph only the level-0 rows
+ (~205k of 1M) have any source dependency at all, and each of those has
+ exactly one, but 'AnyCompSrcDep' is an existential wrapper
+ ('Control.Computations.CompEngine.CompFlow.ForAnyCompFlow' around a
+ 'CompSrcId' plus a typed key/version pair) -- a boxed, multi-word object in
+ its own right, sitting inside a boxed 'HashSet' HAMT leaf, per row. Worse,
+ real graphs (this benchmark included, at 300 distinct source keys against
+ ~200k dependent rows) see the *same* @(key, version)@ pair observed by many
+ rows at once, and nothing before this deduplicated that: every row got its
+ own separate heap copy of an equal value.
+
+ This module now interns 'AnyCompSrcDep' values to small 'Int' ids (a
+ per-def 'SrcDepIntern': forward @'HashMap' 'AnyCompSrcDep' 'Int'@, reverse
+ growable boxed vector for the @Int -> AnyCompSrcDep@ direction, ids
+ assigned monotonically) and stores a row's src-dep set as an interned-id
+ CSR arena -- the exact same 'EdgeArena' machinery @compDeps@/@rdeps@ already
+ use above (stride 1, ids narrow enough to fit the arena's 'Word64' words
+ with room to spare), rather than inventing a third storage shape. A row's
+ set is now a handful of unboxed words indexing into a small, heavily-shared
+ table instead of a private boxed structure duplicated per row.
+
+ __Ids are never recycled__ -- the same tradeoff Stage 1's original global
+ intern table made (docs/benchmark-notes.md, "Stage 1"), deliberately not
+ revisited here: unlike row ids (recycled because row *churn* is the
+ engine's whole workload) or hash-index slots (recycled because tombstones
+ would degrade probe length under exactly that churn), a src-dep id's
+ *value space* is expected to stay small relative to the row count for any
+ realistic graph (the task brief's assumption, matching this benchmark's
+ 300 keys against ~200k dependent rows) -- so a forward/reverse table that
+ only ever grows is cheap in absolute terms even though, unlike everything
+ else in this module, nothing here ever shrinks it. A workload whose source
+ versions churn through effectively unbounded distinct values over a long
+ process lifetime would grow this table without bound; that is an honest,
+ accepted limitation of this design, not a hidden one -- see
+ docs/benchmark-notes.md's Stage-4 entry for this item for the numbers that
+ justified accepting it.
+
+ __What this does and does not change.__ 'readSrcDeps'/'writeSrcDeps' keep
+ their exact prior signatures (@'DefTable' p a -> 'Int' -> 'IO' ('HashSet'
+ 'AnyCompSrcDep')@ and the writing dual) -- intern/decode happens entirely
+ inside them, invisible to "SimpleStateIf.hs", which needed zero edits (the
+ same "column access boundary absorbs the representation change" property
+ 4b/4c/4d established). Row freeing is unchanged too: a freed row's src-dep
+ arena span is left as orphaned garbage, reclaimed the next time that def's
+ arena compacts, exactly like @compDeps@/@rdeps@ -- this module's own
+ interned ids stay valid forever (never recycled, so a stale span's ids are
+ always still resolvable, just briefly pointing at data nothing references
+ any more), so there is no dangling-id hazard from deferring the reclaim.
+ What SimpleStateIf.hs's own @sifs_srcIndex@ tracks (which rows currently
+ depend on which source key, and when a key becomes wholly unclaimed and
+ should be reported as garbage/unregistered) is entirely untouched by any
+ of this -- that bookkeeping only ever sees fully-decoded 'AnyCompSrcDep'
+ values via the unchanged read/write API, so dead-source-key reporting and
+ 'CompSrc.compSrcUnregister' triggering keep working exactly as before.
+
  = Row lifecycle and reuse
 
  A freed row is pushed onto a free list and its 'flags' cleared (not-alive,
@@ -236,7 +297,13 @@ where
 -- LOCAL
 ----------------------------------------
 
-import Control.Computations.CompEngine.CompSrc (AnyCompSrcDep)
+import Control.Computations.CompEngine.CompSrc (
+  AnyCompSrcDep,
+  CompSrc (..),
+  CompSrcInstanceId (..),
+  Dep (..),
+  wrapCompSrcDep,
+ )
 import Control.Computations.Utils.Hash (Hash128 (..), largeHash128)
 
 ----------------------------------------
@@ -244,14 +311,17 @@ import Control.Computations.Utils.Hash (Hash128 (..), largeHash128)
 ----------------------------------------
 
 import Control.Applicative ((<|>))
+import Control.Concurrent.STM (retry)
 import Control.Monad (forM_, when)
 import Data.Bits
 import qualified Data.HashMap.Strict as HashMap
 import Data.HashSet (HashSet)
 import qualified Data.HashSet as HashSet
+import Data.Hashable (Hashable (..))
 import Data.IORef
 import Data.Int (Int32)
 import qualified Data.LargeHashable as LH
+import Data.String (fromString)
 import Data.Type.Equality ((:~:) (Refl))
 import Data.Typeable (Typeable, eqT)
 import qualified Data.Vector.Generic.Mutable as GM
@@ -756,6 +826,61 @@ hixBackwardShift table cap getHash i0 = go i0 i0
             go j j -- the hole moved to j; continue scanning from there
 
 --
+-- Src-dep interning -- see the module haddock's "Src-dep interning" section
+-- for the full design rationale. A per-def AnyCompSrcDep <-> Int table;
+-- ids are assigned monotonically and never recycled (an accepted, explicit
+-- tradeoff -- see the haddock).
+--
+
+data SrcDepIntern = SrcDepIntern
+  { sdi_forward :: !(IORef (HashMap.HashMap AnyCompSrcDep Int))
+  , sdi_reverse :: !(IORef (VM.IOVector AnyCompSrcDep))
+  -- ^ Int -> AnyCompSrcDep; grown like any other boxed column, never
+  -- shrunk. Freshly-grown capacity is the usual uninitialised-element error
+  -- thunk, but is never read there: 'sdiResolve' only ever reads indices
+  -- below 'sdi_count', which are always written by 'sdiIntern' before being
+  -- handed out.
+  , sdi_count :: !(IORef Int)
+  -- ^ next id to assign; also the valid-index bound for 'sdiResolve'.
+  }
+
+newSrcDepIntern :: IO SrcDepIntern
+newSrcDepIntern =
+  SrcDepIntern
+    <$> newIORef HashMap.empty
+    <*> (newIORef =<< VM.new 0)
+    <*> newIORef 0
+
+-- | Look up @dep@'s interned id, assigning a fresh one on a miss (appended
+-- to the reverse table; ids are never recycled, see the module haddock).
+sdiIntern :: SrcDepIntern -> AnyCompSrcDep -> IO Int
+sdiIntern sdi dep = do
+  fwd <- readIORef (sdi_forward sdi)
+  case HashMap.lookup dep fwd of
+    Just i -> pure i
+    Nothing -> do
+      i <- readIORef (sdi_count sdi)
+      growBoxed (sdi_reverse sdi) (i + 1)
+      rv <- readIORef (sdi_reverse sdi)
+      VM.write rv i dep
+      writeIORef (sdi_count sdi) (i + 1)
+      writeIORef (sdi_forward sdi) (HashMap.insert dep i fwd)
+      pure i
+
+-- | Resolve an interned id back to its 'AnyCompSrcDep'. Fails loudly on an
+-- out-of-range id -- every id stored in a row's arena span was written by
+-- 'sdiIntern' immediately after being assigned and ids are never recycled,
+-- so a valid id is always resolvable (mirrors Stage 1's
+-- @Utils.Intern.resolve@ dead-id contract).
+sdiResolve :: SrcDepIntern -> Int -> IO AnyCompSrcDep
+sdiResolve sdi i = do
+  count <- readIORef (sdi_count sdi)
+  when (i < 0 || i >= count) $
+    error ("DefTable.sdiResolve: interned src-dep id " ++ show i ++ " out of range (bug)")
+  rv <- readIORef (sdi_reverse sdi)
+  VM.read rv i
+
+--
 -- The table
 --
 
@@ -784,7 +909,11 @@ data DefTable p a = DefTable
   , dt_rdeps :: !EdgeArena
   -- ^ flat reverse comp-dep edges (packed 'DefRef's depending on this
   -- row), stride 1.
-  , dt_srcDeps :: !(IORef (VM.IOVector (HashSet AnyCompSrcDep)))
+  , dt_srcDeps :: !EdgeArena
+  -- ^ flat interned src-dep ids, stride 1 -- see the module haddock's
+  -- "Src-dep interning" section.
+  , dt_srcDepIntern :: !SrcDepIntern
+  -- ^ this def's own @AnyCompSrcDep <-> Int@ table backing 'dt_srcDeps'.
   , dt_index :: !HashIndex
   -- ^ this def's own param-hash -> row index (its share of what used to be
   -- one global intern table). Open addressing over row ids only -- no
@@ -804,7 +933,8 @@ new = do
   va <- mkColumn
   cd <- newEdgeArena
   rd <- newEdgeArena
-  sd <- newIORef =<< VM.new 0
+  sd <- newEdgeArena
+  sdi <- newSrcDepIntern
   ix <- newHashIndex
   fr <- newIORef []
   ln <- newIORef 0
@@ -818,6 +948,7 @@ new = do
       , dt_compDeps = cd
       , dt_rdeps = rd
       , dt_srcDeps = sd
+      , dt_srcDepIntern = sdi
       , dt_index = ix
       , dt_free = fr
       , dt_len = ln
@@ -832,7 +963,7 @@ growAllTo dt needed = do
   colGrow needed (dt_value dt)
   eaGrowRows (dt_compDeps dt) needed
   eaGrowRows (dt_rdeps dt) needed
-  growBoxed (dt_srcDeps dt) needed
+  eaGrowRows (dt_srcDeps dt) needed
 
 -- | The table's current logical row count (rows 0 until this are valid
 -- indices, though not all are necessarily alive -- see 'isAlive').
@@ -979,11 +1110,25 @@ writeRdeps dt row xs = do
   n <- rowCount dt
   eaWrite (dt_rdeps dt) row (isAlive dt) n 1 (VU.map fromIntegral xs)
 
+-- | Decode a row's interned src-dep arena span back into a 'HashSet' of
+-- full 'AnyCompSrcDep' values -- see the module haddock's "Src-dep
+-- interning" section. Callers outside this module never see an interned
+-- id.
 readSrcDeps :: DefTable p a -> Int -> IO (HashSet AnyCompSrcDep)
-readSrcDeps dt row = readIORef (dt_srcDeps dt) >>= \v -> VM.read v row
+readSrcDeps dt row = do
+  flat <- eaRead (dt_srcDeps dt) row 1
+  deps <- mapM (sdiResolve (dt_srcDepIntern dt) . fromIntegral) (VU.toList flat)
+  pure (HashSet.fromList deps)
 
+-- | Intern every element of @s@ (assigning fresh ids on a miss -- see
+-- 'sdiIntern') and overwrite the row's entire src-dep span with the
+-- resulting ids, exactly like 'writeCompDeps'/'writeRdeps' do for their own
+-- edge columns.
 writeSrcDeps :: DefTable p a -> Int -> HashSet AnyCompSrcDep -> IO ()
-writeSrcDeps dt row s = readIORef (dt_srcDeps dt) >>= \v -> VM.write v row s
+writeSrcDeps dt row s = do
+  ids <- mapM (sdiIntern (dt_srcDepIntern dt)) (HashSet.toList s)
+  n <- rowCount dt
+  eaWrite (dt_srcDeps dt) row (isAlive dt) n 1 (VU.fromList (map fromIntegral ids))
 
 --
 -- Tests
@@ -1234,6 +1379,107 @@ test_noResultSentinelDoesNotCollideWithRealHashes =
   mapM_
     (\i -> assertBool (hashToPair (h i) /= noResultSentinel))
     [1 .. 50 :: Int]
+
+--
+-- Src-dep interning: a minimal 'CompSrc' instance for building real
+-- 'AnyCompSrcDep' test values (mirrors Tests/TestStateIf.hs's
+-- @TestStateSrc@), plus tests covering the interned-CSR-arena
+-- representation directly against the module's internals (this file's own
+-- test section has access to 'SrcDepIntern', unlike SimpleStateIf.hs which
+-- only ever sees decoded 'HashSet' 'AnyCompSrcDep' values through the
+-- unchanged public API).
+--
+
+data TestSrc = TestSrc deriving (Show, Eq, Typeable)
+
+data VoidRequest a
+
+instance Hashable TestSrc where
+  hashWithSalt s TestSrc = hashWithSalt s (0 :: Int)
+
+instance CompSrc TestSrc where
+  type CompSrcReq TestSrc = VoidRequest
+  type CompSrcKey TestSrc = String
+  type CompSrcVer TestSrc = Int
+  compSrcInstanceId _ = CompSrcInstanceId (fromString "TestSrc")
+  compSrcExecute _ act = case act of {}
+  compSrcUnregister _ _ = pure ()
+  compSrcWaitChanges _ = retry
+
+srcDep :: String -> Int -> AnyCompSrcDep
+srcDep k v = wrapCompSrcDep TestSrc (Dep k v)
+
+test_srcDepsRoundTrip :: IO ()
+test_srcDepsRoundTrip = do
+  dt <- newTest
+  (r, _) <- lookupOrInsertRow dt (h 1) 1
+  let s = HashSet.fromList [srcDep "a" 1, srcDep "b" 1]
+  writeSrcDeps dt r s
+  got <- readSrcDeps dt r
+  assertEqual s got
+
+-- | The same @(key, version)@ pair, written by two different rows, must be
+-- interned exactly once -- this is the whole point of the rewrite (see the
+-- module haddock's "Src-dep interning" section): rows sharing a source dep
+-- share one heap copy via a small shared id, not a private copy each.
+test_srcDepsInterningDedupesEqualValues :: IO ()
+test_srcDepsInterningDedupesEqualValues = do
+  dt <- newTest
+  (r1, _) <- lookupOrInsertRow dt (h 1) 1
+  (r2, _) <- lookupOrInsertRow dt (h 2) 2
+  writeSrcDeps dt r1 (HashSet.singleton (srcDep "shared" 1))
+  writeSrcDeps dt r2 (HashSet.singleton (srcDep "shared" 1))
+  count <- readIORef (sdi_count (dt_srcDepIntern dt))
+  assertEqual 1 count
+  got1 <- readSrcDeps dt r1
+  got2 <- readSrcDeps dt r2
+  assertEqual (HashSet.singleton (srcDep "shared" 1)) got1
+  assertEqual (HashSet.singleton (srcDep "shared" 1)) got2
+
+-- | Distinct src deps get distinct ids -- including the case that actually
+-- drives real-world interning table growth: the *same key* observed at a
+-- *different version* is a genuinely distinct 'AnyCompSrcDep' (see
+-- CompSrc.hs's @SomeCompSrcDep@, which wraps key and version together), not
+-- deduplicated against the old version.
+test_srcDepsDistinctValuesGetDistinctIds :: IO ()
+test_srcDepsDistinctValuesGetDistinctIds = do
+  dt <- newTest
+  (r, _) <- lookupOrInsertRow dt (h 1) 1
+  writeSrcDeps dt r (HashSet.fromList [srcDep "k" 1, srcDep "k" 2, srcDep "other" 1])
+  count <- readIORef (sdi_count (dt_srcDepIntern dt))
+  assertEqual 3 count
+  got <- readSrcDeps dt r
+  assertEqual (HashSet.fromList [srcDep "k" 1, srcDep "k" 2, srcDep "other" 1]) got
+
+-- | Overwriting a row's src deps repeatedly (the live-update path's actual
+-- write pattern) must keep reading back the *latest* set, and must force at
+-- least one compaction of the shared arena along the way -- exercising the
+-- same append-new-span/mark-old-span-dead machinery 'writeCompDeps'/
+-- 'writeRdeps' already get covered for, now via the interned-id path.
+test_srcDepsManyOverwritesKeepLatestCorrectAndCompact :: IO ()
+test_srcDepsManyOverwritesKeepLatestCorrectAndCompact = do
+  dt <- newTest
+  (r, _) <- lookupOrInsertRow dt (h 1) 1
+  mapM_
+    (\i -> writeSrcDeps dt r (HashSet.singleton (srcDep "churn" i)))
+    [1 .. 5000 :: Int]
+  got <- readSrcDeps dt r
+  assertEqual (HashSet.singleton (srcDep "churn" 5000)) got
+
+-- | A freed row's src-dep arena span becomes orphaned garbage (like
+-- @compDeps@/@rdeps@); its interned ids stay resolvable (never recycled),
+-- but a *fresh* occupant of the recycled row number must never see the old
+-- occupant's src deps.
+test_srcDepsResetOnRowReuse :: IO ()
+test_srcDepsResetOnRowReuse = do
+  dt <- newTest
+  (r1, _) <- lookupOrInsertRow dt (h 1) 1
+  writeSrcDeps dt r1 (HashSet.singleton (srcDep "old" 1))
+  freeRow dt (h 1) r1
+  (r2, _) <- lookupOrInsertRow dt (h 2) 2
+  assertEqual r1 r2
+  got <- readSrcDeps dt r2
+  assertEqual HashSet.empty got
 
 --
 -- Row reuse and garbage tolerance (Rust Stage 5's rules, ported): freeing a
