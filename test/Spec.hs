@@ -6,7 +6,6 @@ import Test.Framework
 
 -- Generate with
 -- egrep -R -l '^(test|prop)_' src | sed 's|src/||g; s|/|.|g; s|.hs$||g' | sort -u | gawk '{ printf "import {-@ HTF_TESTS @-} %s\n", $0 }'
-import {-@ HTF_TESTS @-} Control.Computations.CompEngine.CompFlowRegistry
 import {-@ HTF_TESTS @-} Control.Computations.CompEngine.Tests.TestCompEngine
 import {-@ HTF_TESTS @-} Control.Computations.CompEngine.Tests.TestDriver
 import {-@ HTF_TESTS @-} Control.Computations.CompEngine.Tests.TestOutputs
@@ -19,7 +18,7 @@ import {-@ HTF_TESTS @-} Control.Computations.CompEngine.Utils.PriorityAgingQueu
 import {-@ HTF_TESTS @-} Control.Computations.CompEngine.Utils.SrcIndex
 import {-@ HTF_TESTS @-} Control.Computations.FlowImpls.FileSink
 import {-@ HTF_TESTS @-} Control.Computations.FlowImpls.FileSrc
-import {-@ HTF_TESTS @-} Control.Computations.FlowImpls.TimeSrc
+import {-@ HTF_TESTS @-} Control.Computations.FlowImpls.TimeSrcTest
 import {-@ HTF_TESTS @-} Control.Computations.Utils.DataSizeTest
 import {-@ HTF_TESTS @-} Control.Computations.Utils.DispatcherTest
 import {-@ HTF_TESTS @-} Control.Computations.Utils.FailTest

@@ -1,6 +1,5 @@
 {-# LANGUAGE ExistentialQuantification #-}
 {-# LANGUAGE RankNTypes #-}
-{-# OPTIONS_GHC -F -pgmF htfpp #-}
 
 module Control.Computations.CompEngine.CompFlowRegistry (
   CompFlowRegistry,
@@ -16,7 +15,6 @@ module Control.Computations.CompEngine.CompFlowRegistry (
   unregisterCompSink,
   allCompSrcChanges,
   Blocking (..),
-  htf_thisModulesTests,
 )
 where
 
@@ -43,7 +41,6 @@ import Data.HashSet (HashSet)
 import qualified Data.HashSet as HashSet
 import Data.Proxy
 import Data.Typeable
-import Test.Framework
 
 data RegState = RegState
   { rs_srcs :: HashMap CompSrcId AnyCompSrc
