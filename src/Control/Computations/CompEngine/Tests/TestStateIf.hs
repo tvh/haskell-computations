@@ -127,6 +127,58 @@ test_capBecomesStaleDuringComputationBecauseDependencyChanges =
       -- root now indirectly depends on two versions of foo and thus SHOULD be stale after the run
       dequeueNextCap sif >>= liftIO . assertEqual (Just (wrapCompAp root1))
 
+{- | The engine-level version of DefTable.hs's own
+ @test_versionChurnOnSingleRowKeepsInternTableBounded@: drive many version
+ bumps of the same source key against a single cap through the real
+ @capEvaluation@ round trip (started -> finished, exactly like the driver
+ loop calls it) and assert the interned src-dep table never accumulates
+ more than the one currently-referenced version -- Part 1's refcounting fix,
+ exercised end to end rather than against 'Control.Computations.CompEngine.Utils.DefTable.DefTable'
+ directly. Before the fix this would grow without bound (one id per
+ distinct @(key, version)@ pair ever observed, docs/benchmark-notes.md's
+ Stage 4e "accepted limitation").
+-}
+test_srcDepInternTableStaysBoundedAcrossVersionChurn :: IO ()
+test_srcDepInternTableStaysBoundedAcrossVersionChurn = do
+  st <- newSifState
+  let stateIf = mkSimpleCompEngineStateIf (SimpleStateIf{ssif_withState = \f -> f st})
+  c0 <- debugTotalSrcDepInternLiveCount st
+  assertEqual 0 c0
+  mapM_ (\v -> capEvaluation stateIf foo1 (mkExtDeps [("ext", v)]) jval1) [1 .. 2000 :: Int]
+  c1 <- debugTotalSrcDepInternLiveCount st
+  -- only the latest version of "ext" is still referenced by foo1
+  assertEqual 1 c1
+
+{- | The same churn, but across many distinct caps all sharing the *same*
+ source key at the *same* version at any given moment (so the live-set
+ size stays at 1 shared id throughout, even as N rows all reference it) --
+ checks that fan-in sharing (this codebase's own benchmark graph: 300
+ source keys against ~200k dependent rows, docs/benchmark-notes.md's Stage
+ 4e) doesn't inflate the live count past the number of distinct values
+ actually referenced, and that freeing every dependent by moving them all
+ off the key (via a version bump none of them re-register against) drains
+ it back to zero.
+-}
+test_srcDepInternTableSharedAcrossManyCapsStaysBoundedAndDrains :: IO ()
+test_srcDepInternTableSharedAcrossManyCapsStaysBoundedAndDrains = do
+  st <- newSifState
+  let stateIf = mkSimpleCompEngineStateIf (SimpleStateIf{ssif_withState = \f -> f st})
+      caps = [mkCompAp barComp i | i <- [1 .. 50 :: Int]]
+  mapM_ (\cap -> capEvaluation stateIf cap (mkExtDeps [("shared", 1)]) jval1) caps
+  c1 <- debugTotalSrcDepInternLiveCount st
+  assertEqual 1 c1
+  -- bump the version several times, re-registering every cap against the
+  -- latest each time -- the live count must stay at 1 throughout, not grow
+  -- per bump.
+  mapM_
+    ( \v -> do
+        _ <- enqueueStaleCaps stateIf (mkExtDeps [("shared", v)])
+        mapM_ (\cap -> capEvaluation stateIf cap (mkExtDeps [("shared", v)]) jval1) caps
+    )
+    [2 .. 20 :: Int]
+  c2 <- debugTotalSrcDepInternLiveCount st
+  assertEqual 1 c2
+
 test_gc :: IO ()
 test_gc =
   prepareTest $ \sif ->

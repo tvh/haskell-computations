@@ -91,6 +91,7 @@ module Control.Computations.CompEngine.SimpleStateIf (
   mkSimpleCompEngineStateIf,
   newSifState,
   validateSifState,
+  debugTotalSrcDepInternLiveCount,
 )
 where
 
@@ -228,6 +229,18 @@ validateSifState st = do
           flags <- DT.readFlags dt targetRow
           unless (DT.flagsAlive flags) $
             fail (what ++ " points at dead row " ++ show (targetDef, targetRow))
+
+{- | Debug/test-only: total number of currently-live interned src-dep ids
+ summed across every def's own 'DT.DefTable' (i.e. 'DT.srcDepInternLiveCount'
+ per def, added). Exists purely so an engine-level test
+ (Tests/TestStateIf.hs) can assert Part 1's refcounting fix holds through
+ the real @capEvaluation@/@capEvaluationFinished@ API -- not part of
+ 'CompEngineStateIf', never called by "Impl.hs" or "Run.hs".
+-}
+debugTotalSrcDepInternLiveCount :: SifState -> IO Int
+debugTotalSrcDepInternLiveCount st = do
+  defs <- readIORef (sifs_defs st)
+  sum <$> mapM (\(SomeDefEntry _ dt) -> DT.srcDepInternLiveCount dt) (IntMap.elems defs)
 
 mkSimpleCompEngineStateIf
   :: (MonadIO m)
