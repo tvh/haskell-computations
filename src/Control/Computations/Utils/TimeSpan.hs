@@ -1,7 +1,5 @@
-{-# OPTIONS_GHC -F -pgmF htfpp #-}
-
 module Control.Computations.Utils.TimeSpan (
-  TimeSpan,
+  TimeSpan (..),
   zeroTime,
   isPositiveTimeSpan,
   isInRange,
@@ -31,7 +29,9 @@ module Control.Computations.Utils.TimeSpan (
   plusTimeSpan,
   multiplyTimeSpan,
   parseTimeSpan,
-  htf_thisModulesTests,
+  timeSpanP,
+  parseM,
+  parseM',
 ) where
 
 ----------------------------------------
@@ -142,12 +142,6 @@ instance Show TimeSpan where
     two :: Integer
     two = 2
 
-test_showTimeSpan :: IO ()
-test_showTimeSpan =
-  do
-    assertEqual "1ms1us" (show $ TimeSpan 1001)
-    assertEqual "1days1us" (show $ days 1 `plusTimeSpan` microseconds 1)
-
 timeSpanP :: Parser TimeSpan
 timeSpanP =
   do
@@ -177,30 +171,6 @@ timeSpanP =
   toMin num = 1000 ^ two * 60 * num
   toDays num = 1000 ^ two * 60 ^ two * 24 * num
   two = 2 :: Integer
-
-test_timeSpanP :: IO ()
-test_timeSpanP =
-  do
-    assertEqual (Ok $ minutes 3) (parseM timeSpanP "" "3m")
-    assertEqual (Ok $ minutes 3) (parseM timeSpanP "" "3min")
-    assertEqual (Ok $ days (-1)) (parseM timeSpanP "" "-1days")
-    assertEqual (Ok $ days (-1)) (parseM timeSpanP "" "-1d")
-    assertEqual (Ok (days (-1), " ")) (parseM' timeSpanP "" " -1d ")
-    assertEqual (Ok $ days (-1) `plusTimeSpan` hours (-1)) (parseM timeSpanP "" "-1days1h")
-    assertEqual (Ok $ days 0) (parseM timeSpanP "" " 0us")
-    assertEqual (Ok longTime) (parseM timeSpanP "" "3days3h2s999ms998us")
-    assertBool $ isFail (parseM timeSpanP "" "-1days-1h")
-    assertBool $ isFail (parseM timeSpanP "" "-1days 1h")
- where
-  longTime =
-    foldr
-      plusTimeSpan
-      (days 0)
-      [days 3, hours 3, seconds 2, milliseconds 999, microseconds 998]
-
-prop_timeSpanP :: TimeSpan -> Bool
-prop_timeSpanP f =
-  parseM timeSpanP "" (showText f) == Ok f
 
 -- Note: 'prop_readShow' (round-tripping via 'read'/'show') used to live
 -- here alongside a 'Read TimeSpan' instance. Now that 'Read TimeSpan' is

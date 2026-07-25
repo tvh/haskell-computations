@@ -4,7 +4,6 @@
 {-# LANGUAGE Rank2Types #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE UndecidableInstances #-}
-{-# OPTIONS_GHC -F -pgmF htfpp #-}
 {-# OPTIONS_GHC -fno-warn-orphans #-}
 
 module Control.Computations.Utils.Fail (
@@ -48,7 +47,6 @@ module Control.Computations.Utils.Fail (
   eitherToFail,
   fromFailString,
   partitionFails,
-  htf_thisModulesTests,
   Fail.MonadFail,
 ) where
 
@@ -88,7 +86,6 @@ import qualified Data.LargeHashable as LH
 import Data.String
 import qualified Data.Text as T
 import GHC.Generics
-import Test.Framework hiding (whenFail)
 import Prelude
 
 data Fail a
@@ -453,16 +450,6 @@ partitionFails l = go l ([], [])
         go rest (x : good, bad)
       (Fail s : rest) ->
         go rest (good, s : bad)
-
-test_partitionFails :: IO ()
-test_partitionFails =
-  do
-    assertEqual ([] :: [Int], []) (partitionFails [])
-    assertEqual ([1 :: Int], []) (partitionFails [Ok 1])
-    assertEqual ([] :: [Int], ["bad"]) (partitionFails [Fail "bad"])
-    assertEqual
-      ([1, 2, 3 :: Int], ["bad1", "bad2"])
-      (partitionFails [Ok 1, Fail "bad1", Ok 2, Ok 3, Fail "bad2"])
 
 eitherToError :: MonadError e m => Either e a -> m a
 eitherToError = either throwError return

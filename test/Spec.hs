@@ -20,15 +20,15 @@ import {-@ HTF_TESTS @-} Control.Computations.CompEngine.Utils.SrcIndex
 import {-@ HTF_TESTS @-} Control.Computations.FlowImpls.FileSink
 import {-@ HTF_TESTS @-} Control.Computations.FlowImpls.FileSrc
 import {-@ HTF_TESTS @-} Control.Computations.FlowImpls.TimeSrc
-import {-@ HTF_TESTS @-} Control.Computations.Utils.DataSize
-import {-@ HTF_TESTS @-} Control.Computations.Utils.Dispatcher
-import {-@ HTF_TESTS @-} Control.Computations.Utils.Fail
+import {-@ HTF_TESTS @-} Control.Computations.Utils.DataSizeTest
+import {-@ HTF_TESTS @-} Control.Computations.Utils.DispatcherTest
+import {-@ HTF_TESTS @-} Control.Computations.Utils.FailTest
 import {-@ HTF_TESTS @-} Control.Computations.Utils.FileStore.Tests
 import {-@ HTF_TESTS @-} Control.Computations.Utils.FileWatch
 import {-@ HTF_TESTS @-} Control.Computations.Utils.IOUtils
 import {-@ HTF_TESTS @-} Control.Computations.Utils.MultiMap
 import {-@ HTF_TESTS @-} Control.Computations.Utils.MultiSet
-import {-@ HTF_TESTS @-} Control.Computations.Utils.TimeSpan
+import {-@ HTF_TESTS @-} Control.Computations.Utils.TimeSpanTest
 
 main :: IO ()
 main = do
