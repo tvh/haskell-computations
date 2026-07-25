@@ -117,6 +117,54 @@
  "SimpleStateIf.hs"'s module haddock. Only the storage layout changed; nothing
  was dropped to save bytes.
 
+ = Hash index: open addressing over the existing hash column
+
+ The old per-def index was a persistent 'Data.HashMap.Strict.HashMap'
+ 'Hash128' 'Int' -- a HAMT leaf plus a boxed 'Hash128' key and boxed 'Int'
+ value per entry, every one of them traced by every major GC, even though
+ the key is pure duplication: every row's param hash already lives in the
+ unboxed @param_hash@ column above. 'HashIndex' replaces it with a
+ hand-rolled open-addressing table that stores only row ids
+ ('Data.Int.Int32', @-1@ the empty-slot sentinel) in a flat
+ 'Data.Vector.Unboxed.Mutable.IOVector' -- no key storage, no boxing,
+ nothing for the GC to trace.
+
+ __Probe scheme.__ A candidate slot for hash @h@ is @w128_first h .\&.
+ (capacity - 1)@ (capacity is always a power of two, so this is @mod@ via a
+ mask) -- MD5-derived hashes (this codebase's only hash source, see
+ "Utils/Hash.hs") are already uniformly distributed, so either 64-bit half
+ works equally well as the slot seed; the high word was picked arbitrarily.
+ Collisions resolve by linear probing (slot, slot+1, ... wrapping mod
+ capacity). A probe candidate is verified by reading the *existing*
+ @param_hash@ column for the row id stored at that slot and comparing the
+ full 128-bit hash against it -- exactly the redundant-key trick this
+ module is built around: the table never needs to store or compare against
+ a second copy of the key.
+
+ __Growth.__ Capacity starts at 8 and doubles whenever an insert would push
+ the load factor (@(count+1) \/ capacity@) past 0.7; growing rebuilds a
+ fresh table and reinserts every currently-occupied row id at its new slot
+ (no key copies to move, since the table holds no keys -- only a row id and
+ a lookup of that row's own @param_hash@ column entry).
+
+ __Deletion: backward-shift, not tombstones.__ Rows are freed constantly on
+ this engine's live-update path (recompute invalidates a row, a fresh param
+ hash allocates a new one), so a tombstone strategy would accumulate dead
+ markers under exactly the workload this table sees most -- degrading probe
+ length over the life of the process with no reclamation short of a full
+ rehash. Backward-shift deletion avoids that: removing an entry clears its
+ slot, then walks forward relocating any subsequent entry whose ideal slot
+ no longer cyclically requires the gap left behind (i.e. an entry a plain
+ linear probe could no longer find past the new hole) back into the hole,
+ opening a fresh hole where that entry used to sit, until a genuinely empty
+ slot is reached -- the standard argument for why linear probing never
+ needs tombstones. The net effect: repeated free/reuse churn (this module's
+ own row-lifecycle contract, exercised by the live-update benchmark tens of
+ thousands of times over) never grows the table's dead-slot fraction --
+ capacity only ever grows in response to genuine live-entry growth, never
+ in response to churn. See 'hixBackwardShift' for the algorithm (Knuth's
+ backward-shift deletion for linear probing, adapted to not store keys).
+
  = Row lifecycle and reuse
 
  A freed row is pushed onto a free list and its 'flags' cleared (not-alive,
@@ -196,7 +244,6 @@ import Control.Computations.Utils.Hash (Hash128 (..), largeHash128)
 
 import Control.Monad (forM_, when)
 import Data.Bits
-import Data.HashMap.Strict (HashMap)
 import qualified Data.HashMap.Strict as HashMap
 import Data.HashSet (HashSet)
 import qualified Data.HashSet as HashSet
@@ -471,6 +518,173 @@ eaWrite ea row isRowAlive rows stride flat = do
   maybeCompact ea isRowAlive rows stride
 
 --
+-- Open-addressing hash->row index -- see the module haddock's "Hash index"
+-- section for the full design rationale. Deliberately generic over how a
+-- row's hash is fetched (a `getHash` callback) rather than hardwired to
+-- `DefTable`'s own `dt_paramHash` column, so it can be built and tested in
+-- isolation from the rest of the table.
+--
+
+-- | Sentinel marking an empty slot. Real row ids are always >= 0 (they come
+-- from 'allocRow', a monotonic-or-recycled non-negative counter), so -1
+-- can never collide with a genuine occupant.
+hixEmpty :: Int32
+hixEmpty = -1
+
+-- | Starting capacity for a fresh index (a fresh 'DefTable' allocates one
+-- of these per def, including many-small-defs, so this stays small).
+hixInitialCap :: Int
+hixInitialCap = 8
+
+-- | Grow once occupancy would exceed this fraction of capacity.
+hixLoadFactor :: Double
+hixLoadFactor = 0.7
+
+data HashIndex = HashIndex
+  { hix_table :: !(IORef (VUM.IOVector Int32))
+  , hix_count :: !(IORef Int)
+  -- ^ number of occupied slots; tracked separately rather than derived by
+  -- scanning, since backward-shift deletion (no tombstones) makes
+  -- "occupied slot count" and "live entry count" the same thing at all
+  -- times.
+  }
+
+newHashIndex :: IO HashIndex
+newHashIndex = do
+  v <- VUM.new hixInitialCap
+  VUM.set v hixEmpty
+  HashIndex <$> newIORef v <*> newIORef 0
+
+-- | The slot a hash probes first. Capacity is always a power of two, so
+-- @mod@ is a bitmask. Uses the hash's high word arbitrarily -- MD5 output
+-- (this codebase's only hash source) is uniform in either half; see the
+-- module haddock's "Hash index" section.
+hixSlot :: Int -> Hash128 -> Int
+hixSlot cap (Hash128 w) = fromIntegral (LH.w128_first w) .&. (cap - 1)
+{-# INLINE hixSlot #-}
+
+-- | Walk the probe sequence for @h@ against a concrete table, returning the
+-- slot and row id of the matching entry (verified via @getHash@, not a
+-- stored key -- there isn't one), or 'Nothing' once the sequence reaches an
+-- empty slot. Shared by 'hixLookup' (wants the row) and 'hixDelete' (wants
+-- the slot, to start the backward-shift walk from).
+hixProbe :: VUM.IOVector Int32 -> (Int -> IO Hash128) -> Hash128 -> IO (Maybe (Int, Int))
+hixProbe table getHash h = go start 0
+ where
+  cap = VUM.length table
+  start = hixSlot cap h
+  go i steps
+    | steps >= cap = pure Nothing -- defensive: can't happen, load factor < 1 guarantees an empty slot
+    | otherwise = do
+        v <- VUM.read table i
+        if v == hixEmpty
+          then pure Nothing
+          else do
+            rh <- getHash (fromIntegral v)
+            if rh == h
+              then pure (Just (i, fromIntegral v))
+              else go ((i + 1) .&. (cap - 1)) (steps + 1)
+
+-- | Find the row currently indexed under @h@.
+hixLookup :: HashIndex -> (Int -> IO Hash128) -> Hash128 -> IO (Maybe Int)
+hixLookup hix getHash h = do
+  table <- readIORef (hix_table hix)
+  fmap snd <$> hixProbe table getHash h
+
+-- | Insert @row@ under @h@. Caller's responsibility: @h@ is not already
+-- present ('DefTable.lookupOrInsertRow' only calls this on a lookup miss).
+-- Grows first if this insert would cross the load factor.
+hixInsert :: HashIndex -> (Int -> IO Hash128) -> Hash128 -> Int -> IO ()
+hixInsert hix getHash h row = do
+  hixMaybeGrow hix getHash
+  table <- readIORef (hix_table hix)
+  let cap = VUM.length table
+      go i = do
+        v <- VUM.read table i
+        if v == hixEmpty
+          then VUM.write table i (fromIntegral row)
+          else go ((i + 1) .&. (cap - 1))
+  go (hixSlot cap h)
+  modifyIORef' (hix_count hix) (+ 1)
+
+hixMaybeGrow :: HashIndex -> (Int -> IO Hash128) -> IO ()
+hixMaybeGrow hix getHash = do
+  table <- readIORef (hix_table hix)
+  count <- readIORef (hix_count hix)
+  let cap = VUM.length table
+  when (fromIntegral (count + 1) > hixLoadFactor * fromIntegral cap) $
+    hixGrow hix getHash
+
+-- | Double capacity and reinsert every currently-occupied row id at its new
+-- slot. No keys to copy -- only row ids -- so this is a fresh table plus,
+-- per occupied old slot, one @getHash@ call (the row's own @param_hash@
+-- column entry) to find its new slot.
+hixGrow :: HashIndex -> (Int -> IO Hash128) -> IO ()
+hixGrow hix getHash = do
+  old <- readIORef (hix_table hix)
+  let oldCap = VUM.length old
+      newCap = oldCap * 2
+  new <- VUM.new newCap
+  VUM.set new hixEmpty
+  forM_ [0 .. oldCap - 1] $ \i -> do
+    v <- VUM.read old i
+    when (v /= hixEmpty) $ do
+      rh <- getHash (fromIntegral v)
+      insertFresh new newCap rh v
+  writeIORef (hix_table hix) new
+ where
+  insertFresh table cap rh row = go (hixSlot cap rh)
+   where
+    go i = do
+      w <- VUM.read table i
+      if w == hixEmpty
+        then VUM.write table i row
+        else go ((i + 1) .&. (cap - 1))
+
+-- | Remove the entry for @h@, then close the gap via backward-shift
+-- deletion. No-op if @h@ isn't present (defensive; callers are expected to
+-- only free a row they previously inserted).
+hixDelete :: HashIndex -> (Int -> IO Hash128) -> Hash128 -> IO ()
+hixDelete hix getHash h = do
+  table <- readIORef (hix_table hix)
+  found <- hixProbe table getHash h
+  case found of
+    Nothing -> pure ()
+    Just (slot, _row) -> do
+      let cap = VUM.length table
+      VUM.write table slot hixEmpty
+      modifyIORef' (hix_count hix) (subtract 1)
+      hixBackwardShift table cap getHash slot
+
+-- | Backward-shift deletion's gap-closing walk (Knuth's algorithm for
+-- linear probing without tombstones, adapted to verify candidates via
+-- @getHash@ rather than a stored key). @i@ starts at the position of the
+-- hole just opened; @j@ walks forward from it. An entry at @j@ whose ideal
+-- slot @k@ does /not/ cyclically fall in @(i, j]@ is one a plain linear
+-- probe could no longer find past the hole at @i@, so it is relocated back
+-- to @i@, opening a fresh hole at @j@; otherwise it is left alone and the
+-- walk continues. Terminates the first time @j@ reaches a genuinely empty
+-- slot.
+hixBackwardShift :: VUM.IOVector Int32 -> Int -> (Int -> IO Hash128) -> Int -> IO ()
+hixBackwardShift table cap getHash i0 = go i0 i0
+ where
+  go i jPrev = do
+    let j = (jPrev + 1) .&. (cap - 1)
+    vj <- VUM.read table j
+    if vj == hixEmpty
+      then pure ()
+      else do
+        hj <- getHash (fromIntegral vj)
+        let k = hixSlot cap hj
+            inRange = if i <= j then i < k && k <= j else i < k || k <= j
+        if inRange
+          then go i j -- entry at j stays reachable through the gap at i; keep scanning
+          else do
+            VUM.write table i vj
+            VUM.write table j hixEmpty
+            go j j -- the hole moved to j; continue scanning from there
+
+--
 -- The table
 --
 
@@ -498,9 +712,11 @@ data DefTable p a = DefTable
   -- ^ flat reverse comp-dep edges (packed 'DefRef's depending on this
   -- row), stride 1.
   , dt_srcDeps :: !(IORef (VM.IOVector (HashSet AnyCompSrcDep)))
-  , dt_index :: !(IORef (HashMap Hash128 Int))
+  , dt_index :: !HashIndex
   -- ^ this def's own param-hash -> row index (its share of what used to be
-  -- one global intern table)
+  -- one global intern table). Open addressing over row ids only -- no
+  -- stored key -- see the module haddock's "Hash index" section; probes
+  -- verify against the row's own @param_hash@ column entry.
   , dt_free :: !(IORef [Int])
   , dt_len :: !(IORef Int)
   -- ^ logical row count (<= every column's current capacity)
@@ -516,7 +732,7 @@ new = do
   cd <- newEdgeArena
   rd <- newEdgeArena
   sd <- newIORef =<< VM.new 0
-  ix <- newIORef HashMap.empty
+  ix <- newHashIndex
   fr <- newIORef []
   ln <- newIORef 0
   pure
@@ -573,13 +789,13 @@ allocRow dt = do
 -- Returns 'False' on a hit.
 lookupOrInsertRow :: forall p a. DefTable p a -> Hash128 -> p -> IO (Int, Bool)
 lookupOrInsertRow dt h p = do
-  idx <- readIORef (dt_index dt)
-  case HashMap.lookup h idx of
+  found <- hixLookup (dt_index dt) (readParamHash dt) h
+  case found of
     Just row -> pure (row, False)
     Nothing -> do
       row <- allocRow dt
-      modifyIORef' (dt_index dt) (HashMap.insert h row)
       writeHash (dt_paramHash dt) row h
+      hixInsert (dt_index dt) (readParamHash dt) h row
       writeParam dt row p
       writeFlags dt row (mkFlags True False NoResult)
       writeCompDeps dt row VU.empty
@@ -593,7 +809,7 @@ lookupOrInsertRow dt h p = do
 -- haddock's "Row lifecycle and reuse" section for why that's safe.
 freeRow :: DefTable p a -> Hash128 -> Int -> IO ()
 freeRow dt h row = do
-  modifyIORef' (dt_index dt) (HashMap.delete h)
+  hixDelete (dt_index dt) (readParamHash dt) h
   modifyIORef' (dt_free dt) (row :)
   writeFlags dt row 0
 
@@ -1014,3 +1230,206 @@ test_freedRowsDontResurfaceAfterCompaction = do
   assertEqual (VU.fromList [(3000, 3000, 3000)]) cd
   aliveDoomed <- isAlive dt rDoomed
   assertBool (not aliveDoomed)
+
+--
+-- Hash index: standalone tests against a small in-memory hash column (not
+-- routed through a full DefTable), covering insert/lookup/delete/grow and
+-- backward-shift's collision handling directly -- plus a couple of
+-- DefTable-level integration/churn tests at the end.
+--
+
+-- | A hash built from explicit hi\/lo words, for tests that need to force
+-- specific slots\/collisions deterministically rather than relying on
+-- 'largeHash128''s MD5 output landing where a test wants it.
+rawHash :: Word64 -> Word64 -> Hash128
+rawHash hi lo = Hash128 (LH.Word128 hi lo)
+
+-- | A tiny mutable row->hash table for standalone 'HashIndex' tests: plays
+-- the role 'DefTable''s own @param_hash@ column plays for the real thing.
+newHashColumn :: IO (IORef (VM.IOVector Hash128))
+newHashColumn = newIORef =<< VM.new 256
+
+setHashColumn :: IORef (VM.IOVector Hash128) -> Int -> Hash128 -> IO ()
+setHashColumn ref row hv = readIORef ref >>= \v -> VM.write v row hv
+
+getHashColumn :: IORef (VM.IOVector Hash128) -> Int -> IO Hash128
+getHashColumn ref row = readIORef ref >>= \v -> VM.read v row
+
+test_hashIndexLookupMissOnEmptyTable :: IO ()
+test_hashIndexLookupMissOnEmptyTable = do
+  hix <- newHashIndex
+  col <- newHashColumn
+  found <- hixLookup hix (getHashColumn col) (rawHash 1 1)
+  assertEqual Nothing found
+
+test_hashIndexInsertThenLookupFindsRow :: IO ()
+test_hashIndexInsertThenLookupFindsRow = do
+  hix <- newHashIndex
+  col <- newHashColumn
+  let hv = rawHash 42 42
+  setHashColumn col 5 hv
+  hixInsert hix (getHashColumn col) hv 5
+  found <- hixLookup hix (getHashColumn col) hv
+  assertEqual (Just 5) found
+
+test_hashIndexLookupMissForDifferentHash :: IO ()
+test_hashIndexLookupMissForDifferentHash = do
+  hix <- newHashIndex
+  col <- newHashColumn
+  let hv = rawHash 1 1
+  setHashColumn col 0 hv
+  hixInsert hix (getHashColumn col) hv 0
+  found <- hixLookup hix (getHashColumn col) (rawHash 2 2)
+  assertEqual Nothing found
+
+test_hashIndexDeleteThenLookupMisses :: IO ()
+test_hashIndexDeleteThenLookupMisses = do
+  hix <- newHashIndex
+  col <- newHashColumn
+  let hv = rawHash 7 7
+  setHashColumn col 3 hv
+  hixInsert hix (getHashColumn col) hv 3
+  hixDelete hix (getHashColumn col) hv
+  found <- hixLookup hix (getHashColumn col) hv
+  assertEqual Nothing found
+
+test_hashIndexDeleteOnMissingKeyIsNoOp :: IO ()
+test_hashIndexDeleteOnMissingKeyIsNoOp = do
+  hix <- newHashIndex
+  col <- newHashColumn
+  let hv = rawHash 9 9
+  setHashColumn col 0 hv
+  hixInsert hix (getHashColumn col) hv 0
+  -- deleting an absent key must not throw and must not disturb the real entry
+  hixDelete hix (getHashColumn col) (rawHash 123 456)
+  found <- hixLookup hix (getHashColumn col) hv
+  assertEqual (Just 0) found
+
+-- | Force several entries into the same initial-capacity (8) probe chain by
+-- picking hi words that collide mod 8, and check every entry is still
+-- individually findable -- exercises linear-probe collision resolution
+-- rather than the (overwhelmingly likely) no-collision case a few random
+-- inserts would hit.
+test_hashIndexCollisionsAllFindable :: IO ()
+test_hashIndexCollisionsAllFindable = do
+  hix <- newHashIndex
+  col <- newHashColumn
+  let his = [0, 8, 16, 24, 32] -- all `mod 8 == 0` at the initial capacity
+  mapM_
+    ( \(i, hiW) -> do
+        let hv = rawHash hiW 0
+        setHashColumn col i hv
+        hixInsert hix (getHashColumn col) hv i
+    )
+    (zip [0 ..] his)
+  mapM_
+    ( \(i, hiW) -> do
+        found <- hixLookup hix (getHashColumn col) (rawHash hiW 0)
+        assertEqual (Just i) found
+    )
+    (zip [0 ..] his)
+
+-- | Deleting the *middle* of a collision chain must not strand the entries
+-- that come after it in the probe sequence -- the case backward-shift
+-- deletion exists to handle (a plain "just clear the slot" delete would
+-- break their reachability).
+test_hashIndexDeleteMiddleOfCollisionChainKeepsOthersFindable :: IO ()
+test_hashIndexDeleteMiddleOfCollisionChainKeepsOthersFindable = do
+  hix <- newHashIndex
+  col <- newHashColumn
+  let hvs = [rawHash hiW 0 | hiW <- [0, 8, 16]] -- all collide to slot 0
+  mapM_ (\(i, hv) -> setHashColumn col i hv >> hixInsert hix (getHashColumn col) hv i) (zip [0 ..] hvs)
+  hixDelete hix (getHashColumn col) (hvs !! 1) -- delete the middle one (hi=8, row 1)
+  found0 <- hixLookup hix (getHashColumn col) (hvs !! 0)
+  found1 <- hixLookup hix (getHashColumn col) (hvs !! 1)
+  found2 <- hixLookup hix (getHashColumn col) (hvs !! 2)
+  assertEqual (Just 0) found0
+  assertEqual Nothing found1
+  assertEqual (Just 2) found2
+
+test_hashIndexGrowsAndPreservesAllEntries :: IO ()
+test_hashIndexGrowsAndPreservesAllEntries = do
+  hix <- newHashIndex
+  col <- newHashColumn
+  -- comfortably past the initial capacity (8) at load factor 0.7, forcing
+  -- at least two doublings
+  let n = 100
+  mapM_
+    ( \i -> do
+        let hv = rawHash (fromIntegral i) (fromIntegral i)
+        setHashColumn col i hv
+        hixInsert hix (getHashColumn col) hv i
+    )
+    [0 .. n - 1]
+  mapM_
+    ( \i -> do
+        let hv = rawHash (fromIntegral i) (fromIntegral i)
+        found <- hixLookup hix (getHashColumn col) hv
+        assertEqual (Just i) found
+    )
+    [0 .. n - 1]
+
+-- | Alternately insert-then-delete the same row many times over (the
+-- pattern the engine's live-update path drives: a row is freed and its
+-- hash slot recycled, over and over, on the same handful of hot rows) --
+-- the property backward-shift deletion (no tombstones) exists to protect:
+-- capacity must not creep up from churn alone, and every still-live entry
+-- must stay findable throughout.
+test_hashIndexChurnDoesNotDegradeCapacityOrCorrectness :: IO ()
+test_hashIndexChurnDoesNotDegradeCapacityOrCorrectness = do
+  hix <- newHashIndex
+  col <- newHashColumn
+  -- a couple of entries that stay live for the whole test, to check they
+  -- remain findable throughout the churn of everything else
+  let stableA = rawHash 1001 1001
+      stableB = rawHash 1002 1002
+  setHashColumn col 200 stableA
+  hixInsert hix (getHashColumn col) stableA 200
+  setHashColumn col 201 stableB
+  hixInsert hix (getHashColumn col) stableB 201
+  forM_ [1 .. 500 :: Int] $ \i -> do
+    let hv = rawHash (fromIntegral (1000000 + i)) 0
+    setHashColumn col 0 hv
+    hixInsert hix (getHashColumn col) hv 0
+    found <- hixLookup hix (getHashColumn col) hv
+    assertEqual (Just 0) found
+    hixDelete hix (getHashColumn col) hv
+    foundAfter <- hixLookup hix (getHashColumn col) hv
+    assertEqual Nothing foundAfter
+  table <- readIORef (hix_table hix)
+  -- only the two stable entries remain live; capacity must not have grown
+  -- past what two live entries need (still the initial 8), since
+  -- backward-shift deletion leaves no tombstones behind to inflate it
+  assertEqual 8 (VUM.length table)
+  count <- readIORef (hix_count hix)
+  assertEqual 2 count
+  foundA <- hixLookup hix (getHashColumn col) stableA
+  foundB <- hixLookup hix (getHashColumn col) stableB
+  assertEqual (Just 200) foundA
+  assertEqual (Just 201) foundB
+
+-- | The same churn pattern, but through 'DefTable''s own public API
+-- (lookupOrInsertRow / freeRow) rather than 'HashIndex' directly -- the
+-- live-update path's actual call shape -- checking that a row untouched by
+-- the churn is unaffected and that every freed hash is genuinely gone.
+test_defTableChurnManyFreeReuseCyclesStayCorrect :: IO ()
+test_defTableChurnManyFreeReuseCyclesStayCorrect = do
+  dt <- newTest
+  (rSteady, _) <- lookupOrInsertRow dt (h 999999) 999999
+  forM_ [1 .. 500 :: Int] $ \i -> do
+    (r, fresh) <- lookupOrInsertRow dt (h i) i
+    assertBool fresh
+    freeRow dt (h i) r
+    -- the freed hash must not still be findable -- re-inserting it must
+    -- allocate fresh, not hit a stale index entry
+    (r', fresh') <- lookupOrInsertRow dt (h i) i
+    assertBool fresh'
+    freeRow dt (h i) r'
+  -- the row that stayed alive throughout must be entirely unaffected
+  aliveSteady <- isAlive dt rSteady
+  assertBool aliveSteady
+  ph <- readParamHash dt rSteady
+  assertEqual (h 999999) ph
+  (rAgain, freshAgain) <- lookupOrInsertRow dt (h 999999) 999999
+  assertBool (not freshAgain)
+  assertEqual rSteady rAgain
