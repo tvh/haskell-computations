@@ -13,12 +13,35 @@
  tools, but not an identical structure -- see "Why this isn't just another
  EdgeArena" below for why.
 
+ This haddock documents the *design*: what's here and the invariants it
+ maintains (see the "Invariants (summary)" section at the end for the quick
+ checklist). For the *archaeology* -- why this module exists at all, what
+ was measured, what the reverse-side design calls landed on and why they
+ differ from the forward side's -- see docs/benchmark-notes.md's "Stage 4h"
+ (this module's own introduction) and "Stage 4i" (the strictness bug it
+ shipped with -- see "A boxed side column needs to force its own writes"
+ below).
+
  = Two tables, one per existential
 
- 'KeyIntern' interns 'AnyCompSrcKey' (which source key) to a dense 'Int';
- 'SrcKeyArena' stores, per interned key id, the flat @(DefRef, AnyCompSrcVer)@
- list of that key's current dependents -- unboxed 'DefRef' column, boxed
- (parallel, index-aligned) 'AnyCompSrcVer' column.
+ 'KeyIntern' interns 'AnyCompSrcKey' (which source key) to a dense
+ 'SrcKeyId'; 'SrcKeyArena' stores, per interned key id, the flat
+ @(DefRef, AnyCompSrcVer)@ list of that key's current dependents -- unboxed
+ 'DefRef' column, boxed (parallel, index-aligned) 'AnyCompSrcVer' column.
+
+ ASCII sketch: source key @"k"@ interned to id 3, currently depended on by
+ two rows (packed refs @r7@ and @r12@), each having last observed a
+ different version of @"k"@:
+
+ >  KeyIntern (AnyCompSrcKey -> SrcKeyId):
+ >    "k" -> 3   (ki_forward)                    ki_count = 4, ki_free = []
+ >
+ >  sifs_srcEntries :: IntMap SrcKeyId(as Int) SrcKeyArena
+ >    3 -> SrcKeyArena { ska_refs = [r7, r12], ska_vers = [v_old, v_new] }
+ >
+ >  A change notification carrying "k"@v_new arriving at this SrcKeyArena
+ >  invalidates only the dependent whose *own* recorded version doesn't
+ >  match (r7, still at v_old) -- not both, and not by key identity alone.
 
  = Why 'KeyIntern' needs no refcounting
 
@@ -118,6 +141,38 @@
  practice, and because it operates on an unboxed 'Int' column, not a boxed
  structure -- see the module's own churn tests for the bound this actually
  achieves.
+
+ = Invariants (summary)
+
+ __Key interning ('KeyIntern'):__
+
+ * A key id is live iff it currently has a forward-map entry; release
+   deletes the entry and pushes the id onto a free list for reuse -- no
+   refcounting, because ownership here is 1:1 (see "Why KeyIntern needs no
+   refcounting" above), unlike 'DefTable.hs'\'s @SrcDepIntern@.
+ * A caller only ever releases a key id after its own bookkeeping
+   ('SimpleStateIf.removeSrcDependent') has confirmed the key's dependent
+   arena just became empty -- 'kiRelease' on a key with a live dependent is
+   always a lifecycle bug, not a legitimate state.
+
+ __Per-key dependent arena ('SrcKeyArena'):__
+
+ * 'skaAppend' does not deduplicate -- a second append for a ref already
+   present in the arena adds a second entry. Safe only because every real
+   call path removes the old @(key, version)@ entry before adding the new
+   one on a version change ("SimpleStateIf.hs"'s @updateEdges@, "removes
+   before adds, deliberately").
+ * 'skaRemove' is swap-with-last, not a stable shift -- order is never a
+   contract of this structure, matching the @HashMap DefRef AnyCompSrcVer@
+   it replaced.
+ * __Every write through 'skaAppend' must force @ver@ to WHNF before this
+   module's own call forces it.__ 'skaAppend' does this itself (the @!ver@
+   bang) precisely because 'Data.Vector.Mutable.write' carries no
+   strictness contract the way the @Data.HashMap.Strict@ this replaced did
+   -- see "A boxed side column needs to force its own writes" above; this
+   is the one invariant on this list that a real, measured regression (4h)
+   was needed to surface, not something the design got right by
+   inspection.
 -}
 module Control.Computations.CompEngine.Utils.SrcIndex (
   -- * Key interning

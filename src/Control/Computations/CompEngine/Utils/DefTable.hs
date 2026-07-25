@@ -7,18 +7,95 @@
 {- | Per-definition columnar row storage: the "Tier 2" memory redesign from
  docs/benchmark-notes.md's "Memory roadmap" section, modeled on the Rust
  port's Stage 5 (@rust-computations/docs/persistence-benchmark-notes.md@,
- "Stage 5 -- Tier 2 columnar per-def tables").
+ "Stage 5 -- Tier 2 columnar per-def tables"). This haddock documents the
+ *design*: what's here and the invariants it maintains. For the
+ *archaeology* -- which increment introduced which piece, what was measured,
+ what was tried and reverted -- see docs/benchmark-notes.md's "Stage 3" and
+ "Stage 4" (4a-4j); this module's own sections below cross-reference the
+ specific subsections where a design choice was actually decided by a
+ measurement rather than by the argument given here.
+
+ = Overview: a per-def struct-of-arrays
+
+ Before this rewrite, the engine's mutable state was five boxed, persistent
+ containers keyed by a dense interned 'Int' id (Stage 1) -- a
+ 'Data.HashMap.Strict.HashMap'-ish structure whose leaves were themselves
+ boxed records, all traced by every major GC. This module replaces that with
+ one 'DefTable' /per definition/ (@'CompId'@, roughly "one @DefTable@ per
+ distinct top-level computation in the program"), each holding its rows as a
+ struct of parallel columns -- the classic "array of structs" -> "struct of
+ arrays" flip: instead of @Vector Row@ where @Row@ bundles one definition's
+ param, value, hashes, flags and edges together in one boxed record, it's
+ @Row -> paramHash[row]@, @Row -> flags[row]@, @Row -> compDeps[row]@, etc,
+ each its own flat column. A row is a plain array index (@'RowIdx'@) into
+ every one of these columns at once; the columns are, in order of what they
+ hold:
+
+ * @param_hash@, @result_hash@ :: unboxed 'Hash128' (as two 'Word64's each).
+ * @flags@ :: unboxed 'Flags' (alive \/ pending \/ result-state -- see
+   "Flags" below).
+ * @param@, @value@ :: the definition's actual typed param\/result, unboxed
+   when the type allows it, boxed otherwise (see "Typed value columns"
+   below).
+ * @compDeps@, @rdeps@, @srcDeps@ :: not per-row columns at all, but indices
+   (@offset@, @len@) into three arenas /shared across every row in the def/
+   -- see "Edge storage" below.
+ * a hash index (@param_hash -> row@) and a src-dep intern table, both
+   per-def, both described in their own sections below.
+
+ This is why the module is called @DefTable@ and not, say, @RowStore@: the
+ def is the unit columns are allocated per, arenas are shared within, and
+ indexes are scoped to.
+
+ ASCII sketch of one @DefTable@ with 3 rows (row 1 dead, row 0 and 2 alive):
+
+ >                row:        0         1         2
+ >  param_hash   [Word64,Word64] [ ... ] [Word64,Word64]
+ >  result_hash  [Word64,Word64] [ ... ] [Word64,Word64]
+ >  flags        [ alive ]       [ dead ]  [ alive ]
+ >  param        [  p0   ]       [  -    ]  [  p2   ]
+ >  value        [  v0   ]       [  -    ]  [  v2   ]
+ >  compDeps     off=6,len=2     off=?,len=0  off=0,len=2   --\
+ >  rdeps        off=1,len=1     off=?,len=0  off=3,len=1   --+-> into the
+ >  srcDeps      off=0,len=1     off=?,len=0  off=1,len=0   --/    three
+ >                                                                 EdgeArenas
+ >  dt_index (open-addressed, param_hash -> row): probe(hash) -> {0, 2}
+ >  dt_srcDepIntern (AnyCompSrcDep <-> SrcDepId, refcounted): backs srcDeps
+
+ Row 1's @param@\/@value@\/hash cells are drawn as "-" \/ "?" -- not zeroed,
+ just garbage no longer reachable through any column read, because every
+ read of a possibly-stale column is gated by a 'flagsAlive' check first (see
+ "Row lifecycle and reuse" below).
 
  = Row identity
 
- A row is identified by a def index (which definition it belongs to) and a
- row number within that definition's table. Callers of this module pack the
- two into a single 'Int' via 'DefRef' rather than using a pair, so the rest
- of the state layer (the stale-cap priority queue, the outputs side table,
- anything hashing/comparing an identity) keeps working with plain 'Int's --
- the same "hot-path keys are Ints" property Stage 1's interning established,
- just reinterpreted: what used to be an arbitrary dense counter is now
- @(defIndex \<\< rowBits) .|. row@.
+ A row is identified by a def index ('DefIdx' -- which definition it belongs
+ to) and a row number within that definition's table ('RowIdx'). Callers
+ outside this module pack the two into a single 'DefRef' via 'packRef'
+ rather than passing a pair around, so the rest of the state layer (the
+ stale-cap priority queue, the outputs side table, anything hashing\/
+ comparing an identity) keeps working with one flat key type -- the same
+ "hot-path keys are Ints" property Stage 1's interning established, just
+ reinterpreted: what used to be an arbitrary dense counter is now
+ @(defIndex \<\< rowBits) .|. row@, wrapped in a 'DefRef' newtype rather than
+ handed out as a bare 'Int'.
+
+ __Why 'DefRef' (and 'DefIdx'\/'RowIdx') are newtypes, not aliases.__ Before
+ this readability pass, @DefRef@ was @type DefRef = Int@ -- a def index, a
+ row number, an interned id, and a packed ref were all, to the type checker,
+ the same type, so a transposed argument (@packRef row defIdx@, or a def
+ index handed to a function expecting a row) compiled silently and failed
+ only at runtime, if at all. Each is now its own 'newtype': 'DefRef''s
+ constructor isn't even exported, so the /only/ way to build or take one
+ apart from outside this module is 'packRef'\/'unpackRef'\/'refDefIdx'\/
+ 'refRow' (plus the explicit 'unDefRef'\/'mkDefRefUnsafe' escape hatch for
+ the two places -- "SimpleStateIf.hs"'s @IntMap@-keyed containers and
+ "SrcIndex.hs"'s unboxed dependent column -- that must see the raw 'Int').
+ These newtypes cost nothing at runtime (verified, not assumed -- see
+ docs/benchmark-notes.md's Stage 4 A\/B discipline, applied to this pass
+ too): a 'newtype' has no runtime representation of its own, so
+ @'RowIdx' 5@ and @5 :: Int@ compile to the identical machine word: the type
+ distinction is erased after typechecking, not carried at runtime.
 
  = Columns
 
@@ -57,6 +134,55 @@
  allocator places in the large-object area once it crosses the pinned/large
  threshold, where the copying collector never traces or copies it -- see the
  module's "Small defs" note below for the one case where this doesn't apply.
+
+ ASCII sketch of a stride-3 @compDeps@ arena after row 0 has been
+ overwritten once (its original span at words 0-2 is now dead, the current
+ span lives at words 6-8) and row 2 has never been touched:
+
+ >  word:        0    1    2    3    4    5    6    7    8
+ >  content:   [tgt][hi ][lo ][tgt][hi ][lo ][tgt][hi ][lo ]
+ >              \____row 1's span____/     \____row 0's, current____/
+ >              (dead: row 0's old span was words 0-2, now orphaned)
+ >
+ >  per-row offset/len columns (in words, stride already applied):
+ >    row 0: offset=6, len=1      row 1: offset=0, len=1      row 2: offset=0, len=0
+ >
+ >  ea_used = 9 (arena's append point)     ea_dead = 3 (row 0's orphaned span)
+
+ A write never edits a span in place; it always appends at @ea_used@ and
+ marks the row's *previous* span (if it had one) as dead by adding its
+ length to @ea_dead@ -- see "Mutation strategy" just below. @rdeps@\/
+ @srcDeps@ are the same picture at stride 1 (one word per edge, no hi\/lo).
+
+ __Why 'EdgeArena''s stride isn't a phantom type.__ Considered and rejected.
+ A @data EdgeArena (s :: StrideKind) = ...@ phantom parameter (with
+ @dt_compDeps :: EdgeArena 'CompDepsK@, @dt_rdeps :: EdgeArena 'RdepsK@, a
+ type class to recover the numeric stride from the tag) would statically
+ rule out passing the wrong stride to 'eaWrite'\/'eaRead'\/'eaCompact'. But
+ the actual hazard that would close is narrower than it sounds: 'EdgeArena'
+ is not part of this module's public API (not in the export list at all --
+ only 'DefTable' and its column accessors are), so every call to
+ 'eaWrite'\/'eaRead'\/'eaCompact'\/'eaTakeRow' already lives in exactly one
+ place each ('writeCompDeps'\/'readCompDeps', 'writeRdeps'\/'readRdeps',
+ 'writeSrcDeps'\/'readSrcDeps'\/'freeRow'), each pairing one specific
+ 'EdgeArena' field with one hardcoded 'Stride' constant ('compDepsStride' or
+ 'singleStride') a few lines below its own definition, in a heavily-tested
+ (see the "Edge-arena specific" test section) file a newcomer reads start to
+ finish, not a boundary someone calls from a different module with a
+ different-shaped value in hand. Introducing 'DataKinds', an extra type
+ parameter threaded through 'DefTable''s three 'EdgeArena' fields, and a
+ type-class dispatch to recover a numeric stride back out where compaction's
+ word-count arithmetic still needs one would be real, permanent syntactic
+ and cognitive weight
+ for a transposition that would show up as an immediate, glaring test
+ failure (wrong-stride reads desync every offset downstream) the first time
+ anyone tried it -- not a silent-corruption risk like the pre-newtype
+ 'DefRef'\/row\/def-index mixups this pass otherwise targets. The
+ already-landed 'RowIdx'\/'RowCount'\/'Stride' newtypes (this pass) remove
+ the *positional* version of the same hazard (an 'Int' meant as a stride can
+ no longer be passed where a row count or row index is expected, or vice
+ versa) at a fraction of the cost. Net judgment: more noise than safety
+ here; skipped.
 
  __Mutation strategy: append-new-span, mark-old-span-dead, compact on a
  dead-fraction threshold.__ Chosen over "CSR with per-row slack" because
@@ -278,6 +404,80 @@
  would read the same (already-released) span again and release it a second
  time -- a double-release, and exactly the bug the module's tests check
  for directly.
+
+ = Invariants (summary)
+
+ Each section above argues its own invariant in prose; this is the
+ checklist form, for a reader who wants "what must stay true" without
+ re-deriving it from the design narrative. Every one of these is exercised
+ by this module's own test section (the sole exception is called out
+ below).
+
+ __Row lifecycle (alive \/ free \/ reuse):__
+
+ * A row's @flags@ (specifically 'flagsAlive') is the single gate every
+   other column's read goes through; nothing outside 'lookupOrInsertRow'
+   \/ 'freeRow' may assume a column holds meaningful data without checking
+   it first.
+ * 'freeRow' clears @flags@ (not-alive) and releases the row's @srcDeps@
+   span (refcounted, can't wait -- see above); it deliberately leaves
+   @param@\/@value@\/@result_hash@\/@compDeps@\/@rdeps@ as untouched garbage.
+   This is intentional, not an oversight: 'lookupOrInsertRow' is what
+   re-establishes a safe state for a /reused/ row number, not 'freeRow'.
+ * A freed row's hash-index entry is removed by the caller before
+   'freeRow' is called (not by 'freeRow' itself); the row *number* is
+   recycled via the free list, a *fresh* hash-index entry is created for
+   whatever hash next claims that number.
+
+ __Edge-arena append\/compact (@compDeps@\/@rdeps@\/@srcDeps@):__
+
+ * A write never mutates a span in place; it always appends the new span
+   at @ea_used@ and marks the row's immediately-previous span (if any) as
+   dead by adding its length to @ea_dead@.
+ * Compaction ('eaCompact') only ever runs from the write path
+   ('maybeCompact', once @ea_dead * 2 > ea_used@ past a minimum arena
+   size), never from a separate sweep or from 'freeRow' -- a dead row's
+   orphaned span is simply inert until the next compaction walks past it.
+ * Compaction keeps exactly the *current* span of every row 'isRowAlive'
+   reports true for at the moment it runs; everything else (dead rows,
+   alive rows with no edges) is zeroed in the offset\/len columns.
+
+ __Src-dep refcounting (@dt_srcDepIntern@, "Src-dep interning" above):__
+
+ * An id is live iff its refcount is @> 0@; a refcount reaching zero
+   deletes the forward-map entry, clears the reverse slot (dropping the
+   boxed value), and frees the id for reuse -- all three happen together,
+   never partially.
+ * __Retain-before-release, always.__ 'writeSrcDeps' retains every id in
+   the row's /new/ span before releasing any id in the row's /previous/
+   span. This is not a micro-optimization: 'writeSrcDeps' runs
+   unconditionally on every finish (changed or not), so an id present in
+   both spans (an unchanged dependency) is the common case; releasing
+   first would let such an id's refcount transiently touch zero and be
+   reclaimed out from under the retain that was about to re-establish it
+   (4g, docs/benchmark-notes.md). See @test_overlappingOverwriteNeverDropsTheSharedId@.
+ * 'sdiResolve' checks both range (against @sdi_count@) /and/ liveness
+   (refcount @> 0@) -- recycling means "in range" alone can no longer imply
+   "was ever meant to be read right now".
+
+ __Hash index (@dt_index@, "Hash index" above):__
+
+ * A probe candidate is verified against the row's own @param_hash@
+   column entry, never against a stored key -- there isn't one.
+ * Deletion is backward-shift (Knuth), not tombstones: every occupied slot
+   is a live entry, always: 'hix_count' and "number of occupied slots" are
+   the same number at every point in time, not just after a rehash.
+
+ __@KeyIntern@ (@Utils\/SrcIndex.hs@, not this module -- included here since
+ it mirrors @dt_srcDepIntern@ closely enough that the difference is the
+ point):__ needs no refcounting, unlike @dt_srcDepIntern@, because a source
+ /key/ id has exactly one owner at a time (the single @SrcKeyArena@ created
+ on first dependent, released on last) rather than many rows independently
+ retaining it -- plain assign-on-first-use \/ recycle-on-last-removal is the
+ correct match for 1:1 ownership, not a shortcut that happens to avoid
+ refcounting (4h, docs/benchmark-notes.md; see @Utils\/SrcIndex.hs@'s own
+ module haddock for the full argument, including why /versions/ are the
+ opposite case and are deliberately *not* interned).
 -}
 module Control.Computations.CompEngine.Utils.DefTable (
   -- * Row identity

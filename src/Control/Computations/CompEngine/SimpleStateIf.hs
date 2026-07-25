@@ -11,11 +11,19 @@
  "Memory roadmap"): per-definition struct-of-arrays tables
  ("Control.Computations.CompEngine.Utils.DefTable") instead of the five
  boxed, "AnyCompAp"-then-@Int@-keyed persistent containers Stage 0/1 used.
- Row identity is a packed @(defIndex, row)@ 'Int' ('DT.DefRef'); a def's
- own hash/flags/edge/typed-value columns live in its own 'DT.DefTable',
- reached from a 'CompId' via 'sifs_defIndex' + 'sifs_defs'. See the
- individual functions below and DefTable.hs's module haddock for the
- row-lifecycle and column-layout rationale.
+ Row identity is a packed @('DT.DefIdx', 'DT.RowIdx')@ ('DT.DefRef'); a
+ def's own hash/flags/edge/typed-value columns live in its own
+ 'DT.DefTable', reached from a 'CompId' via 'sifs_defIndex' + 'sifs_defs'.
+ 'DT.DefRef', 'DT.DefIdx' and 'DT.RowIdx' are real newtypes (not @Int@
+ aliases) precisely so this module's own bookkeeping -- which juggles a def
+ index, a row index, and a packed ref side by side in almost every function
+ below -- can't transpose them without a type error; the few spots that must
+ still see a raw @Int@ (this module's two @Data.IntMap.Strict@-keyed
+ fields, @sifs_defs@ and @sifs_srcEntries@, which mandate a literal @Int@
+ key) unwrap explicitly via 'DT.unDefIdx'\/'SI.unSrcKeyId' right at that
+ boundary, not before. See the individual functions below and
+ DefTable.hs's/SrcIndex.hs's module haddocks for the row-lifecycle and
+ column-layout rationale.
 
  = Existential plumbing
 
