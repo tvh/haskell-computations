@@ -188,14 +188,22 @@ newtype SimpleStateIf m = SimpleStateIf
  on its last -- see 'addSrcDependent'\/'removeSrcDependent'.
 -}
 data SifState = SifState
-  { sifs_defIndex :: !(IORef (HashMap CompId Int))
+  { sifs_defIndex :: !(IORef (HashMap CompId DT.DefIdx))
   , sifs_defs :: !(IORef (IntMap SomeDefEntry))
+  -- ^ keyed by the raw 'Int' 'DT.unDefIdx' of a 'DT.DefIdx' --
+  -- 'Data.IntMap.Strict' mandates a literal 'Int' key, so every lookup\/
+  -- insert against this field unwraps a 'DT.DefIdx' at exactly this
+  -- boundary (see 'DT.unDefIdx''s haddock).
   , sifs_nextDefIdx :: !(IORef Int)
+  -- ^ the raw counter 'withDefFor' wraps into a fresh 'DT.DefIdx' via
+  -- 'DT.mkDefIdx' when it hands one out.
   , sifs_srcKeyIntern :: !SI.KeyIntern
   , sifs_srcEntries :: !(IORef (IntMap SI.SrcKeyArena))
-  , sifs_outputs :: !(IORef (OM.OutputsMap Int))
-  , sifs_pendingOutputs :: !(IORef (Map Int AnyCompSinkOutsMap))
-  , sifs_stale :: !(IORef (Paq.PriorityAgingQueue Int ()))
+  -- ^ keyed by the raw 'Int' 'SI.unSrcKeyId' of a 'SI.SrcKeyId', for the
+  -- same 'IntMap'-mandates-literal-'Int' reason as 'sifs_defs'.
+  , sifs_outputs :: !(IORef (OM.OutputsMap DT.DefRef))
+  , sifs_pendingOutputs :: !(IORef (Map DT.DefRef AnyCompSinkOutsMap))
+  , sifs_stale :: !(IORef (Paq.PriorityAgingQueue DT.DefRef ()))
   }
 
 newSifState :: IO SifState
@@ -225,7 +233,7 @@ validateSifState st = do
   defs <- readIORef (sifs_defs st)
   forM_ (IntMap.toList defs) $ \(defIdx, SomeDefEntry _ dt) -> do
     len <- DT.rowCount dt
-    forM_ [0 .. len - 1] $ \row -> do
+    forM_ (DT.rowIndices len) $ \row -> do
       flags <- DT.readFlags dt row
       when (DT.flagsAlive flags) $ do
         cd <- DT.readCompDeps dt row
@@ -235,12 +243,13 @@ validateSifState st = do
   entries <- readIORef (sifs_srcEntries st)
   forM_ (IntMap.toList entries) $ \(keyId, arena) -> do
     pairs <- SI.skaToList arena
-    checkRefs defs ("srcIndex key " ++ show keyId) (VU.fromList (map fst pairs))
+    checkRefs defs ("srcIndex key " ++ show keyId) (VU.fromList (map (DT.unDefRef . fst) pairs))
  where
+  checkRefs :: IntMap SomeDefEntry -> String -> VU.Vector Int -> IO ()
   checkRefs defs what refs =
-    forM_ (VU.toList refs) $ \ref -> do
-      let (targetDef, targetRow) = DT.unpackRef ref
-      case IntMap.lookup targetDef defs of
+    forM_ (VU.toList refs) $ \refInt -> do
+      let (targetDef, targetRow) = DT.unpackRef (DT.mkDefRefUnsafe refInt)
+      case IntMap.lookup (DT.unDefIdx targetDef) defs of
         Nothing -> fail (what ++ " points at unknown def " ++ show targetDef)
         Just (SomeDefEntry _ dt) -> do
           flags <- DT.readFlags dt targetRow
@@ -305,7 +314,7 @@ withDefFor
    . (IsCompParam p, IsCompResult a)
   => SifState
   -> Comp p a
-  -> (Int -> DefTable p a -> IO r)
+  -> (DT.DefIdx -> DefTable p a -> IO r)
   -> IO r
 withDefFor st comp k = do
   let cid = comp_name comp
@@ -313,7 +322,7 @@ withDefFor st comp k = do
   case HashMap.lookup cid idxMap of
     Just defIdx -> do
       defs <- readIORef (sifs_defs st)
-      case IntMap.lookup defIdx defs of
+      case IntMap.lookup (DT.unDefIdx defIdx) defs of
         Just entry -> castDefEntry cid entry >>= k defIdx
         Nothing ->
           error
@@ -325,10 +334,11 @@ withDefFor st comp k = do
             )
     Nothing -> do
       dt <- DT.new
-      defIdx <- readIORef (sifs_nextDefIdx st)
-      writeIORef (sifs_nextDefIdx st) (defIdx + 1)
+      defIdxInt <- readIORef (sifs_nextDefIdx st)
+      writeIORef (sifs_nextDefIdx st) (defIdxInt + 1)
+      let defIdx = DT.mkDefIdx defIdxInt
       modifyIORef' (sifs_defIndex st) (HashMap.insert cid defIdx)
-      modifyIORef' (sifs_defs st) (IntMap.insert defIdx (SomeDefEntry comp dt))
+      modifyIORef' (sifs_defs st) (IntMap.insert defIdxInt (SomeDefEntry comp dt))
       k defIdx dt
 
 -- | One cast per def resolution -- the same idea "Types.hs"'s
@@ -357,7 +367,7 @@ withRow
    . IsCompResult a
   => SifState
   -> CompAp a
-  -> (forall p. IsCompParam p => Int -> DefTable p a -> Int -> Bool -> IO r)
+  -> (forall p. IsCompParam p => DT.DefIdx -> DefTable p a -> DT.RowIdx -> Bool -> IO r)
   -> IO r
 withRow st cap k =
   case cap of
@@ -377,7 +387,7 @@ resolveRefToAny :: SifState -> DefRef -> IO AnyCompAp
 resolveRefToAny st ref = do
   let (defIdx, row) = DT.unpackRef ref
   defs <- readIORef (sifs_defs st)
-  case IntMap.lookup defIdx defs of
+  case IntMap.lookup (DT.unDefIdx defIdx) defs of
     Just (SomeDefEntry comp dt) -> do
       -- Every ref flowing through the state layer (stale queue, rdeps,
       -- outputs) must originate from a row that is still alive -- garbage
@@ -606,7 +616,7 @@ enqueueRefs :: SifState -> HashSet DefRef -> IO (HashSet DefRef)
 enqueueRefs st refs = fmap (HashSet.fromList . catMaybes) $ forM (HashSet.toList refs) $ \ref -> do
   let (defIdx, row) = DT.unpackRef ref
   defs <- readIORef (sifs_defs st)
-  case IntMap.lookup defIdx defs of
+  case IntMap.lookup (DT.unDefIdx defIdx) defs of
     Nothing -> pure Nothing -- resolved to a dead def; nothing to enqueue
     Just (SomeDefEntry comp dt) -> do
       flags <- DT.readFlags dt row
@@ -647,7 +657,7 @@ splitDeps st deps = foldM step (IntMap.empty, HashSet.empty) (HashSet.toList dep
       CompEngDepSrc x -> pure (comps, HashSet.insert x srcs)
       CompEngDepComp (CompDep (Dep (CompDepKey (AnyCompAp targetCap)) observedVer)) -> do
         ref <- withRow st targetCap (\defIdx _dt row _fresh -> pure (DT.packRef defIdx row))
-        pure (IntMap.insert ref observedVer comps, srcs)
+        pure (IntMap.insert (DT.unDefRef ref) observedVer comps, srcs)
 
 --
 -- Edge (rdeps/src-index) bookkeeping and garbage collection. None of these
@@ -658,12 +668,13 @@ splitDeps st deps = foldM step (IntMap.empty, HashSet.empty) (HashSet.toList dep
 addRdep :: SifState -> DefRef -> DefRef -> IO ()
 addRdep st targetRef ref = do
   let (tDef, tRow) = DT.unpackRef targetRef
+      refInt = DT.unDefRef ref
   defs <- readIORef (sifs_defs st)
-  case IntMap.lookup tDef defs of
+  case IntMap.lookup (DT.unDefIdx tDef) defs of
     Nothing -> pure () -- shouldn't happen: target must be alive, we just depended on it
     Just (SomeDefEntry _ dt) -> do
       rd <- DT.readRdeps dt tRow
-      unless (VU.elem ref rd) $ DT.writeRdeps dt tRow (VU.snoc rd ref)
+      unless (VU.elem refInt rd) $ DT.writeRdeps dt tRow (VU.snoc rd refInt)
 
 -- | Remove @ref@ from a target's rdeps; if the target's rdeps become
 -- empty as a result (nothing depends on it any more), cascade-free it --
@@ -673,12 +684,13 @@ addRdep st targetRef ref = do
 removeRdep :: SifState -> DefRef -> DefRef -> IO Garbage
 removeRdep st targetRef ref = do
   let (tDef, tRow) = DT.unpackRef targetRef
+      refInt = DT.unDefRef ref
   defs <- readIORef (sifs_defs st)
-  case IntMap.lookup tDef defs of
+  case IntMap.lookup (DT.unDefIdx tDef) defs of
     Nothing -> pure mempty
     Just (SomeDefEntry _ dt) -> do
       rd <- DT.readRdeps dt tRow
-      let rd' = VU.filter (/= ref) rd
+      let rd' = VU.filter (/= refInt) rd
       DT.writeRdeps dt tRow rd'
       if VU.null rd'
         then do
@@ -688,10 +700,10 @@ removeRdep st targetRef ref = do
             else freeRowCascade st tDef tRow
         else pure mempty
 
-freeRowCascade :: SifState -> Int -> Int -> IO Garbage
+freeRowCascade :: SifState -> DT.DefIdx -> DT.RowIdx -> IO Garbage
 freeRowCascade st defIdx row = do
   defs <- readIORef (sifs_defs st)
-  case IntMap.lookup defIdx defs of
+  case IntMap.lookup (DT.unDefIdx defIdx) defs of
     Nothing -> pure mempty
     Just (SomeDefEntry _ dt) -> do
       let ref = DT.packRef defIdx row
@@ -706,7 +718,7 @@ freeRowCascade st defIdx row = do
       let outs' = OM.delete ref outs
       writeIORef (sifs_outputs st) $! outs'
       removeFromStale st ref
-      compGarbage <- fmap mconcat $ forM (VU.toList myCompDeps) $ \t -> removeRdep st t ref
+      compGarbage <- fmap mconcat $ forM (VU.toList myCompDeps) $ \t -> removeRdep st (DT.mkDefRefUnsafe t) ref
       srcGarbageKeys <- fmap catMaybes $ forM (HashSet.toList mySrcDeps) $ \dep -> removeSrcDependent st dep ref
       -- Only outputs nothing *else* still claims are actually garbage --
       -- e.g. two rows both writing to sink key "output": one dying must
@@ -737,11 +749,11 @@ addSrcDependent st dep ref = do
       ver = depVer dep
   keyId <- SI.kiIntern (sifs_srcKeyIntern st) key
   entries <- readIORef (sifs_srcEntries st)
-  arena <- case IntMap.lookup keyId entries of
+  arena <- case IntMap.lookup (SI.unSrcKeyId keyId) entries of
     Just a -> pure a
     Nothing -> do
       a <- SI.newSrcKeyArena
-      writeIORef (sifs_srcEntries st) $! IntMap.insert keyId a entries
+      writeIORef (sifs_srcEntries st) $! IntMap.insert (SI.unSrcKeyId keyId) a entries
       pure a
   SI.skaAppend arena ref ver
 
@@ -757,14 +769,14 @@ removeSrcDependent st dep ref = do
     Nothing -> pure Nothing
     Just keyId -> do
       entries <- readIORef (sifs_srcEntries st)
-      case IntMap.lookup keyId entries of
+      case IntMap.lookup (SI.unSrcKeyId keyId) entries of
         Nothing -> pure Nothing
         Just arena -> do
           _ <- SI.skaRemove arena ref
           empty <- SI.skaNull arena
           if empty
             then do
-              writeIORef (sifs_srcEntries st) $! IntMap.delete keyId entries
+              writeIORef (sifs_srcEntries st) $! IntMap.delete (SI.unSrcKeyId keyId) entries
               SI.kiRelease (sifs_srcKeyIntern st) key
               pure (Just key)
             else pure Nothing
@@ -806,8 +818,8 @@ updateEdges dt st row oldCompVer newCompVerMap oldSrc newSrc = do
   -- off the row alone (se_dependents doesn't have room for "the same row,
   -- twice, at two versions"). Adding first and removing second would let
   -- the stale removal wipe the fresh add right back out.
-  compGarbage <- fmap mconcat $ forM (IntSet.toList removedComp) $ \t -> removeRdep st t row
-  forM_ (IntSet.toList addedComp) $ \t -> addRdep st t row
+  compGarbage <- fmap mconcat $ forM (IntSet.toList removedComp) $ \t -> removeRdep st (DT.mkDefRefUnsafe t) row
+  forM_ (IntSet.toList addedComp) $ \t -> addRdep st (DT.mkDefRefUnsafe t) row
 
   srcGarbageKeys <- fmap catMaybes $ forM (HashSet.toList removedSrc) $ \dep -> removeSrcDependent st dep row
   forM_ (HashSet.toList addedSrc) $ \dep -> addSrcDependent st dep row
@@ -817,16 +829,16 @@ updateEdges dt st row oldCompVer newCompVerMap oldSrc newSrc = do
 checkSelfStale :: SifState -> IntMap CompDepVer -> IO Bool
 checkSelfStale st comps = or <$> mapM checkOne (IntMap.toList comps)
  where
-  checkOne (ref, observedVer) = do
-    let (tDef, tRow) = DT.unpackRef ref
+  checkOne (refInt, observedVer) = do
+    let (tDef, tRow) = DT.unpackRef (DT.mkDefRefUnsafe refInt)
     defs <- readIORef (sifs_defs st)
-    case IntMap.lookup tDef defs of
+    case IntMap.lookup (DT.unDefIdx tDef) defs of
       Nothing -> pure False
       Just (SomeDefEntry _ dt) -> do
         curVer <- currentVer dt tRow
         pure (observedVer /= curVer)
 
-currentVer :: DefTable p a -> Int -> IO CompDepVer
+currentVer :: DefTable p a -> DT.RowIdx -> IO CompDepVer
 currentVer dt row = do
   flags <- DT.readFlags dt row
   case DT.flagsResultState flags of
@@ -834,7 +846,7 @@ currentVer dt row = do
     NoResult -> pure (CompDepVer None)
     _ -> CompDepVer . Some <$> DT.readResultHash dt row
 
-writeFinishedRow :: DefTable p a -> Int -> ResultState -> Maybe Hash128 -> Maybe a -> IO ()
+writeFinishedRow :: DefTable p a -> DT.RowIdx -> ResultState -> Maybe Hash128 -> Maybe a -> IO ()
 writeFinishedRow dt row rs mh mres = do
   flags <- DT.readFlags dt row
   DT.writeFlags dt row (DT.mkFlags (DT.flagsAlive flags) (DT.flagsPending flags) rs)
@@ -869,9 +881,9 @@ finishCap
    . IsCompResult a
   => SifState
   -> CompAp a
-  -> Int
+  -> DT.DefIdx
   -> DefTable p a
-  -> Int
+  -> DT.RowIdx
   -> DepSet
   -> Maybe a
   -> IO (HashSet AnyCompAp, Garbage)
@@ -934,7 +946,7 @@ finishCap st cap defIdx dt row deps mres = do
       let resultChanged = oldResultState /= newResultState || oldHash /= newHash
       newlyStale <-
         if resultChanged
-          then enqueueRefs st (HashSet.fromList (VU.toList rdeps))
+          then enqueueRefs st (HashSet.fromList (map DT.mkDefRefUnsafe (VU.toList rdeps)))
           else pure HashSet.empty
       selfStale <- checkSelfStale st newCompDepsVer
       -- self-enqueue happens (it's the mechanism keeping this cap on the
@@ -979,7 +991,7 @@ notifyDepChange st (CompEngDepSrc srcDep) = do
     Nothing -> pure HashSet.empty
     Just keyId -> do
       entries <- readIORef (sifs_srcEntries st)
-      case IntMap.lookup keyId entries of
+      case IntMap.lookup (SI.unSrcKeyId keyId) entries of
         Nothing -> pure HashSet.empty
         Just arena -> do
           -- Invalidate only the dependents whose *own* recorded observation

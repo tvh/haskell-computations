@@ -121,6 +121,9 @@
 -}
 module Control.Computations.CompEngine.Utils.SrcIndex (
   -- * Key interning
+  SrcKeyId,
+  unSrcKeyId,
+  mkSrcKeyId,
   KeyIntern,
   newKeyIntern,
   kiIntern,
@@ -155,7 +158,7 @@ import Control.Computations.CompEngine.CompSrc (
   compSrcId,
  )
 import Control.Computations.CompEngine.CompFlow (ForAnyCompFlow (..))
-import Control.Computations.CompEngine.Utils.DefTable (DefRef)
+import Control.Computations.CompEngine.Utils.DefTable (DefRef, mkDefRefUnsafe, unDefRef)
 
 ----------------------------------------
 -- EXTERNAL
@@ -181,6 +184,23 @@ import Test.Framework
 -- refcounting" section.
 --
 
+-- | An id 'KeyIntern' has assigned to some 'AnyCompSrcKey'. The public
+-- boundary type for 'kiIntern'\/'kiLookup'\/'kiRelease'; "SimpleStateIf.hs"
+-- unwraps it via 'unSrcKeyId' at exactly one seam -- @sifs_srcEntries@,
+-- which is 'Data.IntMap.Strict'-keyed and so (like 'DefTable.hs'\'s
+-- @sifs_defs@ and 'DefIdx') needs a literal 'Int', not because
+-- 'SrcKeyId' itself is unboxed storage.
+newtype SrcKeyId = SrcKeyId Int
+  deriving (Eq, Ord, Show)
+
+unSrcKeyId :: SrcKeyId -> Int
+unSrcKeyId (SrcKeyId i) = i
+{-# INLINE unSrcKeyId #-}
+
+mkSrcKeyId :: Int -> SrcKeyId
+mkSrcKeyId = SrcKeyId
+{-# INLINE mkSrcKeyId #-}
+
 data KeyIntern = KeyIntern
   { ki_forward :: !(IORef (HashMap AnyCompSrcKey Int))
   , ki_count :: !(IORef Int)
@@ -195,16 +215,16 @@ newKeyIntern = KeyIntern <$> newIORef HashMap.empty <*> newIORef 0 <*> newIORef 
 -- | Pure lookup -- does not assign an id on a miss. Callers that must not
 -- create a mapping as a side effect of a failed lookup (everything except
 -- 'kiIntern' itself) use this.
-kiLookup :: KeyIntern -> AnyCompSrcKey -> IO (Maybe Int)
-kiLookup ki key = HashMap.lookup key <$> readIORef (ki_forward ki)
+kiLookup :: KeyIntern -> AnyCompSrcKey -> IO (Maybe SrcKeyId)
+kiLookup ki key = fmap mkSrcKeyId . HashMap.lookup key <$> readIORef (ki_forward ki)
 
 -- | Look up @key@'s interned id, assigning one (popping the free list
 -- first, only extending 'ki_count' once it's empty) on a miss.
-kiIntern :: KeyIntern -> AnyCompSrcKey -> IO Int
+kiIntern :: KeyIntern -> AnyCompSrcKey -> IO SrcKeyId
 kiIntern ki key = do
   fwd <- readIORef (ki_forward ki)
   case HashMap.lookup key fwd of
-    Just i -> pure i
+    Just i -> pure (mkSrcKeyId i)
     Nothing -> do
       free <- readIORef (ki_free ki)
       i <- case free of
@@ -217,7 +237,7 @@ kiIntern ki key = do
       -- haddock for why a bare 'writeIORef' of a computed 'HashMap' update
       -- is not, on its own, a strictness guarantee.
       writeIORef (ki_forward ki) $! HashMap.insert key i fwd
-      pure i
+      pure (mkSrcKeyId i)
 
 -- | Release @key@'s interned id: delete the forward entry and push the id
 -- onto the free list for 'kiIntern' to reuse. Caller's responsibility (like
@@ -251,8 +271,17 @@ kiAssignedCount ki = readIORef (ki_count ki)
 -- another EdgeArena" section.
 --
 
+-- | @ska_refs@ stores each dependent's 'DefRef' as a raw 'Int' -- not
+-- 'DefRef' itself, which has no 'Data.Vector.Unboxed.Unbox' instance (see
+-- "DefTable.hs"'s 'Control.Computations.CompEngine.Utils.DefTable.unDefRef'
+-- haddock for why one is deliberately not hand-written). 'skaAppend'\/
+-- 'skaRemove'\/'skaToList' -- this module's actual API boundary -- take\/
+-- return 'DefRef', converting via 'unDefRef'\/'mkDefRefUnsafe' at exactly
+-- this column's read\/write, the same "raw inside storage, typed at the
+-- edge" split "DefTable.hs" itself uses for its own 'DefRef'-packed
+-- @Word64@ arenas.
 data SrcKeyArena = SrcKeyArena
-  { ska_refs :: !(IORef (VUM.IOVector DefRef))
+  { ska_refs :: !(IORef (VUM.IOVector Int))
   , ska_vers :: !(IORef (VM.IOVector AnyCompSrcVer))
   , ska_len :: !(IORef Int)
   }
@@ -312,7 +341,7 @@ skaAppend ska ref !ver = do
   growBoth ska (len + 1)
   rv <- readIORef (ska_refs ska)
   vv <- readIORef (ska_vers ska)
-  VUM.write rv len ref
+  VUM.write rv len (unDefRef ref)
   VM.write vv len ver
   writeIORef (ska_len ska) (len + 1)
 
@@ -328,11 +357,12 @@ skaRemove :: SrcKeyArena -> DefRef -> IO Bool
 skaRemove ska ref = do
   len <- readIORef (ska_len ska)
   rv <- readIORef (ska_refs ska)
-  let go i
+  let refInt = unDefRef ref
+      go i
         | i >= len = pure Nothing
         | otherwise = do
             r <- VUM.read rv i
-            if r == ref then pure (Just i) else go (i + 1)
+            if r == refInt then pure (Just i) else go (i + 1)
   found <- go 0
   case found of
     Nothing -> pure False
@@ -356,7 +386,7 @@ skaToList ska = do
   len <- readIORef (ska_len ska)
   rv <- readIORef (ska_refs ska)
   vv <- readIORef (ska_vers ska)
-  mapM (\i -> (,) <$> VUM.read rv i <*> VM.read vv i) [0 .. len - 1]
+  mapM (\i -> (,) <$> (mkDefRefUnsafe <$> VUM.read rv i) <*> VM.read vv i) [0 .. len - 1]
 
 skaNull :: SrcKeyArena -> IO Bool
 skaNull ska = (== 0) <$> readIORef (ska_len ska)
@@ -451,21 +481,28 @@ test_keyInternChurnWithOverlapStaysBounded = do
   assertEqual 0 live
   assertBool (assigned <= 4)
 
+-- | Test-only shorthand for building a 'DefRef' from a plain integer
+-- literal, via the public 'mkDefRefUnsafe' escape hatch -- this module,
+-- unlike "DefTable.hs" itself, does not have 'DefRef''s constructor in
+-- scope.
+dr :: Int -> DefRef
+dr = mkDefRefUnsafe
+
 test_arenaAppendAndToList :: IO ()
 test_arenaAppendAndToList = do
   ska <- newSrcKeyArena
-  skaAppend ska 100 (mkVer 1)
-  skaAppend ska 200 (mkVer 2)
+  skaAppend ska (dr 100) (mkVer 1)
+  skaAppend ska (dr 200) (mkVer 2)
   xs <- skaToList ska
   assertEqual 2 (length xs)
-  assertBool ((100, mkVer 1) `elem` xs)
-  assertBool ((200, mkVer 2) `elem` xs)
+  assertBool ((dr 100, mkVer 1) `elem` xs)
+  assertBool ((dr 200, mkVer 2) `elem` xs)
 
 test_arenaRemoveMissingIsFalse :: IO ()
 test_arenaRemoveMissingIsFalse = do
   ska <- newSrcKeyArena
-  skaAppend ska 100 (mkVer 1)
-  removed <- skaRemove ska 999
+  skaAppend ska (dr 100) (mkVer 1)
+  removed <- skaRemove ska (dr 999)
   assertBool (not removed)
   n <- skaLiveCount ska
   assertEqual 1 n
@@ -473,19 +510,19 @@ test_arenaRemoveMissingIsFalse = do
 test_arenaRemoveMiddleKeepsOthers :: IO ()
 test_arenaRemoveMiddleKeepsOthers = do
   ska <- newSrcKeyArena
-  mapM_ (\i -> skaAppend ska i (mkVer i)) [1 .. 10 :: Int]
-  removed <- skaRemove ska 5
+  mapM_ (\i -> skaAppend ska (dr i) (mkVer i)) [1 .. 10 :: Int]
+  removed <- skaRemove ska (dr 5)
   assertBool removed
   xs <- skaToList ska
   assertEqual 9 (length xs)
-  assertBool ((5, mkVer 5) `notElem` xs)
-  mapM_ (\i -> assertBool ((i, mkVer i) `elem` xs)) ([1 .. 4] ++ [6 .. 10] :: [Int])
+  assertBool ((dr 5, mkVer 5) `notElem` xs)
+  mapM_ (\i -> assertBool ((dr i, mkVer i) `elem` xs)) ([1 .. 4] ++ [6 .. 10] :: [Int])
 
 test_arenaRemoveLastEntry :: IO ()
 test_arenaRemoveLastEntry = do
   ska <- newSrcKeyArena
-  skaAppend ska 1 (mkVer 1)
-  removed <- skaRemove ska 1
+  skaAppend ska (dr 1) (mkVer 1)
+  removed <- skaRemove ska (dr 1)
   assertBool removed
   empty <- skaNull ska
   assertBool empty
@@ -499,11 +536,11 @@ test_arenaEmptyIsNull = do
 test_arenaReAddAfterRemoveWorks :: IO ()
 test_arenaReAddAfterRemoveWorks = do
   ska <- newSrcKeyArena
-  skaAppend ska 1 (mkVer 1)
-  _ <- skaRemove ska 1
-  skaAppend ska 1 (mkVer 2)
+  skaAppend ska (dr 1) (mkVer 1)
+  _ <- skaRemove ska (dr 1)
+  skaAppend ska (dr 1) (mkVer 2)
   xs <- skaToList ska
-  assertEqual [(1, mkVer 2)] xs
+  assertEqual [(dr 1, mkVer 2)] xs
 
 -- | Growth across many entries preserves every previously-written value --
 -- the same "growth doesn't corrupt existing data" property 'DefTable.hs'\'s
@@ -511,10 +548,10 @@ test_arenaReAddAfterRemoveWorks = do
 test_arenaGrowthPreservesAllData :: IO ()
 test_arenaGrowthPreservesAllData = do
   ska <- newSrcKeyArena
-  mapM_ (\i -> skaAppend ska i (mkVer i)) [1 .. 500 :: Int]
+  mapM_ (\i -> skaAppend ska (dr i) (mkVer i)) [1 .. 500 :: Int]
   xs <- skaToList ska
   assertEqual 500 (length xs)
-  mapM_ (\i -> assertBool ((i, mkVer i) `elem` xs)) [1 .. 500 :: Int]
+  mapM_ (\i -> assertBool ((dr i, mkVer i) `elem` xs)) [1 .. 500 :: Int]
 
 -- | Many single-entry add/remove cycles against one arena -- the
 -- 'SrcKeyArena' analogue of the key-intern churn test above: the live
@@ -524,8 +561,8 @@ test_arenaChurnTracksLiveCountOnly :: IO ()
 test_arenaChurnTracksLiveCountOnly = do
   ska <- newSrcKeyArena
   forM_ [1 .. 3000 :: Int] $ \n -> do
-    skaAppend ska n (mkVer n)
-    _ <- skaRemove ska n
+    skaAppend ska (dr n) (mkVer n)
+    _ <- skaRemove ska (dr n)
     pure ()
   n <- skaLiveCount ska
   assertEqual 0 n

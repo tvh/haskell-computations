@@ -281,11 +281,20 @@
 -}
 module Control.Computations.CompEngine.Utils.DefTable (
   -- * Row identity
+  DefIdx,
+  RowIdx,
   DefRef,
   packRef,
   unpackRef,
   refDefIdx,
   refRow,
+  unDefRef,
+  mkDefRefUnsafe,
+  unDefIdx,
+  mkDefIdx,
+  RowCount,
+  unRowCount,
+  rowIndices,
 
   -- * Flags
   Flags,
@@ -294,6 +303,7 @@ module Control.Computations.CompEngine.Utils.DefTable (
   flagsPending,
   flagsResultState,
   mkFlags,
+  zeroFlags,
 
   -- * The table
   DefTable,
@@ -374,14 +384,37 @@ import Test.Framework hiding ((.&.))
 import qualified Test.QuickCheck as QC
 
 --
--- Row identity: DefRef = packed (defIndex, row)
+-- Row identity: DefRef = packed (DefIdx, RowIdx). Three historically
+-- Int-shaped concepts, now three distinct types -- see the module haddock's
+-- "Row identity" section for the full rationale (in short: a transposed
+-- @packRef row defIdx@, or a def index handed to a function expecting a
+-- row, used to typecheck silently when all three were bare 'Int's).
 --
 
--- | A packed @(defIndex, row)@ identity. 20 bits of def index (~1M
+-- | Which definition a row belongs to.
+newtype DefIdx = DefIdx Int
+  deriving (Eq, Ord, Show)
+
+-- | A row number within one definition's 'DefTable'. Also reused, outside
+-- 'DefTable' proper, as the generic "row id" type 'HashIndex' indexes by
+-- (deliberately decoupled from 'DefTable' -- see its own haddock) and as
+-- the per-entry row component 'EdgeArena' functions take.
+newtype RowIdx = RowIdx Int
+  deriving (Eq, Ord, Show)
+  deriving newtype (Hashable)
+
+-- | A packed @(DefIdx, RowIdx)@ identity: 20 bits of def index (~1M
 -- definitions), 44 bits of row (~17 trillion rows per definition) -- both
 -- comically generous versus this engine's actual scale, chosen to leave
--- headroom rather than to be tight.
-type DefRef = Int
+-- headroom rather than to be tight. A real 'newtype', not a type alias --
+-- see the module haddock's "Row identity" section for why that distinction
+-- matters here specifically. Its constructor is not exported; the only ways
+-- to produce or take one apart from outside this module are 'packRef' \/
+-- 'unpackRef' \/ 'refDefIdx' \/ 'refRow' and the explicit 'unDefRef' escape
+-- hatch below.
+newtype DefRef = DefRef Int
+  deriving (Eq, Ord, Show)
+  deriving newtype (Hashable)
 
 rowBits :: Int
 rowBits = 44
@@ -389,29 +422,126 @@ rowBits = 44
 rowMask :: Int
 rowMask = (1 `shiftL` rowBits) - 1
 
-packRef :: Int -> Int -> DefRef
-packRef defIdx row = (defIdx `shiftL` rowBits) .|. (row .&. rowMask)
+packRef :: DefIdx -> RowIdx -> DefRef
+packRef (DefIdx defIdx) (RowIdx row) = DefRef ((defIdx `shiftL` rowBits) .|. (row .&. rowMask))
 {-# INLINE packRef #-}
 
-unpackRef :: DefRef -> (Int, Int)
-unpackRef ref = (ref `shiftR` rowBits, ref .&. rowMask)
+unpackRef :: DefRef -> (DefIdx, RowIdx)
+unpackRef (DefRef ref) = (DefIdx (ref `shiftR` rowBits), RowIdx (ref .&. rowMask))
 {-# INLINE unpackRef #-}
 
-refDefIdx :: DefRef -> Int
+refDefIdx :: DefRef -> DefIdx
 refDefIdx = fst . unpackRef
 {-# INLINE refDefIdx #-}
 
-refRow :: DefRef -> Int
+refRow :: DefRef -> RowIdx
 refRow = snd . unpackRef
 {-# INLINE refRow #-}
+
+-- | Escape hatch to the raw 'Int' a 'DefRef' packs. Exists for exactly two
+-- call sites outside this module's own column storage: "Utils/SrcIndex.hs"'s
+-- @SrcKeyArena@, which stores one 'DefRef' per dependent in an /unboxed/
+-- column (so it must hold a raw 'Int', not a 'DefRef' -- giving 'DefRef' its
+-- own 'Data.Vector.Unboxed.Unbox' instance would mean writing one by hand,
+-- since 'Unbox' has associated data families that newtype-deriving can't
+-- shortcut without a Template Haskell dependency this codebase deliberately
+-- avoids), and this module's own 'EdgeArena'-packed @Word64@ triples (see
+-- 'flattenCompDeps'\/'unflattenCompDeps'). Not needed, and not used, by
+-- "SimpleStateIf.hs" -- every container it keys by row identity (the stale
+-- queue, the outputs map, the pending-outputs map) is already generic in
+-- its key type, so 'DefRef' flows through them unwrapped.
+unDefRef :: DefRef -> Int
+unDefRef (DefRef i) = i
+{-# INLINE unDefRef #-}
+
+-- | The 'unDefRef' of 'packRef': build a 'DefRef' back up from a raw 'Int'
+-- read out of unboxed storage. Caller's responsibility, same as 'unDefRef':
+-- the 'Int' must actually be a previously-'unDefRef''d 'DefRef', not an
+-- arbitrary value.
+mkDefRefUnsafe :: Int -> DefRef
+mkDefRefUnsafe = DefRef
+{-# INLINE mkDefRefUnsafe #-}
+
+-- | Unwrap a 'RowIdx' to the raw 'Int' index a mutable-vector read\/write
+-- ultimately needs. Used throughout this module's own column access, where
+-- @row@ is already known typed; not exported (row indices never need to
+-- leave "DefTable.hs"/"SimpleStateIf.hs" as anything other than 'RowIdx').
+unRowIdx :: RowIdx -> Int
+unRowIdx (RowIdx i) = i
+{-# INLINE unRowIdx #-}
+
+-- | Unwrap a 'DefIdx' to the raw 'Int' "SimpleStateIf.hs"'s @IntMap@-keyed
+-- def registry (@sifs_defs@) needs -- 'Data.IntMap.Strict' mandates a
+-- literal 'Int' key, so a 'DefIdx' must be unwrapped at exactly that
+-- boundary. Exported for that one call site; every other place a 'DefIdx'
+-- flows (e.g. as a 'HashMap' /value/, or opaquely through this module's own
+-- API) needs no unwrapping.
+unDefIdx :: DefIdx -> Int
+unDefIdx (DefIdx i) = i
+{-# INLINE unDefIdx #-}
+
+-- | The 'unDefIdx' of a fresh index: wrap the raw 'Int' counter
+-- "SimpleStateIf.hs"'s @sifs_nextDefIdx@ hands out.
+mkDefIdx :: Int -> DefIdx
+mkDefIdx = DefIdx
+{-# INLINE mkDefIdx #-}
+
+--
+-- Row count / arena stride: three more historically Int-shaped concepts
+-- that used to sit unlabeled next to a row index in EdgeArena's functions
+-- -- "how many rows does this def currently have" (the bound an
+-- alive-scanning compaction walks) is not "which row" and is not "how many
+-- words make up one edge in this arena".
+--
+
+-- | A def's current logical row count -- what 'rowCount' returns and what
+-- 'eaWrite'\/'eaCompact'\/'maybeCompact' scan up to when reclaiming a def's
+-- arena.
+newtype RowCount = RowCount Int
+  deriving (Eq, Ord, Show)
+
+unRowCount :: RowCount -> Int
+unRowCount (RowCount i) = i
+{-# INLINE unRowCount #-}
+
+-- | Every 'RowIdx' from 0 up to (but not including) a 'RowCount' -- the
+-- iteration escape hatch for callers (e.g. "SimpleStateIf.hs"'s
+-- @validateSifState@) that need to walk every row a table currently has,
+-- rather than operate on one specific 'RowIdx' already in hand.
+rowIndices :: RowCount -> [RowIdx]
+rowIndices (RowCount n) = map RowIdx [0 .. n - 1]
+
+-- | Words per edge in an 'EdgeArena': 3 for @compDeps@ (target 'DefRef' +
+-- observed-hash hi\/lo), 1 for @rdeps@\/@srcDeps@ (target 'DefRef' or
+-- interned id alone). A plain newtype rather than a phantom type parameter
+-- on 'EdgeArena' itself -- see the module haddock's "Why EdgeArena's stride
+-- isn't a phantom type" section for why that was considered and rejected.
+newtype Stride = Stride Int
+  deriving (Eq, Ord, Show)
+
+-- | 'dt_compDeps''s stride: target 'DefRef', observed-hash hi, observed-hash
+-- lo.
+compDepsStride :: Stride
+compDepsStride = Stride 3
+
+-- | 'dt_rdeps''s and 'dt_srcDeps''s stride: one word (a target 'DefRef' or
+-- an interned src-dep id, respectively) per edge.
+singleStride :: Stride
+singleStride = Stride 1
 
 --
 -- Flags
 --
 
 -- | Packed per-row state: bit 0 alive, bit 1 pending (mid-evaluation),
--- bits 2-3 result state (see 'ResultState').
-type Flags = Word8
+-- bits 2-3 result state (see 'ResultState'). A 'newtype' over the packed
+-- 'Word8', not a type alias, so the bit layout below is the /only/ code
+-- that ever touches the byte directly -- everywhere else goes through the
+-- named accessors ('flagsAlive', 'flagsPending', 'flagsResultState',
+-- 'mkFlags'), never a raw bit test or an arithmetic comparison against the
+-- packed value.
+newtype Flags = Flags Word8
+  deriving (Eq, Show)
 
 data ResultState = NoResult | ResultFailure | ResultValue | ResultMetaOnly
   deriving (Eq, Show, Enum, Bounded)
@@ -421,23 +551,32 @@ bitAlive = 0
 bitPending = 1
 
 flagsAlive :: Flags -> Bool
-flagsAlive f = testBit f bitAlive
+flagsAlive (Flags f) = testBit f bitAlive
 {-# INLINE flagsAlive #-}
 
 flagsPending :: Flags -> Bool
-flagsPending f = testBit f bitPending
+flagsPending (Flags f) = testBit f bitPending
 {-# INLINE flagsPending #-}
 
 flagsResultState :: Flags -> ResultState
-flagsResultState f = toEnum (fromIntegral ((f `shiftR` 2) .&. 0x3))
+flagsResultState (Flags f) = toEnum (fromIntegral ((f `shiftR` 2) .&. 0x3))
 {-# INLINE flagsResultState #-}
 
 mkFlags :: Bool -> Bool -> ResultState -> Flags
 mkFlags alive pending rs =
-  (if alive then bit bitAlive else 0)
-    .|. (if pending then bit bitPending else 0)
-    .|. (fromIntegral (fromEnum rs) `shiftL` 2)
+  Flags $
+    (if alive then bit bitAlive else 0)
+      .|. (if pending then bit bitPending else 0)
+      .|. (fromIntegral (fromEnum rs) `shiftL` 2)
 {-# INLINE mkFlags #-}
+
+-- | The all-zero 'Flags' value -- not alive, not pending, no result. What a
+-- freed row's flags are reset to ('freeRow') and, via 'growUnboxedZeroed',
+-- what a freshly grown (never-written) region of the @flags@ column reads
+-- as -- see that function's haddock for why the column must be explicitly
+-- zeroed rather than left as garbage the way every other unboxed column is.
+zeroFlags :: Flags
+zeroFlags = Flags 0
 
 --
 -- Hash128 <-> unboxed pair
@@ -557,13 +696,13 @@ columnIsUnboxed :: Column e -> Bool
 columnIsUnboxed ColBoxed{} = False
 columnIsUnboxed ColUnboxed{} = True
 
-colGrow :: Int -> Column e -> IO ()
-colGrow needed (ColBoxed ref) = growBoxed ref needed
-colGrow needed (ColUnboxed Refl ref) = growUnboxed ref needed
+colGrow :: RowCount -> Column e -> IO ()
+colGrow needed (ColBoxed ref) = growBoxed ref (unRowCount needed)
+colGrow needed (ColUnboxed Refl ref) = growUnboxed ref (unRowCount needed)
 
-colRead :: Column e -> Int -> IO e
-colRead (ColBoxed ref) row = readIORef ref >>= \v -> VM.read v row
-colRead (ColUnboxed Refl ref) row = readIORef ref >>= \v -> VUM.read v row
+colRead :: Column e -> RowIdx -> IO e
+colRead (ColBoxed ref) row = readIORef ref >>= \v -> VM.read v (unRowIdx row)
+colRead (ColUnboxed Refl ref) row = readIORef ref >>= \v -> VUM.read v (unRowIdx row)
 
 -- | Write a value into the column at @row@. The 'ColBoxed' case is the one
 -- that matters: 'Data.Vector.Mutable.write' carries no strictness contract
@@ -579,9 +718,9 @@ colRead (ColUnboxed Refl ref) row = readIORef ref >>= \v -> VUM.read v row
 -- bang here makes the column itself carry the same strictness contract the
 -- @.Strict@ container it replaced did, rather than depending on every
 -- present and future caller getting the ordering right.
-colWrite :: Column e -> Int -> e -> IO ()
-colWrite (ColBoxed ref) row !e = readIORef ref >>= \v -> VM.write v row e
-colWrite (ColUnboxed Refl ref) row e = readIORef ref >>= \v -> VUM.write v row e
+colWrite :: Column e -> RowIdx -> e -> IO ()
+colWrite (ColBoxed ref) row !e = readIORef ref >>= \v -> VM.write v (unRowIdx row) e
+colWrite (ColUnboxed Refl ref) row e = readIORef ref >>= \v -> VUM.write v (unRowIdx row) e
 
 --
 -- CSR-style per-def edge arenas -- see the module haddock's "Edge storage"
@@ -591,6 +730,14 @@ colWrite (ColUnboxed Refl ref) row e = readIORef ref >>= \v -> VUM.write v row e
 -- @VU.Vector (Int, Word64, Word64)@ / @VU.Vector Int@ happens at the
 -- DefTable column-access boundary further down.
 --
+
+-- | A row's current liveness, as a callback rather than a direct
+-- 'DefTable' reference -- this section's functions are deliberately
+-- decoupled from 'DefTable' (see the module haddock), so they ask for "is
+-- this row alive" the same indirect way 'HashIndex' below asks for "what is
+-- this row's hash" (see 'GetHash'). What 'isAlive' partially applied to a
+-- concrete 'DefTable' looks like from an 'EdgeArena''s side.
+type IsRowAlive = RowIdx -> IO Bool
 
 data EdgeArena = EdgeArena
   { ea_off :: !(IORef (VUM.IOVector Int32))
@@ -617,10 +764,10 @@ newEdgeArena =
 -- | Grow an edge arena's per-row @offset@/@len@ columns to at least
 -- @needed@ rows. Does not touch the shared word arena itself -- that grows
 -- independently, on append, in 'eaWrite'.
-eaGrowRows :: EdgeArena -> Int -> IO ()
+eaGrowRows :: EdgeArena -> RowCount -> IO ()
 eaGrowRows ea needed = do
-  growUnboxed (ea_off ea) needed
-  growUnboxedZeroed (ea_len ea) needed
+  growUnboxed (ea_off ea) (unRowCount needed)
+  growUnboxedZeroed (ea_len ea) (unRowCount needed)
 
 -- | Only compact once an arena has reached this many words -- below this,
 -- the O(rowCount) scan a compaction costs isn't worth it.
@@ -630,7 +777,7 @@ compactMinWords = 4096
 -- | Compact iff the def's dead words are more than half of its used
 -- words (and the arena is large enough to bother) -- see the module
 -- haddock's amortized-cost argument.
-maybeCompact :: EdgeArena -> (Int -> IO Bool) -> Int -> Int -> IO ()
+maybeCompact :: EdgeArena -> IsRowAlive -> RowCount -> Stride -> IO ()
 maybeCompact ea isRowAlive rows stride = do
   used <- readIORef (ea_used ea)
   dead <- readIORef (ea_dead ea)
@@ -643,28 +790,29 @@ maybeCompact ea isRowAlive rows stride = do
 -- regardless of whether it was ever given an explicit new write after
 -- going dead -- see the module haddock for why that's the key property
 -- that makes tying this to the write path (rather than row-free) correct.
-eaCompact :: EdgeArena -> (Int -> IO Bool) -> Int -> Int -> IO ()
-eaCompact ea isRowAlive rows stride = do
+eaCompact :: EdgeArena -> IsRowAlive -> RowCount -> Stride -> IO ()
+eaCompact ea isRowAlive rows (Stride stride) = do
   used <- readIORef (ea_used ea)
   srcV <- readIORef (ea_data ea)
   dstV <- VUM.new (max 4 used)
   offV <- readIORef (ea_off ea)
   lenV <- readIORef (ea_len ea)
   writeIdxRef <- newIORef 0
-  forM_ [0 .. rows - 1] $ \row -> do
+  forM_ [0 .. unRowCount rows - 1] $ \rowInt -> do
+    let row = RowIdx rowInt
     alive <- isRowAlive row
-    len <- VUM.read lenV row
+    len <- VUM.read lenV rowInt
     if alive && len > 0
       then do
-        off <- VUM.read offV row
+        off <- VUM.read offV rowInt
         writeIdx <- readIORef writeIdxRef
         let n = fromIntegral len * stride
         GM.unsafeCopy (VUM.slice writeIdx n dstV) (VUM.slice (fromIntegral off) n srcV)
-        VUM.write offV row (fromIntegral writeIdx)
+        VUM.write offV rowInt (fromIntegral writeIdx)
         writeIORef writeIdxRef (writeIdx + n)
       else do
-        VUM.write offV row 0
-        VUM.write lenV row 0
+        VUM.write offV rowInt 0
+        VUM.write lenV rowInt 0
   finalUsed <- readIORef writeIdxRef
   writeIORef (ea_data ea) dstV
   writeIORef (ea_used ea) finalUsed
@@ -673,15 +821,15 @@ eaCompact ea isRowAlive rows stride = do
 -- | Read a row's edge span as a flat, stride-major 'VU.Vector Word64' (a
 -- safe copy -- the arena keeps mutating after this call returns). Empty
 -- for a row with no edges.
-eaRead :: EdgeArena -> Int -> Int -> IO (VU.Vector Word64)
-eaRead ea row stride = do
+eaRead :: EdgeArena -> RowIdx -> Stride -> IO (VU.Vector Word64)
+eaRead ea row (Stride stride) = do
   lenV <- readIORef (ea_len ea)
-  len <- VUM.read lenV row
+  len <- VUM.read lenV (unRowIdx row)
   if len == 0
     then pure VU.empty
     else do
       offV <- readIORef (ea_off ea)
-      off <- VUM.read offV row
+      off <- VUM.read offV (unRowIdx row)
       dataV <- readIORef (ea_data ea)
       VU.freeze (VUM.slice (fromIntegral off) (fromIntegral len * stride) dataV)
 
@@ -695,16 +843,16 @@ eaRead ea row stride = do
 -- row (e.g. the reset write 'lookupOrInsertRow' issues when a freed row
 -- number is reused) sees an empty span rather than the same stale ids
 -- again.
-eaTakeRow :: EdgeArena -> Int -> Int -> IO (VU.Vector Word64)
-eaTakeRow ea row stride = do
+eaTakeRow :: EdgeArena -> RowIdx -> Stride -> IO (VU.Vector Word64)
+eaTakeRow ea row stride@(Stride strideN) = do
   flat <- eaRead ea row stride
   lenV <- readIORef (ea_len ea)
   offV <- readIORef (ea_off ea)
-  len <- VUM.read lenV row
+  len <- VUM.read lenV (unRowIdx row)
   when (len > 0) $ do
-    modifyIORef' (ea_dead ea) (+ (fromIntegral len * stride))
-    VUM.write offV row 0
-    VUM.write lenV row 0
+    modifyIORef' (ea_dead ea) (+ (fromIntegral len * strideN))
+    VUM.write offV (unRowIdx row) 0
+    VUM.write lenV (unRowIdx row) 0
   pure flat
 
 -- | Overwrite a row's entire edge span with @flat@ (already stride-major
@@ -714,26 +862,26 @@ eaTakeRow ea row stride = do
 -- arena's current end, marks the row's previous span (if any) as dead
 -- weight, then lets 'maybeCompact' decide whether the def's dead fraction
 -- now warrants reclaiming it.
-eaWrite :: EdgeArena -> Int -> (Int -> IO Bool) -> Int -> Int -> VU.Vector Word64 -> IO ()
-eaWrite ea row isRowAlive rows stride flat = do
+eaWrite :: EdgeArena -> RowIdx -> IsRowAlive -> RowCount -> Stride -> VU.Vector Word64 -> IO ()
+eaWrite ea row isRowAlive rows stride@(Stride strideN) flat = do
   lenV <- readIORef (ea_len ea)
   offV <- readIORef (ea_off ea)
-  oldLen <- VUM.read lenV row
+  oldLen <- VUM.read lenV (unRowIdx row)
   when (oldLen > 0) $
-    modifyIORef' (ea_dead ea) (+ (fromIntegral oldLen * stride))
+    modifyIORef' (ea_dead ea) (+ (fromIntegral oldLen * strideN))
   let numWords = VU.length flat
   if numWords == 0
     then do
-      VUM.write offV row 0
-      VUM.write lenV row 0
+      VUM.write offV (unRowIdx row) 0
+      VUM.write lenV (unRowIdx row) 0
     else do
       used <- readIORef (ea_used ea)
       growUnboxed (ea_data ea) (used + numWords)
       dataV <- readIORef (ea_data ea)
       VU.unsafeCopy (VUM.slice used numWords dataV) flat
       writeIORef (ea_used ea) (used + numWords)
-      VUM.write offV row (fromIntegral used)
-      VUM.write lenV row (fromIntegral (numWords `div` stride))
+      VUM.write offV (unRowIdx row) (fromIntegral used)
+      VUM.write lenV (unRowIdx row) (fromIntegral (numWords `div` strideN))
   maybeCompact ea isRowAlive rows stride
 
 --
@@ -743,6 +891,12 @@ eaWrite ea row isRowAlive rows stride flat = do
 -- `DefTable`'s own `dt_paramHash` column, so it can be built and tested in
 -- isolation from the rest of the table.
 --
+
+-- | A row's own hash-column entry, as a callback -- see the comment above
+-- for why 'HashIndex' asks for this indirectly rather than taking a
+-- 'DefTable' directly. What 'readParamHash' partially applied to a concrete
+-- 'DefTable' looks like from a 'HashIndex''s side.
+type GetHash = RowIdx -> IO Hash128
 
 -- | Sentinel marking an empty slot. Real row ids are always >= 0 (they come
 -- from 'allocRow', a monotonic-or-recycled non-negative counter), so -1
@@ -787,7 +941,7 @@ hixSlot cap (Hash128 w) = fromIntegral (LH.w128_first w) .&. (cap - 1)
 -- stored key -- there isn't one), or 'Nothing' once the sequence reaches an
 -- empty slot. Shared by 'hixLookup' (wants the row) and 'hixDelete' (wants
 -- the slot, to start the backward-shift walk from).
-hixProbe :: VUM.IOVector Int32 -> (Int -> IO Hash128) -> Hash128 -> IO (Maybe (Int, Int))
+hixProbe :: VUM.IOVector Int32 -> GetHash -> Hash128 -> IO (Maybe (Int, RowIdx))
 hixProbe table getHash h = go start 0
  where
   cap = VUM.length table
@@ -799,13 +953,13 @@ hixProbe table getHash h = go start 0
         if v == hixEmpty
           then pure Nothing
           else do
-            rh <- getHash (fromIntegral v)
+            rh <- getHash (RowIdx (fromIntegral v))
             if rh == h
-              then pure (Just (i, fromIntegral v))
+              then pure (Just (i, RowIdx (fromIntegral v)))
               else go ((i + 1) .&. (cap - 1)) (steps + 1)
 
 -- | Find the row currently indexed under @h@.
-hixLookup :: HashIndex -> (Int -> IO Hash128) -> Hash128 -> IO (Maybe Int)
+hixLookup :: HashIndex -> GetHash -> Hash128 -> IO (Maybe RowIdx)
 hixLookup hix getHash h = do
   table <- readIORef (hix_table hix)
   fmap snd <$> hixProbe table getHash h
@@ -813,7 +967,7 @@ hixLookup hix getHash h = do
 -- | Insert @row@ under @h@. Caller's responsibility: @h@ is not already
 -- present ('DefTable.lookupOrInsertRow' only calls this on a lookup miss).
 -- Grows first if this insert would cross the load factor.
-hixInsert :: HashIndex -> (Int -> IO Hash128) -> Hash128 -> Int -> IO ()
+hixInsert :: HashIndex -> GetHash -> Hash128 -> RowIdx -> IO ()
 hixInsert hix getHash h row = do
   hixMaybeGrow hix getHash
   table <- readIORef (hix_table hix)
@@ -821,12 +975,12 @@ hixInsert hix getHash h row = do
       go i = do
         v <- VUM.read table i
         if v == hixEmpty
-          then VUM.write table i (fromIntegral row)
+          then VUM.write table i (fromIntegral (unRowIdx row))
           else go ((i + 1) .&. (cap - 1))
   go (hixSlot cap h)
   modifyIORef' (hix_count hix) (+ 1)
 
-hixMaybeGrow :: HashIndex -> (Int -> IO Hash128) -> IO ()
+hixMaybeGrow :: HashIndex -> GetHash -> IO ()
 hixMaybeGrow hix getHash = do
   table <- readIORef (hix_table hix)
   count <- readIORef (hix_count hix)
@@ -838,7 +992,7 @@ hixMaybeGrow hix getHash = do
 -- slot. No keys to copy -- only row ids -- so this is a fresh table plus,
 -- per occupied old slot, one @getHash@ call (the row's own @param_hash@
 -- column entry) to find its new slot.
-hixGrow :: HashIndex -> (Int -> IO Hash128) -> IO ()
+hixGrow :: HashIndex -> GetHash -> IO ()
 hixGrow hix getHash = do
   old <- readIORef (hix_table hix)
   let oldCap = VUM.length old
@@ -848,7 +1002,7 @@ hixGrow hix getHash = do
   forM_ [0 .. oldCap - 1] $ \i -> do
     v <- VUM.read old i
     when (v /= hixEmpty) $ do
-      rh <- getHash (fromIntegral v)
+      rh <- getHash (RowIdx (fromIntegral v))
       insertFresh new newCap rh v
   writeIORef (hix_table hix) new
  where
@@ -863,7 +1017,7 @@ hixGrow hix getHash = do
 -- | Remove the entry for @h@, then close the gap via backward-shift
 -- deletion. No-op if @h@ isn't present (defensive; callers are expected to
 -- only free a row they previously inserted).
-hixDelete :: HashIndex -> (Int -> IO Hash128) -> Hash128 -> IO ()
+hixDelete :: HashIndex -> GetHash -> Hash128 -> IO ()
 hixDelete hix getHash h = do
   table <- readIORef (hix_table hix)
   found <- hixProbe table getHash h
@@ -884,7 +1038,7 @@ hixDelete hix getHash h = do
 -- to @i@, opening a fresh hole at @j@; otherwise it is left alone and the
 -- walk continues. Terminates the first time @j@ reaches a genuinely empty
 -- slot.
-hixBackwardShift :: VUM.IOVector Int32 -> Int -> (Int -> IO Hash128) -> Int -> IO ()
+hixBackwardShift :: VUM.IOVector Int32 -> Int -> GetHash -> Int -> IO ()
 hixBackwardShift table cap getHash i0 = go i0 i0
  where
   go i jPrev = do
@@ -893,7 +1047,7 @@ hixBackwardShift table cap getHash i0 = go i0 i0
     if vj == hixEmpty
       then pure ()
       else do
-        hj <- getHash (fromIntegral vj)
+        hj <- getHash (RowIdx (fromIntegral vj))
         let k = hixSlot cap hj
             inRange = if i <= j then i < k && k <= j else i < k || k <= j
         if inRange
@@ -910,6 +1064,25 @@ hixBackwardShift table cap getHash i0 = go i0 i0
 -- reaching zero reclaims it (forward map entry deleted, reverse slot
 -- cleared, id pushed onto a free list for reuse) -- see the haddock.
 --
+
+-- | An id 'SrcDepIntern' has assigned to some 'AnyCompSrcDep'. The public
+-- boundary type for 'sdiIntern'\/'sdiRetain'\/'sdiRelease'\/'sdiResolve';
+-- internally, every column below stores and indexes by the raw 'Int' this
+-- wraps (an unboxed 'Data.Vector.Unboxed.Mutable.IOVector' can't hold
+-- 'SrcDepId' itself without a hand-written 'Data.Vector.Unboxed.Unbox'
+-- instance, the same tradeoff 'DefRef' makes -- see 'unDefRef''s haddock),
+-- and this module's own 'readSrcDeps'\/'writeSrcDeps' convert at the arena
+-- boundary the same way they already convert 'DefRef's.
+newtype SrcDepId = SrcDepId Int
+  deriving (Eq, Ord, Show)
+
+unSrcDepId :: SrcDepId -> Int
+unSrcDepId (SrcDepId i) = i
+{-# INLINE unSrcDepId #-}
+
+mkSrcDepId :: Int -> SrcDepId
+mkSrcDepId = SrcDepId
+{-# INLINE mkSrcDepId #-}
 
 data SrcDepIntern = SrcDepIntern
   { sdi_forward :: !(IORef (HashMap.HashMap AnyCompSrcDep Int))
@@ -955,11 +1128,11 @@ newSrcDepIntern =
 -- before retaining any of it -- see 'DefTable.writeSrcDeps' and the module
 -- haddock's "ordering hazard" note for why that separation matters when a
 -- write's old and new spans overlap.
-sdiIntern :: SrcDepIntern -> AnyCompSrcDep -> IO Int
+sdiIntern :: SrcDepIntern -> AnyCompSrcDep -> IO SrcDepId
 sdiIntern sdi !dep = do
   fwd <- readIORef (sdi_forward sdi)
   case HashMap.lookup dep fwd of
-    Just i -> pure i
+    Just i -> pure (mkSrcDepId i)
     Nothing -> do
       free <- readIORef (sdi_free sdi)
       i <- case free of
@@ -979,13 +1152,13 @@ sdiIntern sdi !dep = do
       -- rationale (a plain 'writeIORef' of a computed 'HashMap' update
       -- gives zero strictness guarantee on its own).
       writeIORef (sdi_forward sdi) $! HashMap.insert dep i fwd
-      pure i
+      pure (mkSrcDepId i)
 
 -- | Bump @i@'s refcount. Caller's responsibility: @i@ is a currently-live
 -- id (just returned by 'sdiIntern', or already known live) -- this module's
 -- only caller ('DefTable.writeSrcDeps') always satisfies that.
-sdiRetain :: SrcDepIntern -> Int -> IO ()
-sdiRetain sdi i = do
+sdiRetain :: SrcDepIntern -> SrcDepId -> IO ()
+sdiRetain sdi (SrcDepId i) = do
   rc <- readIORef (sdi_refcount sdi)
   cur <- VUM.read rc i
   VUM.write rc i (cur + 1)
@@ -996,8 +1169,8 @@ sdiRetain sdi i = do
 -- At zero: delete the forward-map entry, clear the reverse slot (dropping
 -- the boxed 'AnyCompSrcDep' -- see 'sdi_reverse'), and push @i@ onto the
 -- free list for 'sdiIntern' to reuse.
-sdiRelease :: SrcDepIntern -> Int -> IO ()
-sdiRelease sdi i = do
+sdiRelease :: SrcDepIntern -> SrcDepId -> IO ()
+sdiRelease sdi (SrcDepId i) = do
   rc <- readIORef (sdi_refcount sdi)
   cur <- VUM.read rc i
   when (cur <= 0) $
@@ -1023,8 +1196,8 @@ sdiRelease sdi i = do
 -- table, see the module haddock). A zero refcount is exactly the liveness
 -- signal a range check can't provide, so it's checked explicitly here
 -- rather than inferred from the range.
-sdiResolve :: SrcDepIntern -> Int -> IO AnyCompSrcDep
-sdiResolve sdi i = do
+sdiResolve :: SrcDepIntern -> SrcDepId -> IO AnyCompSrcDep
+sdiResolve sdi (SrcDepId i) = do
   count <- readIORef (sdi_count sdi)
   when (i < 0 || i >= count) $
     error ("DefTable.sdiResolve: interned src-dep id " ++ show i ++ " out of range (bug)")
@@ -1126,11 +1299,11 @@ new = do
       , dt_len = ln
       }
 
-growAllTo :: DefTable p a -> Int -> IO ()
+growAllTo :: DefTable p a -> RowCount -> IO ()
 growAllTo dt needed = do
-  growUnboxed (dt_paramHash dt) needed
-  growUnboxed (dt_resultHash dt) needed
-  growUnboxedZeroed (dt_flags dt) needed
+  growUnboxed (dt_paramHash dt) (unRowCount needed)
+  growUnboxed (dt_resultHash dt) (unRowCount needed)
+  growUnboxedZeroed (dt_flags dt) (unRowCount needed)
   colGrow needed (dt_param dt)
   colGrow needed (dt_value dt)
   eaGrowRows (dt_compDeps dt) needed
@@ -1139,21 +1312,21 @@ growAllTo dt needed = do
 
 -- | The table's current logical row count (rows 0 until this are valid
 -- indices, though not all are necessarily alive -- see 'isAlive').
-rowCount :: DefTable p a -> IO Int
-rowCount dt = readIORef (dt_len dt)
+rowCount :: DefTable p a -> IO RowCount
+rowCount dt = RowCount <$> readIORef (dt_len dt)
 
-allocRow :: DefTable p a -> IO Int
+allocRow :: DefTable p a -> IO RowIdx
 allocRow dt = do
   free <- readIORef (dt_free dt)
   case free of
     (r : rs) -> do
       writeIORef (dt_free dt) rs
-      pure r
+      pure (RowIdx r)
     [] -> do
       len <- readIORef (dt_len dt)
-      growAllTo dt (len + 1)
+      growAllTo dt (RowCount (len + 1))
       writeIORef (dt_len dt) (len + 1)
-      pure len
+      pure (RowIdx len)
 
 -- | Get-or-create the row for a given param hash. On a fresh row, writes
 -- the param hash, the (caller-supplied) typed param, initializes flags to
@@ -1163,7 +1336,7 @@ allocRow dt = do
 -- -- as opposed to a *reused* one -- has never had edges and there is
 -- nothing stale to gate), and returns 'True' as the second component.
 -- Returns 'False' on a hit.
-lookupOrInsertRow :: forall p a. DefTable p a -> Hash128 -> p -> IO (Int, Bool)
+lookupOrInsertRow :: forall p a. DefTable p a -> Hash128 -> p -> IO (RowIdx, Bool)
 lookupOrInsertRow dt h p = do
   found <- hixLookup (dt_index dt) (readParamHash dt) h
   case found of
@@ -1191,15 +1364,15 @@ lookupOrInsertRow dt h p = do
 -- row's own offset/len -- otherwise the reset write 'lookupOrInsertRow'
 -- issues on reuse would read the same (already-released) ids again and
 -- double-release them.
-freeRow :: DefTable p a -> Hash128 -> Int -> IO ()
+freeRow :: DefTable p a -> Hash128 -> RowIdx -> IO ()
 freeRow dt h row = do
   hixDelete (dt_index dt) (readParamHash dt) h
-  oldSrc <- eaTakeRow (dt_srcDeps dt) row 1
-  mapM_ (sdiRelease (dt_srcDepIntern dt) . fromIntegral) (VU.toList oldSrc)
-  modifyIORef' (dt_free dt) (row :)
-  writeFlags dt row 0
+  oldSrc <- eaTakeRow (dt_srcDeps dt) row singleStride
+  mapM_ (sdiRelease (dt_srcDepIntern dt) . mkSrcDepId . fromIntegral) (VU.toList oldSrc)
+  modifyIORef' (dt_free dt) (unRowIdx row :)
+  writeFlags dt row zeroFlags
 
-isAlive :: DefTable p a -> Int -> IO Bool
+isAlive :: DefTable p a -> IsRowAlive
 isAlive dt row = flagsAlive <$> readFlags dt row
 
 --
@@ -1209,53 +1382,62 @@ isAlive dt row = flagsAlive <$> readFlags dt row
 -- construction.
 --
 
-readFlags :: DefTable p a -> Int -> IO Flags
-readFlags dt row = readIORef (dt_flags dt) >>= \v -> VUM.read v row
+readFlags :: DefTable p a -> RowIdx -> IO Flags
+readFlags dt row = Flags <$> (readIORef (dt_flags dt) >>= \v -> VUM.read v (unRowIdx row))
 
-writeFlags :: DefTable p a -> Int -> Flags -> IO ()
-writeFlags dt row f = readIORef (dt_flags dt) >>= \v -> VUM.write v row f
+writeFlags :: DefTable p a -> RowIdx -> Flags -> IO ()
+writeFlags dt row (Flags f) = readIORef (dt_flags dt) >>= \v -> VUM.write v (unRowIdx row) f
 
-setPending :: DefTable p a -> Int -> Bool -> IO ()
+setPending :: DefTable p a -> RowIdx -> Bool -> IO ()
 setPending dt row p = do
   f <- readFlags dt row
   writeFlags dt row (mkFlags (flagsAlive f) p (flagsResultState f))
 
-readHash :: IORef (VUM.IOVector (Word64, Word64)) -> Int -> IO Hash128
-readHash ref row = pairToHash <$> (readIORef ref >>= \v -> VUM.read v row)
+readHash :: IORef (VUM.IOVector (Word64, Word64)) -> RowIdx -> IO Hash128
+readHash ref row = pairToHash <$> (readIORef ref >>= \v -> VUM.read v (unRowIdx row))
 
-writeHash :: IORef (VUM.IOVector (Word64, Word64)) -> Int -> Hash128 -> IO ()
-writeHash ref row hv = readIORef ref >>= \v -> VUM.write v row (hashToPair hv)
+writeHash :: IORef (VUM.IOVector (Word64, Word64)) -> RowIdx -> Hash128 -> IO ()
+writeHash ref row hv = readIORef ref >>= \v -> VUM.write v (unRowIdx row) (hashToPair hv)
 
-readParamHash :: DefTable p a -> Int -> IO Hash128
+readParamHash :: DefTable p a -> GetHash
 readParamHash dt = readHash (dt_paramHash dt)
 
-readResultHash :: DefTable p a -> Int -> IO Hash128
+readResultHash :: DefTable p a -> RowIdx -> IO Hash128
 readResultHash dt = readHash (dt_resultHash dt)
 
-writeResultHash :: DefTable p a -> Int -> Hash128 -> IO ()
+writeResultHash :: DefTable p a -> RowIdx -> Hash128 -> IO ()
 writeResultHash dt = writeHash (dt_resultHash dt)
 
 -- | Zero out the result-hash slot. Not required for correctness (every
 -- read is gated behind the result-state flag bits), but avoids a
 -- changed-bit false-negative from comparing against an ancient hash if a
 -- future column dump/debug tool ever reads it unconditionally.
-clearResultHash :: DefTable p a -> Int -> IO ()
+clearResultHash :: DefTable p a -> RowIdx -> IO ()
 clearResultHash dt row = writeHash (dt_resultHash dt) row (pairToHash (0, 0))
 
-writeParam :: DefTable p a -> Int -> p -> IO ()
+writeParam :: DefTable p a -> RowIdx -> p -> IO ()
 writeParam dt row p = colWrite (dt_param dt) row p
 
-readParam :: DefTable p a -> Int -> IO p
+readParam :: DefTable p a -> RowIdx -> IO p
 readParam dt row = colRead (dt_param dt) row
 
-readValue :: DefTable p a -> Int -> IO a
+readValue :: DefTable p a -> RowIdx -> IO a
 readValue dt row = colRead (dt_value dt) row
 
-writeValue :: DefTable p a -> Int -> a -> IO ()
+writeValue :: DefTable p a -> RowIdx -> a -> IO ()
 writeValue dt row a = colWrite (dt_value dt) row a
 
 -- | Flatten a comp-dep edge set into stride-3 words (target, hash-hi,
--- hash-lo) for 'eaWrite'.
+-- hash-lo) for 'eaWrite'. The target component is a packed 'DefRef' stored
+-- as a raw 'Word64' -- like the rest of this section, a bulk unboxed
+-- payload deliberately left in its raw machine representation (see
+-- 'unDefRef''s haddock: giving 'DefRef' its own 'Unbox' instance is exactly
+-- the friction this module avoids), not a scalar call-site argument where a
+-- transposition would be the risk. 'DefTable'\'s own row-identity API
+-- ('packRef'\/'unpackRef'\/'refDefIdx'\/'refRow') is the actual 'DefRef'
+-- boundary; callers reconstruct a typed 'DefRef' from a target 'Int' via
+-- 'mkDefRefUnsafe' only where they cross back into scalar, single-ref logic
+-- (e.g. "SimpleStateIf.hs"'s @resolveRefToAny@).
 flattenCompDeps :: VU.Vector (Int, Word64, Word64) -> VU.Vector Word64
 flattenCompDeps xs = VU.generate (3 * VU.length xs) go
  where
@@ -1270,36 +1452,37 @@ unflattenCompDeps flat = VU.generate (VU.length flat `div` 3) go
  where
   go n = (fromIntegral (flat VU.! (3 * n)), flat VU.! (3 * n + 1), flat VU.! (3 * n + 2))
 
-readCompDeps :: DefTable p a -> Int -> IO (VU.Vector (Int, Word64, Word64))
-readCompDeps dt row = unflattenCompDeps <$> eaRead (dt_compDeps dt) row 3
+readCompDeps :: DefTable p a -> RowIdx -> IO (VU.Vector (Int, Word64, Word64))
+readCompDeps dt row = unflattenCompDeps <$> eaRead (dt_compDeps dt) row compDepsStride
 
-writeCompDeps :: DefTable p a -> Int -> VU.Vector (Int, Word64, Word64) -> IO ()
+writeCompDeps :: DefTable p a -> RowIdx -> VU.Vector (Int, Word64, Word64) -> IO ()
 writeCompDeps dt row xs = do
   n <- rowCount dt
-  eaWrite (dt_compDeps dt) row (isAlive dt) n 3 (flattenCompDeps xs)
+  eaWrite (dt_compDeps dt) row (isAlive dt) n compDepsStride (flattenCompDeps xs)
 
--- | Just the target refs of a comp-dep edge set, discarding the observed
--- version -- what the rdeps graph (add/remove edges, GC liveness) cares
--- about.
+-- | Just the target refs (raw, packed 'DefRef' 'Int's -- see
+-- 'flattenCompDeps''s haddock) of a comp-dep edge set, discarding the
+-- observed version -- what the rdeps graph (add/remove edges, GC liveness)
+-- cares about.
 compDepTargets :: VU.Vector (Int, Word64, Word64) -> VU.Vector Int
 compDepTargets = VU.map (\(r, _, _) -> r)
 
-readRdeps :: DefTable p a -> Int -> IO (VU.Vector Int)
-readRdeps dt row = VU.map fromIntegral <$> eaRead (dt_rdeps dt) row 1
+readRdeps :: DefTable p a -> RowIdx -> IO (VU.Vector Int)
+readRdeps dt row = VU.map fromIntegral <$> eaRead (dt_rdeps dt) row singleStride
 
-writeRdeps :: DefTable p a -> Int -> VU.Vector Int -> IO ()
+writeRdeps :: DefTable p a -> RowIdx -> VU.Vector Int -> IO ()
 writeRdeps dt row xs = do
   n <- rowCount dt
-  eaWrite (dt_rdeps dt) row (isAlive dt) n 1 (VU.map fromIntegral xs)
+  eaWrite (dt_rdeps dt) row (isAlive dt) n singleStride (VU.map fromIntegral xs)
 
 -- | Decode a row's interned src-dep arena span back into a 'HashSet' of
 -- full 'AnyCompSrcDep' values -- see the module haddock's "Src-dep
 -- interning" section. Callers outside this module never see an interned
 -- id.
-readSrcDeps :: DefTable p a -> Int -> IO (HashSet AnyCompSrcDep)
+readSrcDeps :: DefTable p a -> RowIdx -> IO (HashSet AnyCompSrcDep)
 readSrcDeps dt row = do
-  flat <- eaRead (dt_srcDeps dt) row 1
-  deps <- mapM (sdiResolve (dt_srcDepIntern dt) . fromIntegral) (VU.toList flat)
+  flat <- eaRead (dt_srcDeps dt) row singleStride
+  deps <- mapM (sdiResolve (dt_srcDepIntern dt) . mkSrcDepId . fromIntegral) (VU.toList flat)
   pure (HashSet.fromList deps)
 
 -- | Intern every element of @s@ (assigning fresh ids on a miss -- see
@@ -1317,15 +1500,15 @@ readSrcDeps dt row = do
 -- reverse-slot clear, free-list push) out from under the retain that was
 -- about to follow, corrupting the very id this write is about to store
 -- right back into the row's own new span.
-writeSrcDeps :: DefTable p a -> Int -> HashSet AnyCompSrcDep -> IO ()
+writeSrcDeps :: DefTable p a -> RowIdx -> HashSet AnyCompSrcDep -> IO ()
 writeSrcDeps dt row s = do
   let sdi = dt_srcDepIntern dt
-  oldFlat <- eaRead (dt_srcDeps dt) row 1
+  oldFlat <- eaRead (dt_srcDeps dt) row singleStride
   newIds <- mapM (sdiIntern sdi) (HashSet.toList s)
   mapM_ (sdiRetain sdi) newIds
-  mapM_ (sdiRelease sdi . fromIntegral) (VU.toList oldFlat)
+  mapM_ (sdiRelease sdi . mkSrcDepId . fromIntegral) (VU.toList oldFlat)
   n <- rowCount dt
-  eaWrite (dt_srcDeps dt) row (isAlive dt) n 1 (VU.fromList (map fromIntegral newIds))
+  eaWrite (dt_srcDeps dt) row (isAlive dt) n singleStride (VU.fromList (map (fromIntegral . unSrcDepId) newIds))
 
 -- | Test/debug-only: number of currently-live interned src-dep ids in this
 -- def's table -- see 'sdiLiveCount'. Exported (unlike the rest of
@@ -1347,19 +1530,29 @@ h = largeHash128
 newTest :: IO (DefTable Int Int)
 newTest = new
 
+-- | Test-only shorthand for building 'DefIdx'/'RowIdx' values from plain
+-- integer literals -- this module's own test section has the constructors
+-- in scope (unlike every other module), so there's no need to go via the
+-- public 'mkDefIdx' escape hatch.
+di :: Int -> DefIdx
+di = DefIdx
+
+ri :: Int -> RowIdx
+ri = RowIdx
+
 test_packUnpackRoundTrips :: IO ()
 test_packUnpackRoundTrips = do
-  assertEqual (3, 7) (unpackRef (packRef 3 7))
-  assertEqual (0, 0) (unpackRef (packRef 0 0))
-  assertEqual (5, 0) (unpackRef (packRef 5 0))
-  assertEqual 3 (refDefIdx (packRef 3 7))
-  assertEqual 7 (refRow (packRef 3 7))
+  assertEqual (di 3, ri 7) (unpackRef (packRef (di 3) (ri 7)))
+  assertEqual (di 0, ri 0) (unpackRef (packRef (di 0) (ri 0)))
+  assertEqual (di 5, ri 0) (unpackRef (packRef (di 5) (ri 0)))
+  assertEqual (di 3) (refDefIdx (packRef (di 3) (ri 7)))
+  assertEqual (ri 7) (refRow (packRef (di 3) (ri 7)))
 
 test_newTableIsEmpty :: IO ()
 test_newTableIsEmpty = do
   dt <- newTest
   n <- rowCount dt
-  assertEqual 0 n
+  assertEqual (RowCount 0) n
 
 test_lookupOrInsertRowIsIdempotent :: IO ()
 test_lookupOrInsertRowIsIdempotent = do
@@ -1377,7 +1570,7 @@ test_lookupOrInsertRowDistinctHashesGetDistinctRows = do
   (r2, _) <- lookupOrInsertRow dt (h 2) 2
   assertBool (r1 /= r2)
   n <- rowCount dt
-  assertEqual 2 n
+  assertEqual (RowCount 2) n
 
 test_freeRowThenReinsertNewHashReusesRowNumber :: IO ()
 test_freeRowThenReinsertNewHashReusesRowNumber = do
@@ -1389,7 +1582,7 @@ test_freeRowThenReinsertNewHashReusesRowNumber = do
   assertEqual r1 r2
   -- freeing didn't grow the table -- the freed slot was reused, not a new one
   n <- rowCount dt
-  assertEqual 1 n
+  assertEqual (RowCount 1) n
 
 test_freeRowRemovesOldHashFromIndex :: IO ()
 test_freeRowRemovesOldHashFromIndex = do
@@ -1407,7 +1600,7 @@ test_manyRowsAreAllDistinctAndCounted = do
   dt <- newTest
   rows <- mapM (\i -> fst <$> lookupOrInsertRow dt (h i) i) [1 .. 200]
   n <- rowCount dt
-  assertEqual 200 n
+  assertEqual (RowCount 200) n
   assertEqual 200 (length (HashMap.toList (toSet rows)))
  where
   toSet = HashMap.fromList . map (\r -> (r, ()))
@@ -1848,7 +2041,7 @@ test_sdiResolveFailsLoudlyOnReleasedId = do
 test_sdiResolveFailsLoudlyOnNeverAssignedId :: IO ()
 test_sdiResolveFailsLoudlyOnNeverAssignedId = do
   sdi <- newSrcDepIntern
-  result <- try (evaluate =<< sdiResolve sdi 42) :: IO (Either SomeException AnyCompSrcDep)
+  result <- try (evaluate =<< sdiResolve sdi (mkSrcDepId 42)) :: IO (Either SomeException AnyCompSrcDep)
   assertBool (isLeft result)
 
 -- | 'sdiRelease' on an id already at refcount zero (an underflow -- every
@@ -1946,7 +2139,7 @@ test_manyOverwritesOfSameRowKeepLatestEdgesCorrect = do
     ( \i -> do
         let cd = VU.fromList [(i, fromIntegral i, fromIntegral (i + 1))]
         writeCompDeps dt r cd
-        let rd = VU.fromList [i, i + 1, i + 2]
+        let rd = VU.fromList [i, (i + 1), (i + 2)]
         writeRdeps dt r rd
     )
     [1 .. 3000]
@@ -1965,8 +2158,8 @@ test_compactionDoesNotDisturbOtherAliveRowsEdges = do
   bystanders <- mapM (\i -> lookupOrInsertRow dt (h i) i) [1 .. 10]
   mapM_
     ( \(r, i) -> do
-        writeCompDeps dt r (VU.fromList [(100 + i, fromIntegral i, fromIntegral i)])
-        writeRdeps dt r (VU.fromList [200 + i])
+        writeCompDeps dt r (VU.fromList [((100 + i), fromIntegral i, fromIntegral i)])
+        writeRdeps dt r (VU.fromList [(200 + i)])
     )
     (zip (map fst bystanders) [1 .. 10])
   mapM_
@@ -1976,9 +2169,9 @@ test_compactionDoesNotDisturbOtherAliveRowsEdges = do
   mapM_
     ( \(r, i) -> do
         cd <- readCompDeps dt r
-        assertEqual (VU.fromList [(100 + i, fromIntegral i, fromIntegral i)]) cd
+        assertEqual (VU.fromList [((100 + i), fromIntegral i, fromIntegral i)]) cd
         rd <- readRdeps dt r
-        assertEqual (VU.fromList [200 + i]) rd
+        assertEqual (VU.fromList [(200 + i)]) rd
     )
     (zip (map fst bystanders) [1 .. 10])
 
@@ -2150,11 +2343,13 @@ rawHash hi lo = Hash128 (LH.Word128 hi lo)
 newHashColumn :: IO (IORef (VM.IOVector Hash128))
 newHashColumn = newIORef =<< VM.new 256
 
-setHashColumn :: IORef (VM.IOVector Hash128) -> Int -> Hash128 -> IO ()
-setHashColumn ref row hv = readIORef ref >>= \v -> VM.write v row hv
+setHashColumn :: IORef (VM.IOVector Hash128) -> RowIdx -> Hash128 -> IO ()
+setHashColumn ref row hv = readIORef ref >>= \v -> VM.write v (unRowIdx row) hv
 
-getHashColumn :: IORef (VM.IOVector Hash128) -> Int -> IO Hash128
-getHashColumn ref row = readIORef ref >>= \v -> VM.read v row
+-- | Matches 'GetHash''s shape, partially applied to a concrete column --
+-- exactly how a real 'DefTable''s 'readParamHash' is used at this callback.
+getHashColumn :: IORef (VM.IOVector Hash128) -> GetHash
+getHashColumn ref row = readIORef ref >>= \v -> VM.read v (unRowIdx row)
 
 test_hashIndexLookupMissOnEmptyTable :: IO ()
 test_hashIndexLookupMissOnEmptyTable = do
@@ -2168,18 +2363,18 @@ test_hashIndexInsertThenLookupFindsRow = do
   hix <- newHashIndex
   col <- newHashColumn
   let hv = rawHash 42 42
-  setHashColumn col 5 hv
-  hixInsert hix (getHashColumn col) hv 5
+  setHashColumn col (ri 5) hv
+  hixInsert hix (getHashColumn col) hv (ri 5)
   found <- hixLookup hix (getHashColumn col) hv
-  assertEqual (Just 5) found
+  assertEqual (Just (ri 5)) found
 
 test_hashIndexLookupMissForDifferentHash :: IO ()
 test_hashIndexLookupMissForDifferentHash = do
   hix <- newHashIndex
   col <- newHashColumn
   let hv = rawHash 1 1
-  setHashColumn col 0 hv
-  hixInsert hix (getHashColumn col) hv 0
+  setHashColumn col (ri 0) hv
+  hixInsert hix (getHashColumn col) hv (ri 0)
   found <- hixLookup hix (getHashColumn col) (rawHash 2 2)
   assertEqual Nothing found
 
@@ -2188,8 +2383,8 @@ test_hashIndexDeleteThenLookupMisses = do
   hix <- newHashIndex
   col <- newHashColumn
   let hv = rawHash 7 7
-  setHashColumn col 3 hv
-  hixInsert hix (getHashColumn col) hv 3
+  setHashColumn col (ri 3) hv
+  hixInsert hix (getHashColumn col) hv (ri 3)
   hixDelete hix (getHashColumn col) hv
   found <- hixLookup hix (getHashColumn col) hv
   assertEqual Nothing found
@@ -2199,12 +2394,12 @@ test_hashIndexDeleteOnMissingKeyIsNoOp = do
   hix <- newHashIndex
   col <- newHashColumn
   let hv = rawHash 9 9
-  setHashColumn col 0 hv
-  hixInsert hix (getHashColumn col) hv 0
+  setHashColumn col (ri 0) hv
+  hixInsert hix (getHashColumn col) hv (ri 0)
   -- deleting an absent key must not throw and must not disturb the real entry
   hixDelete hix (getHashColumn col) (rawHash 123 456)
   found <- hixLookup hix (getHashColumn col) hv
-  assertEqual (Just 0) found
+  assertEqual (Just (ri 0)) found
 
 -- | Force several entries into the same initial-capacity (8) probe chain by
 -- picking hi words that collide mod 8, and check every entry is still
@@ -2219,14 +2414,14 @@ test_hashIndexCollisionsAllFindable = do
   mapM_
     ( \(i, hiW) -> do
         let hv = rawHash hiW 0
-        setHashColumn col i hv
-        hixInsert hix (getHashColumn col) hv i
+        setHashColumn col (ri i) hv
+        hixInsert hix (getHashColumn col) hv (ri i)
     )
     (zip [0 ..] his)
   mapM_
     ( \(i, hiW) -> do
         found <- hixLookup hix (getHashColumn col) (rawHash hiW 0)
-        assertEqual (Just i) found
+        assertEqual (Just (ri i)) found
     )
     (zip [0 ..] his)
 
@@ -2239,14 +2434,14 @@ test_hashIndexDeleteMiddleOfCollisionChainKeepsOthersFindable = do
   hix <- newHashIndex
   col <- newHashColumn
   let hvs = [rawHash hiW 0 | hiW <- [0, 8, 16]] -- all collide to slot 0
-  mapM_ (\(i, hv) -> setHashColumn col i hv >> hixInsert hix (getHashColumn col) hv i) (zip [0 ..] hvs)
+  mapM_ (\(i, hv) -> setHashColumn col (ri i) hv >> hixInsert hix (getHashColumn col) hv (ri i)) (zip [0 ..] hvs)
   hixDelete hix (getHashColumn col) (hvs !! 1) -- delete the middle one (hi=8, row 1)
   found0 <- hixLookup hix (getHashColumn col) (hvs !! 0)
   found1 <- hixLookup hix (getHashColumn col) (hvs !! 1)
   found2 <- hixLookup hix (getHashColumn col) (hvs !! 2)
-  assertEqual (Just 0) found0
+  assertEqual (Just (ri 0)) found0
   assertEqual Nothing found1
-  assertEqual (Just 2) found2
+  assertEqual (Just (ri 2)) found2
 
 test_hashIndexGrowsAndPreservesAllEntries :: IO ()
 test_hashIndexGrowsAndPreservesAllEntries = do
@@ -2258,15 +2453,15 @@ test_hashIndexGrowsAndPreservesAllEntries = do
   mapM_
     ( \i -> do
         let hv = rawHash (fromIntegral i) (fromIntegral i)
-        setHashColumn col i hv
-        hixInsert hix (getHashColumn col) hv i
+        setHashColumn col (ri i) hv
+        hixInsert hix (getHashColumn col) hv (ri i)
     )
     [0 .. n - 1]
   mapM_
     ( \i -> do
         let hv = rawHash (fromIntegral i) (fromIntegral i)
         found <- hixLookup hix (getHashColumn col) hv
-        assertEqual (Just i) found
+        assertEqual (Just (ri i)) found
     )
     [0 .. n - 1]
 
@@ -2284,16 +2479,16 @@ test_hashIndexChurnDoesNotDegradeCapacityOrCorrectness = do
   -- remain findable throughout the churn of everything else
   let stableA = rawHash 1001 1001
       stableB = rawHash 1002 1002
-  setHashColumn col 200 stableA
-  hixInsert hix (getHashColumn col) stableA 200
-  setHashColumn col 201 stableB
-  hixInsert hix (getHashColumn col) stableB 201
+  setHashColumn col (ri 200) stableA
+  hixInsert hix (getHashColumn col) stableA (ri 200)
+  setHashColumn col (ri 201) stableB
+  hixInsert hix (getHashColumn col) stableB (ri 201)
   forM_ [1 .. 500 :: Int] $ \i -> do
     let hv = rawHash (fromIntegral (1000000 + i)) 0
-    setHashColumn col 0 hv
-    hixInsert hix (getHashColumn col) hv 0
+    setHashColumn col (ri 0) hv
+    hixInsert hix (getHashColumn col) hv (ri 0)
     found <- hixLookup hix (getHashColumn col) hv
-    assertEqual (Just 0) found
+    assertEqual (Just (ri 0)) found
     hixDelete hix (getHashColumn col) hv
     foundAfter <- hixLookup hix (getHashColumn col) hv
     assertEqual Nothing foundAfter
@@ -2306,8 +2501,8 @@ test_hashIndexChurnDoesNotDegradeCapacityOrCorrectness = do
   assertEqual 2 count
   foundA <- hixLookup hix (getHashColumn col) stableA
   foundB <- hixLookup hix (getHashColumn col) stableB
-  assertEqual (Just 200) foundA
-  assertEqual (Just 201) foundB
+  assertEqual (Just (ri 200)) foundA
+  assertEqual (Just (ri 201)) foundB
 
 -- | The same churn pattern, but through 'DefTable''s own public API
 -- (lookupOrInsertRow / freeRow) rather than 'HashIndex' directly -- the
