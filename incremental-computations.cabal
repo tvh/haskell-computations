@@ -78,7 +78,6 @@ library
       Control.Computations.Utils.Logging
       Control.Computations.Utils.MultiMap
       Control.Computations.Utils.MultiSet
-      Control.Computations.Utils.Parser
       Control.Computations.Utils.SourceLocation
       Control.Computations.Utils.SqliteUtils
       Control.Computations.Utils.TimeSpan
@@ -136,7 +135,6 @@ library
     , mtl
     , primitive
     , psqueues
-    , quickcheck-instances
     , random
     , resourcet
     , safe
@@ -170,6 +168,7 @@ executable incremental-computations-exe
       Control.Computations.Demos.Hospital.PatTypes
       Control.Computations.Demos.Hospital.Server
       Control.Computations.Demos.Hospital.Simulation
+      Control.Computations.Demos.Hospital.Tests
       Control.Computations.Demos.Main
       Control.Computations.Demos.Simple.Main
       Control.Computations.Demos.Tests
@@ -228,7 +227,6 @@ executable incremental-computations-exe
     , primitive
     , process
     , psqueues
-    , quickcheck-instances
     , random
     , resourcet
     , safe
@@ -302,7 +300,6 @@ test-suite incremental-computations-test
     , mtl
     , primitive
     , psqueues
-    , quickcheck-instances
     , random
     , resourcet
     , safe

@@ -39,7 +39,6 @@ dependencies:
   - mtl
   - primitive
   - psqueues
-  - quickcheck-instances
   - random
   - resourcet
   - safe

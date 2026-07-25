@@ -37,22 +37,70 @@ module Control.Computations.Utils.TimeSpan (
 ----------------------------------------
 -- LOCAL
 ----------------------------------------
-import Control.Computations.Utils.Parser
 import Control.Computations.Utils.Types
 
 ----------------------------------------
 -- EXTERNAL
 ----------------------------------------
 
+import Control.Monad (join, void)
 import Data.Hashable
 import Data.LargeHashable
 import qualified Data.Text as T
 import Data.Time.Clock
+import Data.Void (Void)
 import GHC.Generics (Generic)
 import Test.Framework
 import qualified Text.Megaparsec as P
 import qualified Text.Megaparsec.Char as P
 import qualified Text.Megaparsec.Char.Lexer as L
+
+-- The tiny slice of "Control.Computations.Utils.Parser" (deleted; this was
+-- its sole caller) that 'timeSpanP' actually needs: a parser type alias
+-- plus the whitespace/integer lexeme parsers and the two ways to run a
+-- parser and get back a 'Fail'.
+type Parser = P.Parsec Void T.Text
+
+spaceP :: Parser ()
+spaceP =
+  L.space
+    (void P.spaceChar)
+    (fail "no support for line comments")
+    (fail "no support for block comments")
+
+lexemeP :: Parser a -> Parser a
+lexemeP = L.lexeme spaceP
+
+integerP :: Parser Integer
+integerP = L.signed P.space (lexemeP L.decimal)
+
+parseM :: Parser a -> FilePath -> T.Text -> Fail a
+parseM parser filename value =
+  case P.parse (parser <* P.eof) filename value of
+    Left err -> fail (P.errorBundlePretty err)
+    Right x -> return x
+
+parseM' :: Parser a -> String -> T.Text -> Fail (a, T.Text)
+parseM' p fn str =
+  let initialState =
+        -- Unfortunately not exported by megaparsec
+        P.State
+          { P.stateInput = str
+          , P.stateOffset = 0
+          , P.stateParseErrors = []
+          , P.statePosState =
+              P.PosState
+                { P.pstateInput = str
+                , P.pstateOffset = 0
+                , P.pstateSourcePos = P.initialPos fn
+                , P.pstateTabWidth = P.defaultTabWidth
+                , P.pstateLinePrefix = ""
+                }
+          }
+      (s, mRes) = P.runParser' p initialState
+   in case mRes of
+        Left e -> fail $ P.errorBundlePretty e
+        Right res -> return (res, P.stateInput s)
 
 -- | Represents a time span with microsecond resolution.
 newtype TimeSpan = TimeSpan {unTimeSpan :: Integer}
@@ -154,17 +202,18 @@ prop_timeSpanP :: TimeSpan -> Bool
 prop_timeSpanP f =
   parseM timeSpanP "" (showText f) == Ok f
 
--- | Parse a 'TimeSpan' from its textual form (e.g. @"3days3h"@), the
--- megaparsec-free entry point for callers such as config-file parsing that
--- shouldn't need to know this module is implemented with 'Parser'. On
--- failure, the 'Fail' string is megaparsec's own parse-error message, which
--- is far more informative than a generic "invalid input" string.
 -- Note: 'prop_readShow' (round-tripping via 'read'/'show') used to live
 -- here alongside a 'Read TimeSpan' instance. Now that 'Read TimeSpan' is
 -- gone (its sole consumer, Config.hs, calls 'parseTimeSpan' directly),
 -- that round-trip property is exactly 'prop_timeSpanP' above --
 -- 'parseTimeSpan' is defined as 'parseM timeSpanP ""' -- so it was dropped
 -- as redundant rather than retargeted.
+
+-- | Parse a 'TimeSpan' from its textual form (e.g. @"3days3h"@), the
+-- megaparsec-free entry point for callers such as config-file parsing that
+-- shouldn't need to know this module is implemented with 'Parser'. On
+-- failure, the 'Fail' string is megaparsec's own parse-error message, which
+-- is far more informative than a generic "invalid input" string.
 parseTimeSpan :: T.Text -> Fail TimeSpan
 parseTimeSpan = parseM timeSpanP ""
 

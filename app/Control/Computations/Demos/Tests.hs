@@ -9,6 +9,7 @@ import Test.Framework
 -- Generate with
 -- egrep -R -l '^(test|prop)_' app | sed 's|src/||g; s|/|.|g; s|.hs$||g' | sort -u | gawk '{ printf "import {-@ HTF_TESTS @-} %s\n", $0 }'
 import {-@ HTF_TESTS @-} Control.Computations.Demos.DirSync.Tests
+import {-@ HTF_TESTS @-} Control.Computations.Demos.Hospital.Tests
 
 testMain :: IO ()
 testMain = do
