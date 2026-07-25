@@ -868,6 +868,80 @@ dominated by GHC's copying headroom rather than by data layout. Cold eval
 6.8 s vs Rust ~2.9 s (2.3×). Live update 10.5 s vs ~0.5 s — **still ~20×,
 and now conspicuously the only metric that has not moved all campaign.**
 
+### 4f — the 20× live-update gap was an accidental quadratic (commit `3e817bb`) — **kept**
+
+The hypothesis behind this investigation — "a gap that appears in one
+phase but not the other, over identical data structures, is not a constant
+factor" — was correct, and the culprit is a two-line-fixable O(n).
+
+**Mechanism.** `Impl.hs`'s `stepCompEngine` calls
+`withCompState staleQueueSize` **once per dequeued cap** — 80,767 times per
+round at scale 1.0. `staleQueueSize` resolved to
+`PriorityAgingQueue.size`, which summed `Data.HashPSQ.size` over four
+priority sub-queues — and `Data.HashPSQ.size` is **O(n)**: confirmed by
+reading `psqueues-0.2.8.3`'s `Data/HashPSQ/Internal.hs`, it folds the
+entire tree (`IntPSQ.fold'`) because bucket sizes aren't tracked
+incrementally. So every rerun paid a cost proportional to the current
+queue size: quadratic in the size of a propagation round.
+
+**Why cold eval never showed it**: `startCompEngine` evaluates recursively
+via `execAp` and never goes through `stepCompEngine`/`dequeueNextCap`/
+`staleQueueSize` at all. That is exactly why cold eval improved across
+Stages 0–4e while the live update sat unmoved — they don't share this path.
+
+**The scaling table is the proof** (µs/rerun, dirty-set fraction constant):
+
+| Scale | reruns | before | after |
+|---|---|---|---|
+| 0.05 | 4,755 | ~14.5 | ~8.2 |
+| 0.1 | 8,248 | ~19.7 | ~8.3 |
+| 0.25 | 24,671 | ~49.4 | ~9.8 |
+| 0.5 | 41,627 | ~71.8 | ~10.3 |
+| 1.0 | 80,767 | **~130** | **~10.4** |
+
+Per-rerun cost grew ~9× over a 20× scale range before; it is **flat at
+every scale** after. Textbook O(n) → O(1).
+
+Profile (live-phase-isolated via a new, off-by-default
+`PERSIST_BENCH_LIVE_LOOPS` diagnostic, `-fprof-late`): `IntPSQ.fold'` and
+friends were **22.5% of time / 24.4% of alloc — the largest cost-center
+family in the profile**, more than double the next item. The old whole-run
+profiles under-reported it at ~4% purely because they were cold-eval
+dominated; isolating the phase was what made it visible.
+
+**Fix**: an incrementally-maintained `paq_size` in `PriorityAgingQueue`
+(updated in `enqueue`/`deleteView`/`dequeue`; `upgrade` only moves entries
+between sub-queues so it doesn't touch the count). `size` becomes O(1).
+
+| Scale 1.0 | before | after |
+|---|---|---|
+| live | 10.55–10.85 s | **0.80–0.85 s (~13×)** |
+| cold | 6.89–6.97 s | 6.86–6.92 s (flat) |
+| max_live | 375.7 MB | 375.7 MB (identical) |
+| GCs | 925 | **388** |
+| reruns | 80,767 | 80,767 (bit-identical) |
+
+Everything else was **exonerated with evidence, not assumed**: the
+src-index walk is bounded by the key's own dependents; `dequeueNextCap` is
+O(log n) + O(1); `deleteDeadOutputs` runs only at `nRun==1`;
+`commitPendingOutputsForKey` is bounded by the row's own outputs, and the
+one genuinely O(total-outputs) function (`getCompSinkOuts`) is never on the
+per-rerun path.
+
+### Scoreboard after 4f — the arc, end to end
+
+| metric | Stage 0 | now | vs Rust |
+|---|---|---|---|
+| cold eval | 42.8 s | **6.9 s** | 2.4× |
+| live update | 24.4 s | **0.85 s** | **1.7×** |
+| live heap | ~1,500 B/cap | **375.8 B/cap** | 1.14× |
+| RSS | ~2.6 GB | **785 MB** | 2.2× |
+
+Live update is now the *closest* metric to Rust, having been the worst by
+an order of magnitude. Cold 2.4× and live 1.7× are believable constant
+factors for a boxed-by-default runtime; the remaining RSS ratio is GHC's
+copying headroom, not layout.
+
 ## Not tried yet / open items
 
 - **The Interlude-2 diet, measured.** The Rust notes list a ranked, concrete
