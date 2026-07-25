@@ -602,6 +602,78 @@ argument for persistent structures disappears — future persistence work
 inherits mutable-snapshot complexity Rust already solved (Stage 2's
 pending-map pattern ports back).
 
+## Stage 3 — columnar-unboxed state (commits `a8ae7ff`…`be072a8`, harness fix `20a9c69`)
+
+The Memory-roadmap rewrite, landed as five separately-buildable increments
+(the earlier WIP branch's architecture adopted after review; its commit
+sequence restarted and every claim re-verified — `wip/columnar-rework`
+preserved as archive): (1) `DefTable` per-def struct-of-arrays skeleton
+with packed `DefRef(defIdx, row)` ids + free-list; (2) unboxed
+`param_hash`/`result_hash`/`flags` columns (`Data.Vector.Unboxed.Mutable`);
+(3) the big wiring commit — `DefTable` replaces `SimpleStateIf`'s five
+containers, flat rdeps + changed-bit replace `VerList`'s version
+bucketing, typed param/value columns, `CompCacheMeta` shrunk to just the
+hash, `SifCache.hs` deleted, state moves TVar/STM → MVar/IORef (plan
+steps 3+4 fused: whole-module typechecking allows no halfway state once
+the old containers are gone); (4) lifecycle hardening — dead-row resolves
+fail loudly, garbage-tolerant row reuse (Rust Stage 5's rules) verified by
+tests; (5) dead-code kills: `Intern.hs` (superseded by per-def indexes),
+`VerList.hs`, `DepMap`'s container. Comp-dep edges now carry a per-edge
+*observed version* — required by `test_modifcationWhileWorkingOnQueue`
+(impure-cap detection), so that semantics moved rather than died. Tests
+86/86 (net of suites whose subjects were deleted); the seam held —
+`Impl.hs`'s algorithm and `CompEngineStateIf` unchanged.
+
+Bonus find: a **second** eager-RunStats settle ambiguity (sibling of
+`a1c5933`'s), previously masked by the old engine being slow — the
+columnar engine settles fast enough that the bench's drain-wait could
+match a pre-posted stats record and report "settled" with reruns still
+climbing. Fixed in the bench harness (`20a9c69`); rerun counts re-verified
+across 7 scales.
+
+### Numbers (same-session alternating A/B vs `7a19093`, 2 runs/side)
+
+Scale 1.0, `-A64m`:
+
+| | cold | live | RSS settle | max_live | B/cap | GCs |
+|---|---|---|---|---|---|---|
+| old | 46.4–46.6 s | 15.5–16.0 s | ~3.26 GB | 1464.8 MB | 1465 | 177 |
+| new | **7.29–7.31 s** | **10.9–11.0 s** | ~2.24 GB | **1132.0 MB** | 1132 | 66 |
+
+Scale 1.0, default RTS:
+
+| | cold | live | RSS settle | max_live | B/cap | GCs |
+|---|---|---|---|---|---|---|
+| old | 60.7–60.8 s | 20.6–22.9 s | 2.5–3.3 GB | ~1747 MB | 1747 | 37,497 |
+| new | **10.1–10.3 s** | **13.3–13.6 s** | **1.53 GB** | **838 MB** | **838** | 14,022 |
+
+**Cold eval 6.4× faster** (46.5 → 7.3 s best config — columnar locality
+turned the biggest number in this doc into the smallest), live −25–35%,
+`max_live` −23% to −52% depending on RTS config. 999,760 instances /
+80,767 reruns, bit-identical to every prior stage. (This session's
+absolute wall-clocks ran hotter than earlier sessions' — same-session
+pairs carry the conclusions, as always.)
+
+### Verdict vs. the ~250–350 MB parity projection
+
+Short of it, for two architectural (not incidental) reasons, honestly
+identified rather than papered over: the typed **param/value columns are
+still boxed** (`p`/`a` admit no `Unbox` constraint — real param types in
+the test suite include `ByteString`), and the **per-row unboxed edge
+vectors live in the nursery**, not the large-object area — so the
+copying-GC multiplier the roadmap aimed to escape still applies to a
+large slice. Reaching parity needs per-def monomorphized value storage
+and one shared CSR edge array per def — a materially bigger change,
+deliberately not attempted in this stage. Standing vs. Rust Stage 5:
+cold 7.3 s vs ~2.9 s (**~2.5×**, was ~14× at Stage 0); RSS 1.53 GB vs
+~330 MB (~4.6×); live 10.9 s vs ~0.5 s (still the widest gap).
+
+API/semantics changes: `CompCacheMeta` → hash-only newtype;
+`fullCaching`/`hashCaching` drop their `Show` constraint (the per-rerun
+`show` is finally dead); `initialSifState` → `newSifState :: IO`;
+row ids are recycled (Stage 1 never recycled; the free-list + loud
+dead-resolve contract covers it).
+
 ## Not tried yet / open items
 
 - **The Interlude-2 diet, measured.** The Rust notes list a ranked, concrete
