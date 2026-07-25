@@ -65,6 +65,7 @@ import GHC.Stats
 import System.Environment (lookupEnv)
 import System.Posix.Process (getProcessID)
 import System.Process (readProcess)
+import System.Timeout (timeout)
 import Text.Printf (printf)
 import Text.Read (readMaybe)
 
@@ -388,10 +389,31 @@ benchMain = do
   -- wait returns -- a genuine deadlock (reproduced: 'waitForRunAtLeast 1'
   -- observed run=2/staleCaps=0 while the engine thread was already blocked
   -- in 'compSrcWaitChanges', and 'waitForFullSettle' then waited on run 3
-  -- forever). 'waitForFullSettle' already re-checks 'rs_staleCaps' before
-  -- advancing, so seeding it with 'rs1's own (possibly-overshot) run number
-  -- is both correct and sufficient.
-  rs2 <- waitForFullSettle runVar (rs_run rs1)
+  -- forever).
+  --
+  -- ⚠ Residual ambiguity found while benchmarking the columnar rewrite
+  -- (docs/benchmark-notes.md "Memory roadmap"): 'rs1' is *itself* an eager
+  -- pre-post -- describing run 0's (nonexistent, trivially-0) leftover --
+  -- so "seed with rs1's own run number" can ALSO return before run 1's own
+  -- body (this 300-key drain) has even looked for changes, not just after.
+  -- Both "genuinely fully drained and blocked" and "hasn't started yet"
+  -- present as @rs_staleCaps == 0@ at run 1; the 'RunStats' payload alone
+  -- can't tell them apart. Harmless on a slow engine (there's always been
+  -- enough of a gap before this got checked that the driver had already
+  -- moved past it) but newly observable now that the columnar rewrite's
+  -- engine is fast enough to close that gap: confirmed via a diagnostic
+  -- counterRef recheck that 'waitForFullSettle' can return instantly here
+  -- while ~10k real reruns are still in flight, uncounted, on the driver
+  -- thread. Not a Driver.hs contract bug (its "at least" semantics are
+  -- exactly as documented) and not touched here -- resolved locally: race
+  -- a bounded wait for a *confirmed* advance past run 1 against a timeout,
+  -- falling back to trusting 'rs1' iff the timeout fires (which only
+  -- happens in the genuinely-already-settled case, where 'rs1' was correct
+  -- all along).
+  mRs2Advanced <- timeout 2000000 (waitForFullSettle runVar (rs_run rs1 + 1))
+  rs2 <- case mRs2Advanced of
+    Just rs -> pure rs
+    Nothing -> waitForFullSettle runVar (rs_run rs1)
   preLiveReruns <- readIORef counterRef
   when (preLiveReruns /= coldReruns) $
     putStrLn
