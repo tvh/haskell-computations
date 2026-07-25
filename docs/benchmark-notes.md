@@ -781,6 +781,41 @@ Deterministic and reproducible, but the HAMT was cheaper than the
 back-of-envelope suggested. The decisive win here was **time, not
 memory**: −13% cold, with no run overlap.
 
+### 4d — unboxed value/param columns via `Typeable` dispatch (commit `e6738cb`) — **kept**
+
+The item the roadmap thought needed a public `Unbox` constraint. It does
+not. `dt_param`/`dt_value` became a GADT existential:
+
+```haskell
+data Column e where
+  ColBoxed   :: !(IORef (VM.IOVector e)) -> Column e
+  ColUnboxed :: VUM.Unbox u => !(e :~: u) -> !(IORef (VUM.IOVector u)) -> Column e
+```
+
+`mkColumn` tests `e` with `eqT` at column-construction time against a
+fixed set (`Word32`/`Word64`/`Int`/`Char`/`Bool`/`Double`) and captures a
+`e :~: u` equality proof on a match; everything else falls back to boxed.
+The `Refl` witness makes the unboxed read/write typecheck directly — no
+conversion function, just one constructor-tag branch per access.
+
+**Public API stayed constraint-free**, which was the hard requirement:
+`DefTable.new` gained `(Typeable p, Typeable a)`, but that is an internal
+module, and its only caller already had those in scope —
+`IsCompParam p = (Show p, Typeable p, LargeHashable p)`, so `Typeable` was
+always there transitively. `defineComp`/`wireComp`/`Comp`/
+`CompCacheBehavior`/`IsCompParam`/`IsCompResult` are byte-for-byte
+unchanged, and `ByteString`/`String` params keep working via the fallback
+(tested explicitly).
+
+| metric | before | after | Δ |
+|---|---|---|---|
+| 1.0 max_live | 853.9 MB | **817.3 MB** | **−4.3%** |
+| 0.1 max_live | 85.5 MB | **68.2 MB** | **−20.3%** |
+| cold / live / GCs | — | — | flat within noise |
+
+Bigger win at small scale, where the param/value columns are a larger
+share next to still-small edge arenas. Tests 99 → **103**.
+
 ## Not tried yet / open items
 
 - **The Interlude-2 diet, measured.** The Rust notes list a ranked, concrete
