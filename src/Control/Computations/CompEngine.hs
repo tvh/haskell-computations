@@ -13,6 +13,15 @@ import Control.Computations.CompEngine.Core as X
 import Control.Computations.CompEngine.Driver as X
 import Control.Computations.CompEngine.Run as X
 
+-- 'PaqPriority' is defined in the (hidden) columnar state layer's
+-- "Control.Computations.CompEngine.Utils.PriorityAgingQueue", but it shows
+-- up in this facade's own public surface -- 'defineCompWithPriority',
+-- 'compId_priority', 'mkCompIdWithPriority' and 'anyCompApPriority' (all
+-- re-exported below via CompDef/Types) take or return it -- so it must be
+-- reachable. Re-exporting just the one type here is cheaper than exposing
+-- the whole 395-line priority-queue module for four constructors.
+import Control.Computations.CompEngine.Utils.PriorityAgingQueue as X (PaqPriority (..))
+
 -- 'CompM' is re-exported *abstractly* here: its representation wraps IO
 -- (see Types.hs), so unlike the old pure representation, exposing its
 -- constructor/'runCompM' accessor through this public facade would let a

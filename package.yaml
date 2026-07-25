@@ -95,6 +95,87 @@ default-extensions:
 
 library:
   source-dirs: src
+  # The public API is deliberately narrow: the facade, the flow-source/sink
+  # classes, the shipped flow implementations, and the small user-facing
+  # types that appear in their signatures (Fail/Option, Hash128, TimeSpan,
+  # Clock, ...). Everything a consumer needs to define a comp and wire a
+  # flow in should be reachable from this list; everything else -- the
+  # columnar state layer (CompEngine/Utils/*), the engine internals
+  # (CompEngine/{Impl,SimpleStateIf,Types,...}), and the Utils/* modules
+  # that never surface in an exposed signature -- is other-modules and can
+  # change without a major version bump. See exposed-modules below for the
+  # per-module reasoning; anything not listed there is implicitly
+  # other-modules (hpack default), listed explicitly for clarity.
+  exposed-modules:
+    - Control.Computations.CompEngine
+    # ^ the facade: re-exports CacheBehaviors, CompDef, CompEval, CompFlow,
+    # CompFlowRegistry, CompSink, CompSrc, Core, Driver, Run, Types (minus
+    # CompM internals), and PaqPriority. Those ten CompEngine/* modules and
+    # PriorityAgingQueue stay other-modules -- this facade is their only
+    # sanctioned entry point, verified by grepping app/ and bench/ for any
+    # direct import of them (there is exactly one, app/.../SqliteSrc.hs's
+    # CompSrc import, rerouted through this facade rather than exposing
+    # CompSrc itself).
+    - Control.Computations.FlowImpls.CompLogging
+    - Control.Computations.FlowImpls.FileSink
+    - Control.Computations.FlowImpls.FileSrc
+    - Control.Computations.FlowImpls.FileStoreSink
+    - Control.Computations.FlowImpls.HashMapFlow
+    - Control.Computations.FlowImpls.IOSink
+    - Control.Computations.FlowImpls.TimeSrc
+    # ^ the shipped sources/sinks users wire into a CompFlowRegistry.
+    - Control.Computations.Utils.TimeSpan
+    # ^ CompSrc/driver configs take TimeSpan (poll intervals, run limits).
+    - Control.Computations.Utils.Fail
+    - Control.Computations.Utils.Types
+    # ^ Fail/Ok are in the CompSrc/CompSink class signatures (compSrcExecute
+    # etc. return `Fail a`); Option is equally load-bearing --
+    # CompSink.compSinkListExistingOutputs returns `Option (IO ...)`,
+    # Run.RunSettings' rs_maxRunIterations field and Driver's
+    # waitForRunAtLeast/waitForFullSettle are `Option`-typed, and
+    # CompEngine.Types' CompCacheValue/CompDepVer fields are `Option`-typed
+    # too. Utils.Types re-exports all of Utils.Fail (`module F`), so
+    # exposing both together (rather than just Fail, as originally
+    # suggested) is what makes Option actually reachable -- Utils.Fail
+    # alone was not enough. TypeId is defined here too but never escapes an
+    # opaque exported type (CompSrcId/CompSinkId hide their csi_type
+    # field), so it doesn't independently force this decision -- Option
+    # does.
+    - Control.Computations.Utils.Hash
+    # ^ CompEngine.Types' CompCacheMeta(..)/ccv_largeHash expose Hash128
+    # directly, so a user constructing/inspecting a cache value needs this.
+    - Control.Computations.Utils.Logging
+    # ^ the engine and every FlowImpl log through this; a consumer needs
+    # setupLogging/setLogLevel to control verbosity. Confirmed load-bearing,
+    # not just demo convenience: every demo and the benchmark call it.
+    - Control.Computations.Utils.Clock
+    # ^ forced by the shipped FlowImpls' own signatures, not just demo use:
+    # FileSrcConfig's fcsc_clock field and TimeSrc's initTimeSrc/withTimeSrc
+    # both take a `Clock` argument directly, so a caller needs `realClock`
+    # (or to build their own) to use FileSrc/TimeSrc at all.
+    - Control.Computations.Utils.IOUtils
+    # ^ likewise forced: FileSrc's DirEntry(..) has a `FileType` field and
+    # FileKey(..) wraps a `CanonPath`, both defined here.
+    - Control.Computations.Utils.TimeUtils
+    # ^ likewise forced: TimeSrc's compGetTime takes a `TimeIntervalType`.
+    - Control.Computations.Utils.FileStore.Writer
+    - Control.Computations.Utils.FileStore.Types
+    # ^ likewise forced: FileStoreSink.withFileStoreSink takes a
+    # `FileStoreCfg` and its WriteDoc request yields an `ObjId`, both from
+    # this pair (Writer re-exports Types wholesale, but Types is exposed
+    # directly too since a demo module imports it on its own).
+    - Control.Computations.Utils.Dispatcher
+    - Control.Computations.Utils.SqliteUtils
+    - Control.Computations.Utils.FileStore.Watcher
+    # ^ NOT required by any shipped FlowImpls signature -- these three are
+    # exposed only because in-repo demo code (the Hospital demo's
+    # Control.Computations.Demos.FlowImpls.SqliteSrc and
+    # Control.Computations.Demos.Hospital.Server) imports them directly to
+    # build a bespoke sqlite-backed CompSrc and an HTTP dashboard. There is
+    # no facade to route these through (unlike the CompSrc case above), and
+    # rewriting that demo code is out of scope for this step. This is a
+    # genuine widening of the "narrow" ideal, done deliberately rather than
+    # reflexively -- see the packaging job's report for the full tradeoff.
   dependencies:
     - QuickCheck >= 2.15 && < 2.16
     # ^ Not test-only: a handful of library types (TimeSpan, DataSize,

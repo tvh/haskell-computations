@@ -28,6 +28,27 @@ source-repository head
 library
   exposed-modules:
       Control.Computations.CompEngine
+      Control.Computations.FlowImpls.CompLogging
+      Control.Computations.FlowImpls.FileSink
+      Control.Computations.FlowImpls.FileSrc
+      Control.Computations.FlowImpls.FileStoreSink
+      Control.Computations.FlowImpls.HashMapFlow
+      Control.Computations.FlowImpls.IOSink
+      Control.Computations.FlowImpls.TimeSrc
+      Control.Computations.Utils.TimeSpan
+      Control.Computations.Utils.Fail
+      Control.Computations.Utils.Types
+      Control.Computations.Utils.Hash
+      Control.Computations.Utils.Logging
+      Control.Computations.Utils.Clock
+      Control.Computations.Utils.IOUtils
+      Control.Computations.Utils.TimeUtils
+      Control.Computations.Utils.FileStore.Writer
+      Control.Computations.Utils.FileStore.Types
+      Control.Computations.Utils.Dispatcher
+      Control.Computations.Utils.SqliteUtils
+      Control.Computations.Utils.FileStore.Watcher
+  other-modules:
       Control.Computations.CompEngine.CacheBehaviors
       Control.Computations.CompEngine.CompDef
       Control.Computations.CompEngine.CompEval
@@ -45,36 +66,15 @@ library
       Control.Computations.CompEngine.Utils.OutputsMap
       Control.Computations.CompEngine.Utils.PriorityAgingQueue
       Control.Computations.CompEngine.Utils.SrcIndex
-      Control.Computations.FlowImpls.CompLogging
-      Control.Computations.FlowImpls.FileSink
-      Control.Computations.FlowImpls.FileSrc
-      Control.Computations.FlowImpls.FileStoreSink
-      Control.Computations.FlowImpls.HashMapFlow
-      Control.Computations.FlowImpls.IOSink
-      Control.Computations.FlowImpls.TimeSrc
       Control.Computations.Utils.Ansi
-      Control.Computations.Utils.Clock
       Control.Computations.Utils.ConcUtils
       Control.Computations.Utils.DataSize
-      Control.Computations.Utils.Dispatcher
-      Control.Computations.Utils.Fail
       Control.Computations.Utils.FileStore.Intern
-      Control.Computations.Utils.FileStore.Types
-      Control.Computations.Utils.FileStore.Watcher
-      Control.Computations.Utils.FileStore.Writer
       Control.Computations.Utils.FileWatch
-      Control.Computations.Utils.Hash
-      Control.Computations.Utils.IOUtils
-      Control.Computations.Utils.Logging
       Control.Computations.Utils.MultiMap
       Control.Computations.Utils.MultiSet
       Control.Computations.Utils.SourceLocation
-      Control.Computations.Utils.SqliteUtils
-      Control.Computations.Utils.TimeSpan
-      Control.Computations.Utils.TimeUtils
-      Control.Computations.Utils.Types
       Control.Computations.Utils.VirtualTime
-  other-modules:
       Paths_incremental_computations
   hs-source-dirs:
       src

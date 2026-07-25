@@ -25,7 +25,7 @@ module Control.Computations.Demos.FlowImpls.SqliteSrc (
 -- LOCAL
 ----------------------------------------
 
-import Control.Computations.CompEngine.CompSrc
+import Control.Computations.CompEngine
 import Control.Computations.Utils.Clock
 import Control.Computations.Utils.IOUtils
 import Control.Computations.Utils.Logging
