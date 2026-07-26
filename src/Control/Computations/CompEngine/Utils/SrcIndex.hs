@@ -13,12 +13,7 @@
 
  This haddock documents the *design*: what's here and the invariants it
  maintains (see the "Invariants (summary)" section at the end for the quick
- checklist). For the *archaeology* -- why this module exists at all, what
- was measured, what the reverse-side design calls landed on and why they
- differ from the forward side's -- see docs/benchmark-notes.md's "Stage 4h"
- (this module's own introduction) and "Stage 4i" (the strictness bug it
- shipped with -- see "A boxed side column needs to force its own writes"
- below).
+ checklist).
 
  = Two tables, one per existential
 
@@ -43,77 +38,72 @@
 
  = Why 'KeyIntern' needs no refcounting
 
- 4g's lesson (docs/benchmark-notes.md) was that interning a
- /version-carrying/ value without a reclaim path leaks, because a
- (key, version) pair can be referenced by many rows at once and only some of
- them stop referencing it at a time -- nothing short of a genuine reference
- count knows when the last one let go. 'KeyIntern' interns 'AnyCompSrcKey'
- alone (no version component), and -- unlike "DefTable.hs"'s
- @SrcDepIntern@, whose ids are retained independently by every row that
- currently lists them in its own @dt_srcDeps@ span -- a key id here has
- exactly one owner at a time: the single 'SrcKeyArena' this module creates
- for it on first use and deletes on last-dependent-removed (below). Ownership
- is 1:1, not many:1, so a plain assign-on-first-use /
- recycle-on-last-removal lifecycle is the *correct* match for this shape, not
- a shortcut that happens to avoid refcounting -- there is only ever one
+ Interning a /version-carrying/ value without a reclaim path leaks, because
+ a (key, version) pair can be referenced by many rows at once and only some
+ of them stop referencing it at a time -- nothing short of a genuine
+ reference count knows when the last one let go. 'KeyIntern' sidesteps that
+ by interning 'AnyCompSrcKey' alone (no version component), and -- unlike
+ "DefTable.hs"'s @SrcDepIntern@, whose ids are retained independently by
+ every row that currently lists them in its own @dt_srcDeps@ span -- a key
+ id here has exactly one owner at a time: the single 'SrcKeyArena' this
+ module creates for it on first use and deletes on last-dependent-removed
+ (below). Ownership is 1:1, not many:1, so a plain assign-on-first-use /
+ recycle-on-last-removal lifecycle is the *correct* match for this shape,
+ not a shortcut that happens to avoid refcounting -- there is only ever one
  thing to ask "is anyone still holding this?", and it already exists
  ('SimpleStateIf.removeSrcDependent'\'s own "did this key's dependent set
- just become empty?" check, unchanged from the pre-columnar design).
- Interning 'AnyCompSrcVer' *would* reopen the many:1 sharing problem (the
- same version value can be the current observation of many different rows
- at once) -- which is exactly why this module does not do that; see
- "Why the version is a boxed side column, not interned" below.
+ just become empty?" check). Interning 'AnyCompSrcVer' *would* reopen the
+ many:1 sharing problem (the same version value can be the current
+ observation of many different rows at once) -- which is exactly why this
+ module does not do that; see "Why the version is a boxed side column, not
+ interned" below.
 
  = Why the version is a boxed side column, not interned
 
- The task brief's other option -- intern 'AnyCompSrcVer' too, refcounted
- like 'DefTable.hs'\'s @SrcDepIntern@ -- was considered and rejected.
- Two reasons, both about where the actual duplication in this benchmark
- lives: "DefTable.hs"'s Stage 4e found that the /forward/ side's apparent
- 683x duplication was fake -- every row's src-dep set was being
- freshly reconstructed on every call ('wrapCompSrcDep' rebuilding a
- 'CompSrcId'\/'Text' each time), not genuinely 683 distinct values. On the
- /reverse/ side that discovery does not obviously transfer: a source key's
- dependent set spans rows that last observed it at *different* times (that
- is the entire reason 'SrcKeyArena' -- like the 'VerList' bucketing it
- replaced pre-Stage-3 -- tracks a version /per dependent/ rather than one
- shared "current version" for the key: see
- @test_modifcationWhileWorkingOnQueue@), so the real distinct-version count
- among one key's dependents is workload-dependent, not a known-small
- constant the way the forward side's snapshot-instant duplication was.
- Second, and decisive: interning here would reintroduce exactly the
- many:1 sharing 'KeyIntern' above was designed to avoid -- a version value
- can be the current observation of many rows simultaneously, so reclaiming
- it needs the same refcount discipline 'DefTable.hs'\'s @SrcDepIntern@
- already carries, for a payoff that (unlike the forward side, and unlike
- keys, which the task brief itself calls "few and stable") is not
+ The alternative design -- intern 'AnyCompSrcVer' too, refcounted like
+ 'DefTable.hs'\'s @SrcDepIntern@ -- was considered and rejected, for two
+ reasons about where the actual value duplication lives. On the /forward/
+ side, a src-dep set's apparent heavy duplication is an artifact of every
+ row's set being freshly reconstructed on every call ('wrapCompSrcDep'
+ rebuilding a 'CompSrcId'\/'Text' each time), not genuinely many distinct
+ rows sharing identical values (see "DefTable.hs"'s own discussion of
+ @SrcDepIntern@). That justification does not transfer to the /reverse/
+ side: a source key's dependent set spans rows that last observed it at
+ *different* times (that is the entire reason 'SrcKeyArena' tracks a
+ version /per dependent/ rather than one shared "current version" for the
+ key: see @test_modifcationWhileWorkingOnQueue@), so the real
+ distinct-version count among one key's dependents is workload-dependent,
+ not a known-small constant the way the forward side's snapshot-instant
+ duplication is. Second, and decisive: interning here would reintroduce
+ exactly the many:1 sharing 'KeyIntern' above is designed to avoid -- a
+ version value can be the current observation of many rows simultaneously,
+ so reclaiming it needs the same refcount discipline 'DefTable.hs'\'s
+ @SrcDepIntern@ already carries, for a payoff that (unlike the forward
+ side, and unlike keys, which are typically few and stable) is not
  established to be there. A boxed side column costs one boxed word per
- currently-live dependent -- exactly what the pre-existing @HashMap DefRef
- AnyCompSrcVer@ already cost per entry, just outside a HAMT leaf -- with
- none of a second refcounted table's bookkeeping or failure modes.
+ currently-live dependent -- exactly what a @HashMap DefRef AnyCompSrcVer@
+ would cost per entry, just outside a HAMT leaf -- with none of a second
+ refcounted table's bookkeeping or failure modes.
 
  = A boxed side column needs to force its own writes
 
- A cautionary finding from this module's own A/B testing, worth recording
- next to the design decision above: a boxed side column is not a neutral
- stand-in for what @Data.HashMap.Strict@ used to do. The pre-columnar
- @HashMap DefRef AnyCompSrcVer@ this module replaces is a /Strict/ HashMap,
- which forces its value on every insert; @Data.Vector.Mutable.write@ has no
- such contract and will happily store an unevaluated thunk. Left lazy,
- 'skaAppend'\'s @ver@ argument is a thunk closing over its caller's whole
- 'Control.Computations.CompEngine.CompSrc.AnyCompSrcDep' (and, transitively,
- the 'DepSet' it came from) -- and nothing forces it during cold eval at
- all, since nothing reads a version back out of the arena until the live
- phase's 'SimpleStateIf.notifyDepChange' compares it. The measured effect of
- that one missing bang pattern, first-cut: ~10x slower cold eval and ~9x
- more bytes allocated at every scale tested, with the exact same
- instance/rerun counts as the fixed version -- a pure space leak, invisible
- to every type signature and every test in this module (semantics were
- never wrong, only retention). 'skaAppend' forces @ver@ to WHNF before
- storing it (down through 'AnyCompSrcVer'\'s 'StrictData' fields, which is
- sufficient -- see its own haddock); the lesson generalizes to any future
- boxed column in this codebase built directly on @Data.Vector.Mutable@
- rather than a @Strict@ container.
+ A boxed column built directly on @Data.Vector.Mutable@ is not a neutral
+ stand-in for a @Data.HashMap.Strict@: the latter forces its value on
+ every insert, while @Data.Vector.Mutable.write@ carries no such contract
+ and will happily store an unevaluated thunk. Left lazy, 'skaAppend'\'s
+ @ver@ argument would be a thunk closing over its caller's whole
+ 'Control.Computations.CompEngine.CompSrc.AnyCompSrcDep' (and,
+ transitively, the 'DepSet' it came from) -- and nothing would force it
+ during cold eval, since nothing reads a version back out of the arena
+ until the live phase's 'SimpleStateIf.notifyDepChange' compares it. Left
+ unforced, every dependent's evaluation closure would stay reachable for
+ the entire cold-eval run even though nothing will ever look at it again --
+ a pure space leak, invisible to every type signature and every test in
+ this module, since semantics are never wrong, only retention is.
+ 'skaAppend' forces @ver@ to WHNF before storing it (down through
+ 'AnyCompSrcVer'\'s 'StrictData' fields, which is sufficient -- see its own
+ haddock); the lesson generalizes to any boxed column in this codebase
+ built directly on @Data.Vector.Mutable@ rather than a @Strict@ container.
 
  = Why this isn't just another EdgeArena
 
@@ -134,11 +124,12 @@
  O(current key size) scan is the one deliberate complexity tradeoff here
  (a hand-rolled per-key secondary index mapping 'DefRef' to slot would make
  removal O(1) at the cost of a second boxed structure per key, undoing much
- of the point) -- accepted because this benchmark's per-key population
- (~683 dependents avg across 300 keys) keeps a linear scan cheap in
- practice, and because it operates on an unboxed 'Int' column, not a boxed
- structure -- see the module's own churn tests for the bound this actually
- achieves.
+ of the point) -- accepted because the persistence benchmark shipped with
+ this library (see @bench\/.../Bench\/Main.hs@) exercises roughly 683
+ dependents per key averaged across 300 keys, which keeps a linear scan
+ cheap in practice, and because the scan operates on an unboxed 'Int'
+ column, not a boxed structure -- see the module's own churn tests for the
+ bound this actually achieves.
 
  = Invariants (summary)
 
@@ -160,17 +151,14 @@
    call path removes the old @(key, version)@ entry before adding the new
    one on a version change ("SimpleStateIf.hs"'s @updateEdges@, "removes
    before adds, deliberately").
- * 'skaRemove' is swap-with-last, not a stable shift -- order is never a
-   contract of this structure, matching the @HashMap DefRef AnyCompSrcVer@
-   it replaced.
- * __Every write through 'skaAppend' must force @ver@ to WHNF before this
-   module's own call forces it.__ 'skaAppend' does this itself (the @!ver@
-   bang) precisely because 'Data.Vector.Mutable.write' carries no
-   strictness contract the way the @Data.HashMap.Strict@ this replaced did
-   -- see "A boxed side column needs to force its own writes" above; this
-   is the one invariant on this list that a real, measured regression (4h)
-   was needed to surface, not something the design got right by
-   inspection.
+ * 'skaRemove' is swap-with-last, not a stable shift -- order is not part
+   of this structure's contract.
+ * __Every write through 'skaAppend' must force @ver@ to WHNF.__
+   'skaAppend' does this itself (the @!ver@ bang) precisely because
+   'Data.Vector.Mutable.write' carries no strictness contract of its own --
+   see "A boxed side column needs to force its own writes" above; this is
+   the one invariant on this list that is not obvious from the types alone,
+   which is why it is called out here explicitly rather than left implicit.
 -}
 module Control.Computations.CompEngine.Utils.SrcIndex (
   -- * Key interning
@@ -307,15 +295,15 @@ kiAssignedCount ki = readIORef (ki_count ki)
 -- another EdgeArena" section.
 --
 
--- | @ska_refs@ stores each dependent's 'DefRef' directly -- 'DefRef' now has
--- a real 'Data.Vector.Unboxed.Unbox' instance (via vector's
--- 'Data.Vector.Unboxed.UnboxViaPrim', see
--- "DefTable.hs"'s 'Control.Computations.CompEngine.Utils.DefTable.unDefRef'
--- haddock for the recipe and the stale claim it corrects), so this column
--- no longer needs to store a raw 'Int' and coerce at every read\/write.
--- 'skaAppend'\/'skaRemove'\/'skaToList' -- this module's actual API boundary
--- -- take\/return 'DefRef' exactly as this column now does; there is no
--- longer a representation seam between them.
+-- | @ska_refs@ stores each dependent's 'DefRef' directly: 'DefRef' has a
+-- real 'Data.Vector.Unboxed.Unbox' instance (via vector's
+-- 'Data.Vector.Unboxed.UnboxViaPrim' -- see "DefTable.hs"'s
+-- 'Control.Computations.CompEngine.Utils.DefTable.unDefRef' haddock for the
+-- recipe), so this column stores 'DefRef' values directly rather than a raw
+-- 'Int' that would need coercing at every read\/write.
+-- 'skaAppend'\/'skaRemove'\/'skaToList' -- this module's actual API
+-- boundary -- take\/return 'DefRef' exactly as this column stores it, with
+-- no representation seam between them.
 data SrcKeyArena = SrcKeyArena
   { ska_refs :: !(IORef (VUM.IOVector DefRef))
   , ska_vers :: !(IORef (VM.IOVector AnyCompSrcVer))
@@ -345,32 +333,33 @@ growBoth ska needed = do
     vv' <- GM.unsafeGrow vv extra
     writeIORef (ska_vers ska) vv'
 
--- | Append one @(ref, ver)@ entry. Caller's responsibility (mirrors the
--- pre-columnar @HashMap.insert@ this replaces): if @ref@ is already
--- present, this appends a *second* entry rather than updating the first --
--- every call site removes the old entry before adding the new one when a
--- dependent re-registers at a different version (see
--- "SimpleStateIf.hs"'s @updateEdges@, "removes before adds, deliberately"),
--- so a live duplicate never actually occurs on the real call path; a
--- direct 'skaAppend' misuse would silently double-count rather than fail
--- loudly, which is why the module's own tests exercise the ordering this
--- depends on directly rather than trusting the invariant silently.
--- | Append one @(ref, ver)@ entry, forcing @ver@ to WHNF before storing it
--- (down through its 'StrictData' fields -- @AnyCompSrcVer@'s constructor,
--- like every constructor in this codebase, has strict fields by default, so
--- WHNF is enough). This is not optional: the pre-columnar @HashMap DefRef
--- AnyCompSrcVer@ this replaces was a @Data.HashMap.Strict@, which forces
--- its *value* on every insert -- @Data.Vector.Mutable.write@ has no such
--- contract and will happily store an unevaluated thunk. Left lazy, that
--- thunk closes over its caller's whole @AnyCompSrcDep@ (and, transitively,
--- the 'DepSet'/'HashSet' it came from) and is never forced during cold
--- eval at all (nothing reads a version back out until the live phase's
--- 'SimpleStateIf.notifyDepChange' compares it) -- a real, measured space
--- leak: retaining ~200k rows' worth of per-row evaluation closures alive
--- for the entire cold-eval run turned a sub-second operation into a
--- double-digit-second one in this module's own A/B testing before this
--- fix, with no change in results (same instance/rerun counts either way)
--- -- exactly the shape of bug a type signature can't catch.
+-- | Append one @(ref, ver)@ entry, forcing @ver@ to WHNF before storing it.
+--
+-- Caller's responsibility: if @ref@ is already present, this appends a
+-- *second* entry rather than updating the first. Every call site removes
+-- the old entry before adding the new one when a dependent re-registers at
+-- a different version (see "SimpleStateIf.hs"'s @updateEdges@, "removes
+-- before adds, deliberately"), so a live duplicate never actually occurs on
+-- the real call path; a direct 'skaAppend' misuse would silently
+-- double-count rather than fail loudly, which is why the module's own
+-- tests exercise the ordering this depends on directly rather than
+-- trusting the invariant silently.
+--
+-- Forcing @ver@ is not optional. @AnyCompSrcVer@'s constructor, like every
+-- constructor in this codebase, has strict fields by default
+-- ('StrictData'), so WHNF is enough to fully evaluate it -- but nothing
+-- forces @ver@ to WHNF in the first place unless the write site does it:
+-- @Data.Vector.Mutable.write@ carries no strictness contract of its own
+-- and will happily store an unevaluated thunk (unlike a
+-- @Data.HashMap.Strict@, which forces its value on every insert). Left
+-- lazy, that thunk would close over its caller's whole @AnyCompSrcDep@
+-- (and, transitively, the 'DepSet'\/'HashSet' it came from) and never get
+-- forced during cold eval at all, since nothing reads a version back out
+-- until the live phase's 'SimpleStateIf.notifyDepChange' compares it --
+-- meaning every dependent's evaluation closure would stay reachable for
+-- the entire cold-eval run for no reason. That is exactly the shape of
+-- space leak no type signature can catch: semantics stay correct (the
+-- same instance\/rerun counts either way), only retention is wrong.
 skaAppend :: SrcKeyArena -> DefRef -> AnyCompSrcVer -> IO ()
 skaAppend ska ref !ver = do
   len <- readIORef (ska_len ska)
@@ -387,8 +376,7 @@ skaAppend ska ref !ver = do
 -- deliberately does not need -- see the module haddock). Returns 'True' iff
 -- an entry was found and removed; a caller that expects @ref@ to be
 -- present (there isn't one here -- see 'SimpleStateIf.removeSrcDependent',
--- which tolerates a miss exactly as its pre-columnar predecessor did) can
--- check the result.
+-- which tolerates a miss deliberately) can check the result.
 skaRemove :: SrcKeyArena -> DefRef -> IO Bool
 skaRemove ska ref = do
   len <- readIORef (ska_len ska)
@@ -412,10 +400,9 @@ skaRemove ska ref = do
       writeIORef (ska_len ska) lastIdx
       pure True
 
--- | Every currently-live @(ref, ver)@ pair, in unspecified order (order was
--- never a contract of the pre-columnar @HashMap DefRef AnyCompSrcVer@
--- either, and 'skaRemove'\'s swap-with-last deliberately does not preserve
--- insertion order).
+-- | Every currently-live @(ref, ver)@ pair, in unspecified order: order is
+-- not part of this structure's contract, and 'skaRemove'\'s swap-with-last
+-- deliberately does not preserve insertion order.
 skaToList :: SrcKeyArena -> IO [(DefRef, AnyCompSrcVer)]
 skaToList ska = do
   len <- readIORef (ska_len ska)
