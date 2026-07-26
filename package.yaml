@@ -9,6 +9,9 @@ copyright:           "2010-2023 medilyse GmbH, 2026 Timo von Holtz"
 extra-source-files:
   - README.md
   - CHANGELOG.md
+  - Wehr_A-Software-Architecture-Based-on-Coarse-Grained-Self-Adjusting-Computations.pdf
+  - hospital-config/**/*
+  - webapp/**/*
 
 synopsis:            A framework for coarse-grained self-adjusting (incremental) computations
 category:            Control
@@ -223,17 +226,17 @@ executables:
     - -with-rtsopts=-N2
     - -with-rtsopts=-A64m
     dependencies:
-    - HTF
+    - HTF >= 0.15 && < 0.16
     - QuickCheck
-    - binary
-    - extra
-    - http-types
+    - binary >= 0.8 && < 0.9
+    - extra >= 1.8 && < 1.9
+    - http-types >= 0.12 && < 0.13
     - incremental-computations
-    - optparse-applicative
-    - process
-    - wai
-    - wai-extra
-    - warp
+    - optparse-applicative >= 0.18 && < 0.19
+    - process >= 1.6 && < 1.7
+    - wai >= 3.2 && < 3.3
+    - wai-extra >= 3.1 && < 3.2
+    - warp >= 3.4 && < 3.5
 
 benchmarks:
   incremental-computations-bench:
