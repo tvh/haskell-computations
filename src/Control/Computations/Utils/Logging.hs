@@ -1,3 +1,17 @@
+{- | A minimal global logger: pick a level with 'setupLogging' (or
+ 'setLogLevel'), then call one of the @log*@ functions at a call site. Every
+ demo, the benchmark, and the engine itself log through this module, so
+ controlling verbosity here controls the whole program's log output.
+
+ There are three parallel families for the same six levels
+ ('TRACE' \< 'DEBUG' \< 'INFO' \< 'NOTE' \< 'WARN' \< 'ERROR'), differing only
+ in how they run:
+
+ * @log*@ (e.g. 'logNote') -- ordinary calls in any 'MonadIO'.
+ * @log*STM@ (e.g. 'logNoteSTM') -- usable from inside an 'STM' transaction.
+ * @pure*@ (e.g. 'pureNote') -- wraps a pure value, logging as a side effect
+   when it's forced (akin to @Debug.Trace.trace@); use sparingly.
+-}
 module Control.Computations.Utils.Logging (
   LogLevel (..),
   parseLogLevel,
@@ -53,6 +67,8 @@ import GHC.Conc (unsafeIOToSTM)
 import GHC.Stack
 import System.IO.Unsafe
 
+-- | The six log levels, in increasing order of severity (only messages at or
+-- above the currently-configured level are printed).
 data LogLevel
   = TRACE
   | DEBUG
@@ -62,6 +78,8 @@ data LogLevel
   | ERROR
   deriving (Eq, Ord, Show)
 
+-- | Parse a level from its lowercase name (@\"trace\"@, @\"debug\"@, ...);
+-- see 'allLogLevels' for the full list on failure.
 parseLogLevel :: String -> Either String LogLevel
 parseLogLevel s =
   case L.lookup (map toLower s) logLevelTable of
@@ -79,6 +97,7 @@ logLevelTable =
   , ("error", ERROR)
   ]
 
+-- | A comma-separated list of all valid level names, for error/help text.
 allLogLevels :: String
 allLogLevels = L.intercalate ", " (map fst logLevelTable)
 
@@ -86,16 +105,23 @@ logLevel :: IORef LogLevel
 logLevel = unsafePerformIO (newIORef WARN)
 {-# NOINLINE logLevel #-}
 
+-- | Set the global log level. Call this once near the start of @main@; the
+-- default is 'WARN' if never called.
 setupLogging :: LogLevel -> IO ()
 setupLogging l = setLogLevel l
 
+-- | Change the global log level (an alias for what 'setupLogging' does,
+-- usable later too -- e.g. from 'withLogLevel').
 setLogLevel :: LogLevel -> IO ()
 setLogLevel level = do
   writeIORef logLevel level
 
+-- | Read the currently-configured global log level.
 getLogLevel :: IO LogLevel
 getLogLevel = readIORef logLevel
 
+-- | Run an action with the log level temporarily changed, restoring the
+-- previous level afterwards even if the action throws.
 withLogLevel :: LogLevel -> IO a -> IO a
 withLogLevel prio action = do
   oldPrio <- getLogLevel

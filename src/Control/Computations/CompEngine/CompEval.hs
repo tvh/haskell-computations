@@ -23,6 +23,10 @@ import Control.Computations.Utils.Types
 
 import qualified Data.HashSet as HashSet
 
+-- | Evaluate a wired 'Comp' at a parameter from within another comp body,
+-- recording a dependency on it so the calling comp reruns when this result
+-- changes. Returns 'Nothing' if the dependency itself failed to produce a
+-- value; see 'evalCompOrFail' to fail the caller instead of handling that.
 evalComp
   :: (IsCompParam p, IsCompResult a)
   => Comp p a
@@ -36,6 +40,9 @@ evalComp comp p =
  where
   compAp = mkCompAp comp p
 
+-- | Like 'evalComp', but fails the calling comp (via 'fail') with a message
+-- naming the callee and its argument instead of returning 'Nothing'. This is
+-- the usual choice when the caller has no sensible fallback.
 evalCompOrFail
   :: (HasCallStack, IsCompParam p, IsCompResult a)
   => Comp p a

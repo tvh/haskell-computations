@@ -1,5 +1,11 @@
 {-# LANGUAGE TypeFamilies #-}
 
+{- | "Control.Computations.Utils.Logging"'s @log*@ functions, lifted into
+ 'CompM' so a comp body can log without leaving the computation monad. Each
+ @log*C@ function (e.g. 'logNoteC') is 'doLogC' at a fixed level, and goes
+ through 'Control.Computations.FlowImpls.IOSink.unsafeCompIO' under the
+ hood.
+-}
 module Control.Computations.FlowImpls.CompLogging (
   doLogC,
   logTraceC,
@@ -22,6 +28,9 @@ import Control.Computations.Utils.Logging
 ----------------------------------------
 import GHC.Stack
 
+-- | Log a message at the given level from a comp body. The @log*C@ functions
+-- below are this at a fixed level with the call site's 'CallStack' filled
+-- in automatically.
 doLogC :: LogLevel -> CallStack -> String -> CompM ()
 doLogC level stack msg = unsafeCompIO (doLog level stack msg)
 

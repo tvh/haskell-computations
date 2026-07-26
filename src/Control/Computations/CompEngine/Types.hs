@@ -399,6 +399,11 @@ doAnyRequest req =
   compMYield $
     CompSuspended req (ContCompM . compMFinished . CompResultOk)
 
+-- | Send a request to a registered source from a comp body, failing the
+-- comp (via 'fail') if the source reports an error. The source id (e.g.
+-- from 'Control.Computations.CompEngine.CompSrc.typedCompSrcId') identifies
+-- which registered source to use; the request type is specific to that
+-- source's 'Control.Computations.CompEngine.CompSrc.CompSrc' instance.
 compSrcReq :: CompSrc s => TypedCompSrcId s -> CompSrcReq s a -> CompM a
 compSrcReq s req =
   do
@@ -409,6 +414,11 @@ compSrcReq' :: CompSrc s => TypedCompSrcId s -> CompSrcReq s a -> CompM (Fail a)
 compSrcReq' s req =
   doAnyRequest $ CompReqFlow (CompFlowReqSrc s req)
 
+-- | Send a request to a registered sink from a comp body, failing the comp
+-- (via 'fail') if the sink reports an error. The sink id (e.g. from
+-- 'Control.Computations.CompEngine.CompSink.typedCompSinkId') identifies
+-- which registered sink to use; the request type is specific to that sink's
+-- 'Control.Computations.CompEngine.CompSink.CompSink' instance.
 compSinkReq :: CompSink s => TypedCompSinkId s -> CompSinkReq s a -> CompM a
 compSinkReq s req =
   do

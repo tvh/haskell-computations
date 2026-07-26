@@ -6,6 +6,17 @@
 {-# LANGUAGE UndecidableInstances #-}
 {-# OPTIONS_GHC -fno-warn-orphans #-}
 
+{- | 'Fail': an @Either String@-like result type (a failure message, or a
+ value) used throughout the public API wherever an operation can fail with a
+ human-readable reason -- source/sink requests
+ (e.g. 'Control.Computations.CompEngine.CompSrc.compSrcExecute') return
+ @IO (deps, Fail a)@, and 'Control.Computations.CompEngine.Types.compSrcReq'
+ /'Control.Computations.CompEngine.Types.compSinkReq' fail the calling comp
+ automatically when they see a 'Fail' value. The rest of this module is a
+ grab-bag of combinators for building, running, and converting between
+ 'Fail' and other error-handling types ('Either', 'Maybe', exceptions); most
+ consumers only need the 'Fail' constructors themselves.
+-}
 module Control.Computations.Utils.Fail (
   Fail (..),
   isFail,
@@ -88,6 +99,10 @@ import qualified Data.Text as T
 import GHC.Generics
 import Prelude
 
+-- | A failure message, or a successful value. Note this is deliberately the
+-- reverse constructor order of 'Either' (@'Fail' :: String -> Fail a@ is the
+-- failure case, not the success case) -- a common source of confusion when
+-- reaching for @Either@ instincts.
 data Fail a
   = Fail ~String
   | Ok a
@@ -189,10 +204,12 @@ modifyFailT f failT =
         Ok x -> return (Ok x)
         Fail s -> return (Fail (f s))
 
+-- | Whether a 'Fail' is the failure case.
 isFail :: Fail a -> Bool
 isFail (Fail _) = True
 isFail (Ok _) = False
 
+-- | Whether a 'Fail' is the success case.
 isOk :: Fail a -> Bool
 isOk = not . isFail
 

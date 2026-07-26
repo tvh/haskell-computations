@@ -31,12 +31,22 @@ import Control.Concurrent.STM
 import Control.Monad
 import Data.Time.Clock
 
+-- | Summary of one iteration of the driver's run loop: which run number it
+-- was, whether any source changes were found, and how many cached results
+-- were stale going in.
 data RunStats = RunStats
   { rs_run :: Int
   , rs_hadChanges :: Bool
   , rs_staleCaps :: Int
   }
 
+-- | Drive a computation graph forward forever: register the flows given by
+-- @withRegisteredFlows@ (typically a chain of 'regSrc'\/'regSink' calls
+-- ending in your own action), wire up the graph with @wireComps@, evaluate
+-- the root comp at @startVal@, and keep rerunning whatever's affected as
+-- sources report changes. Returns only if @withRegisteredFlows@'s inner
+-- action returns (e.g. because it was given a bounded action rather than one
+-- that runs forever).
 compDriver
   :: (IsCompParam p, IsCompResult r)
   => (CompFlowRegistry -> IO () -> IO ())
@@ -90,11 +100,15 @@ compDriver' runVar withRegisteredFlows wireComps startVal = do
         c <- wireComps
         pure ([wrapCompAp (mkCompAp c startVal)])
 
+-- | Register a source with a 'CompFlowRegistry', then run @action@. Written
+-- to chain: @regSrc reg (regSrc reg action src2) src1@, or equivalently as
+-- @\\action -> regSrc reg action src@ passed to 'compDriver'.
 regSrc :: CompSrc s => CompFlowRegistry -> IO a -> s -> IO a
 regSrc reg action src = do
   registerCompSrc reg src
   action
 
+-- | Like 'regSrc', but for a sink.
 regSink :: CompSink s => CompFlowRegistry -> IO a -> s -> IO a
 regSink reg action sink = do
   registerCompSink reg sink

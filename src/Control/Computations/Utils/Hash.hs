@@ -1,5 +1,11 @@
 {-# OPTIONS_GHC -fno-warn-orphans #-}
 
+{- | A 128-bit content hash, used by the engine to detect whether a cached
+ computation result actually changed (see the engine's @CompCacheMeta@'s
+ @ccv_largeHash@ field, reachable through the
+ "Control.Computations.CompEngine" facade). Compute one with 'largeHash128'
+ from anything with a @LargeHashable@ instance.
+-}
 module Control.Computations.Utils.Hash (
   Hash128 (..),
   largeHash128,
@@ -22,6 +28,8 @@ import qualified Data.Text.Encoding as T
 import Data.Typeable
 import GHC.Generics (Generic)
 
+-- | A 128-bit hash value. Hashes and orders as its underlying bits; shows as
+-- lowercase hex via 'hashToHexText'.
 newtype Hash128 = Hash128 {unHash128 :: LH.Word128}
   deriving stock (Typeable, Generic)
   deriving newtype (Eq, Ord, Hashable)
@@ -37,11 +45,13 @@ instance Hashable LH.Word128 where
 instance LH.LargeHashable LH.Word128
 instance LH.LargeHashable Hash128
 
+-- | Hash a value's content (an MD5-based 'LH.largeHash') into a 'Hash128'.
 largeHash128 :: LH.LargeHashable a => a -> Hash128
 largeHash128 x =
   let h = LH.largeHash LH.md5HashAlgorithm x
    in Hash128 (LH.unMD5Hash h)
 
+-- | Render a 'Hash128' as lowercase hex text.
 hashToHexText :: Hash128 -> T.Text
 hashToHexText (Hash128 w) = T.decodeUtf8 (Base16.encode (LH.w128ToBs w))
 

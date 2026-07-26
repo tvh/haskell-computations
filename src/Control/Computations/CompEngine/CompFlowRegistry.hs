@@ -47,6 +47,11 @@ data RegState = RegState
   , rs_sinks :: HashMap CompSinkId AnyCompSink
   }
 
+-- | The set of sources and sinks currently available to comp bodies. Create
+-- one with 'newCompFlowRegistry', populate it with 'registerCompSrc'\/
+-- 'registerCompSink' (or the 'Control.Computations.CompEngine.Driver.regSrc'\/
+-- 'Control.Computations.CompEngine.Driver.regSink' helpers), and pass it to
+-- 'Control.Computations.CompEngine.Driver.compDriver'.
 newtype CompFlowRegistry = CompFlowRegistry (TVar RegState)
 
 newCompFlowRegistry :: IO CompFlowRegistry
@@ -163,6 +168,7 @@ unregisterCompSrc (CompFlowRegistry var) src =
     atomically $ modifyTVar' var $ \state ->
       state{rs_srcs = HashMap.delete (compSrcId src) (rs_srcs state)}
 
+-- | Make a sink available to comp bodies via 'Control.Computations.CompEngine.Types.compSinkReq'.
 registerCompSink :: CompSink s => CompFlowRegistry -> s -> IO ()
 registerCompSink (CompFlowRegistry var) sink =
   do

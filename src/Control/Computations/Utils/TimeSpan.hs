@@ -1,3 +1,12 @@
+{- | 'TimeSpan': a microsecond-resolution duration, used across the public
+ API wherever a duration is needed (poll intervals, run-loop timeouts,
+ sleeps -- see e.g. "Control.Computations.FlowImpls.FileSrc"'s
+ @fcsc_pollInterval@ and "Control.Computations.Utils.Clock"). Build one with
+ a unit constructor (@'seconds' 5@, @'milliseconds' 250@, ...), parse one
+ from text with 'parseTimeSpan' (the format 'timeSpanP' accepts, e.g. in
+ config files, is documented on that parser), and convert back out with an
+ @asX@ function (@'asSeconds'@, ...).
+-}
 module Control.Computations.Utils.TimeSpan (
   TimeSpan (..),
   zeroTime,

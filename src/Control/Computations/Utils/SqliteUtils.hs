@@ -1,6 +1,14 @@
 {-# LANGUAGE TypeFamilies #-}
 {-# OPTIONS_GHC -Wno-orphans #-}
 
+{- | Thin conveniences over "Database.SQLite3": opening/closing a database
+ ('withSqliteDb', 'initSqliteDb', 'closeSqliteDb'), running a query and
+ collecting its rows as name\/value pairs ('query', 'exec'), transactions
+ ('withTransaction'), and retrying on @SQLITE_BUSY@ ('retryIfBusy'), which
+ every other function here already does internally. Used to build a custom
+ sqlite-backed 'Control.Computations.CompEngine.CompSrc.CompSrc' or
+ 'Control.Computations.CompEngine.CompSink.CompSink'.
+-}
 module Control.Computations.Utils.SqliteUtils (
   TableName,
   ColumnName,
@@ -108,6 +116,10 @@ collectRows stmt = loop Nothing []
               Nothing -> columnNames stmt
           loop (Just names) (zip names cols : acc)
 
+-- | Run an 'IO' action, retrying with a short random backoff (up to 50
+-- attempts) if it fails with sqlite's @SQLITE_BUSY@ error; @what@ is a label
+-- used only in the log message if retries are exhausted. Every other
+-- database-touching function in this module already goes through this.
 retryIfBusy :: String -> IO a -> IO a
 retryIfBusy what action = loop 0
  where
@@ -132,10 +144,15 @@ retryIfBusy what action = loop 0
       c_sleep realClock (milliseconds i)
   maxRetries = 50 :: Int
 
+-- | Run a SQL statement with no parameters and no result rows expected.
 exec :: Sqlite.Database -> T.Text -> IO ()
 exec db code =
   retryIfBusy "exec" (Sqlite.exec db code)
 
+-- | Bind named parameters to a prepared 'Sqlite.Statement', run it, and
+-- collect every result row as a 'SQLRow' (column name\/value pairs). Resets
+-- the statement and clears its bindings afterwards either way, so the same
+-- 'Sqlite.Statement' can be reused for the next call.
 query :: Sqlite.Statement -> [(T.Text, SQLData)] -> IO [SQLRow]
 query stmt bindings =
   do
@@ -154,6 +171,8 @@ withStatement :: Sqlite.Database -> T.Text -> (Sqlite.Statement -> IO a) -> IO a
 withStatement db sql action =
   bracket (Sqlite.prepare db sql) Sqlite.finalize action
 
+-- | Look up a column's value in a 'SQLRow', failing (in any 'MonadFail') if
+-- the row has no such column.
 getColumnValue :: MonadFail m => SQLRow -> ColumnName -> m SQLData
 getColumnValue row colName =
   case L.lookup colName row of
@@ -165,6 +184,9 @@ getColumnValue row colName =
     Just sqlData ->
       pure sqlData
 
+-- | Open (creating if necessary) a sqlite database at @dbPath@ in WAL mode.
+-- Prefer 'withSqliteDb' unless you need to manage the database's lifetime
+-- yourself.
 initSqliteDb :: T.Text -> IO Sqlite.Database
 initSqliteDb dbPath =
   do
@@ -176,11 +198,14 @@ initSqliteDb dbPath =
     Sqlite.exec db "PRAGMA journal_mode=WAL;"
     pure db
 
+-- | Close a database opened with 'initSqliteDb'\/'withSqliteDb'.
 closeSqliteDb :: Sqlite.Database -> IO ()
 closeSqliteDb db =
   Sqlite.close db `catch` \(_ :: Sqlite.SQLError) ->
     void (Direct.close db)
 
+-- | Open a sqlite database (see 'initSqliteDb'), run @action@, and close it
+-- afterwards even if @action@ throws.
 withSqliteDb :: T.Text -> (Sqlite.Database -> IO a) -> IO a
 withSqliteDb path action =
   bracket
@@ -188,6 +213,8 @@ withSqliteDb path action =
     closeSqliteDb
     action
 
+-- | Run @action@ inside a @BEGIN TRANSACTION@\/@COMMIT@, rolling back on
+-- exception instead of committing.
 withTransaction :: Sqlite.Database -> IO a -> IO a
 withTransaction db action =
   bracketOnError

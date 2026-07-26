@@ -1,6 +1,12 @@
 {-# LANGUAGE DeriveAnyClass #-}
 {-# OPTIONS_GHC -Wno-orphans #-}
 
+{- | Small filesystem helpers layered on "System.Directory"\/"System.Posix":
+ recursive directory listing, atomic file writes, a scratch temp directory
+ for demos\/tests ('withSysTempDir'), and 'FileStatus'\/'CanonPath' -- the
+ file metadata and canonical-path types 'Control.Computations.FlowImpls.FileSrc'
+ tracks files by.
+-}
 module Control.Computations.Utils.IOUtils (
   listDirectoryWithQualifiedNames,
   listDirectoryRecursive,
@@ -71,6 +77,10 @@ listDirectoryRecursive path =
             else loop newAcc p
         _ -> pure newAcc
 
+-- | Create a fresh temporary directory under @\/tmp@, run @action@ with its
+-- path, and remove it afterwards. Handy for demos and tests that need a
+-- scratch directory to wire a 'Control.Computations.FlowImpls.FileSrc.FileSrc'\/
+-- 'Control.Computations.FlowImpls.FileSink.FileSink' pair against.
 withSysTempDir :: (FilePath -> IO a) -> IO a
 withSysTempDir = withTempDirectory "/tmp" "IncComp_"
 
@@ -80,6 +90,9 @@ instance Hashable PosixTypes.CIno where
 instance Hashable PosixTypes.COff where
   hashWithSalt s (PosixTypes.COff i64) = hashWithSalt s i64
 
+-- | The subset of a file's metadata this library tracks changes by: inode,
+-- size, modification\/status-change time, and type. Deliberately excludes
+-- access time, since that would make every read look like a change.
 data FileStatus = FileStatus
   { fs_inode :: Posix.FileID
   , fs_size :: Posix.FileOffset
@@ -90,6 +103,7 @@ data FileStatus = FileStatus
   }
   deriving (Eq, Ord, Show, Generic, Hashable)
 
+-- | What kind of filesystem entry a path is.
 data FileType
   = SocketFileType
   | NamedPipeFileType
@@ -101,6 +115,8 @@ data FileType
   | UnknownFileType
   deriving (Eq, Ord, Show, Generic, Hashable)
 
+-- | Read a path's 'FileStatus'; throws like the underlying
+-- 'Posix.getFileStatus' does if the path doesn't exist.
 getFileStatus :: FilePath -> IO FileStatus
 getFileStatus path = do
   s <- Posix.getFileStatus path

@@ -1,6 +1,13 @@
 {-# LANGUAGE DeriveAnyClass #-}
 {-# LANGUAGE TypeFamilies #-}
 
+{- | A 'Control.Computations.CompEngine.CompSrc.CompSrc' backed by the local
+ filesystem: read a file ('ReadFile'\/'ReadTextFile') or list a directory
+ ('ListDir'), and the source tracks the underlying path's modification time
+ so the engine knows when to rerun anything that depended on it. Build one
+ with 'withFileSrc' (or 'initFileSrc'\/'closeFileSrc' to manage the lifetime
+ by hand), configured via 'defaultFileSrcConfig'.
+-}
 module Control.Computations.FlowImpls.FileSrc (
   FileSrcReq (..),
   FileSrcConfig (..),
@@ -42,17 +49,23 @@ import GHC.Generics (Generic)
 import System.Directory
 import System.FilePath
 
+-- | A request against a 'FileSrc': read a file as bytes or text, or list a
+-- directory's entries.
 data FileSrcReq a where
   ReadFile :: FilePath -> FileSrcReq BS.ByteString
   ReadTextFile :: FilePath -> FileSrcReq String
   ListDir :: FilePath -> FileSrcReq (HashSet DirEntry)
 
+-- | One entry returned by 'ListDir': a name and whether it's a file,
+-- directory, etc.
 data DirEntry = DirEntry
   { de_name :: String
   , de_type :: FileType
   }
   deriving (Eq, Ord, Show, Generic, Hashable)
 
+-- | Configuration for a 'FileSrc'. Build one with 'defaultFileSrcConfig' and
+-- override individual fields as needed.
 data FileSrcConfig = FileSrcConfig
   { fcsc_ident :: CompSrcInstanceId
   , fcsc_pollInterval :: TimeSpan
@@ -60,6 +73,8 @@ data FileSrcConfig = FileSrcConfig
   , fcsc_rootDir :: Option FilePath
   }
 
+-- | A 'FileSrcConfig' with a 100ms poll interval, 'realClock', and no root
+-- directory (paths are used as-is); only @fcsc_ident@ needs supplying.
 defaultFileSrcConfig :: T.Text -> FileSrcConfig
 defaultFileSrcConfig i =
   FileSrcConfig
@@ -69,28 +84,40 @@ defaultFileSrcConfig i =
     , fcsc_rootDir = None
     }
 
+-- | A running file source handle, holding the background file-watching
+-- state. Register it with a 'Control.Computations.CompEngine.CompFlowRegistry.CompFlowRegistry'
+-- to make it available to comp bodies.
 data FileSrc = FileSrc
   { fcs_config :: FileSrcConfig
   , fcs_fileWatch :: FileWatch
   }
 
+-- | Start a 'FileSrc' from a 'FileSrcConfig'. Prefer 'withFileSrc' unless
+-- you need to manage its lifetime by hand.
 initFileSrc :: FileSrcConfig -> IO FileSrc
 initFileSrc cfg = do
   watch <- initFileWatch (fcsc_clock cfg) (fcsc_pollInterval cfg)
   pure (FileSrc cfg watch)
 
+-- | Stop a 'FileSrc' started with 'initFileSrc', releasing its
+-- file-watching resources.
 closeFileSrc :: FileSrc -> IO ()
 closeFileSrc fcs = do
   closeFileWatch (fcs_fileWatch fcs)
 
+-- | Start a 'FileSrc', run @action@, and close it afterwards even if
+-- @action@ throws.
 withFileSrc :: FileSrcConfig -> (FileSrc -> IO a) -> IO a
 withFileSrc cfg =
   bracket (initFileSrc cfg) closeFileSrc
 
+-- | The canonicalized path used to identify a tracked file across polls.
 newtype FileKey = FileKey {unFileKey :: CanonPath}
   deriving stock (Eq, Ord, Show)
   deriving newtype (Hashable, LH.LargeHashable)
 
+-- | A file's modification time, used to detect whether its content may have
+-- changed since it was last read.
 newtype FileVer = FileVer {unFileVer :: POSIXTime}
   deriving stock (Eq, Ord, Show)
   deriving newtype (Hashable, LH.LargeHashable)

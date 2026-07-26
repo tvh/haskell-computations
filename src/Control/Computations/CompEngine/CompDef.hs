@@ -41,6 +41,9 @@ import qualified Data.Map.Strict as Map
 import Data.Maybe
 import qualified Data.Text as T
 
+-- | A not-yet-wired computation from a parameter type @p@ to a result type
+-- @a@. Build one with 'defineComp', then turn it into a runnable 'Comp' with
+-- 'wireComp'.
 newtype CompDef p a = CompDef {unCompDef :: CompMap -> Comp p a}
 
 defineCompX
@@ -53,6 +56,10 @@ defineCompX
 defineCompX name caching fun =
   CompDef $ \cm -> Comp (mkCompId name) caching fun cm
 
+-- | Define a named computation: given a caching strategy (e.g. 'fullCaching')
+-- and a function from parameter to a 'CompM' action producing the result,
+-- get back a 'CompDef' ready to 'wireComp'. The name is used for diagnostics
+-- and must be unique among sibling comps.
 defineComp
   :: (IsCompParam p, IsCompResult r)
   => String
@@ -78,12 +85,20 @@ defineIncComp name initState updateFun =
       mCachedValue <- ce_cachedResult ce
       updateFun (ce_param ce) (fromMaybe initState mCachedValue)
 
+-- | The monad for wiring 'CompDef's together into a dependency graph of
+-- runnable 'Comp's (see 'wireComp'). Values of this type are consumed by
+-- 'Control.Computations.CompEngine.Driver.compDriver'.
 newtype CompWireM a = CompWireM (StateT CompMap Fail a)
   deriving (Functor, Applicative, Monad, MonadFail, MonadFix)
 
 getCompMap :: CompWireM CompMap
 getCompMap = CompWireM get
 
+-- | Turn a 'CompDef' into a runnable 'Comp', registering it in the current
+-- wiring session. Call this once per computation while building the graph
+-- passed to 'Control.Computations.CompEngine.Driver.compDriver'; the
+-- resulting 'Comp' can then be passed into other 'CompDef's that depend on
+-- it (e.g. via 'evalComp'\/'evalCompOrFail').
 wireComp :: (IsCompResult a, IsCompParam p) => CompDef p a -> CompWireM (Comp p a)
 wireComp (CompDef defineComp) =
   do

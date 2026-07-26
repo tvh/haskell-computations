@@ -1,5 +1,13 @@
 {-# LANGUAGE TypeFamilies #-}
 
+{- | A 'Control.Computations.CompEngine.CompSrc.CompSrc' that produces the
+ current time, truncated to a chosen 'TimeIntervalType' granularity, and
+ wakes up dependents once per truncated interval. This is how a comp gets a
+ periodic tick without polling: request the time at a given granularity
+ (with 'compGetTime', against 'defaultTimeSrcId'), and the engine reruns
+ that comp whenever the truncated time value changes. Wire it in with
+ 'withDefaultTimeSrc' (or 'withTimeSrc' for a non-default instance id\/clock).
+-}
 module Control.Computations.FlowImpls.TimeSrc (
   TimeSrcReq (..),
   TimeSrc,
@@ -41,17 +49,24 @@ import qualified Data.Map.Strict as Map
 import Data.Proxy
 import Data.Time.Clock
 
+-- | A request against a 'TimeSrc': the current time truncated to the given
+-- granularity.
 data TimeSrcReq a where
   GetTime :: TimeIntervalType -> TimeSrcReq UTCTime
 
+-- | Identifies a tracked granularity ('TimeIntervalType') within a 'TimeSrc'.
 newtype TimeKey = TimeKey {unTimeKey :: TimeIntervalType}
   deriving (Eq, Ord, Show, Hashable, LH.LargeHashable)
 
+-- | The truncated time value last observed for a given 'TimeKey'.
 newtype TimeVer = TimeVer {unTimeVer :: UTCTime}
   deriving (Eq, Ord, Show, Hashable, LH.LargeHashable)
 
 type TimeDep = Dep TimeKey TimeVer
 
+-- | A running time source handle, holding the background ticking thread.
+-- Register it with a 'Control.Computations.CompEngine.CompFlowRegistry.CompFlowRegistry'
+-- to make it available to comp bodies.
 data TimeSrc = TimeSrc
   { tcs_ident :: CompSrcInstanceId
   , tcs_thread :: Async ()
@@ -62,12 +77,20 @@ data TimeSrc = TimeSrc
 defaultTimeSrcInstanceId :: CompSrcInstanceId
 defaultTimeSrcInstanceId = CompSrcInstanceId "defaultTimeSrc"
 
+-- | The typed source id of the 'TimeSrc' registered by 'withDefaultTimeSrc';
+-- pass this to 'compGetTime' if you need the raw request/id pair instead.
 defaultTimeSrcId :: TypedCompSrcId TimeSrc
 defaultTimeSrcId = typedCompSrcId (Proxy @TimeSrc) defaultTimeSrcInstanceId
 
+-- | Request the current time, truncated to the given granularity, from the
+-- default 'TimeSrc' (see 'withDefaultTimeSrc'). The comp calling this reruns
+-- whenever the truncated value next changes.
 compGetTime :: TimeIntervalType -> CompM UTCTime
 compGetTime t = compSrcReq defaultTimeSrcId (GetTime t)
 
+-- | Start a 'TimeSrc' with the given source id and clock. Prefer
+-- 'withTimeSrc' (or 'withDefaultTimeSrc') unless you need to manage its
+-- lifetime by hand.
 initTimeSrc :: CompSrcInstanceId -> Clock -> IO TimeSrc
 initTimeSrc ident clock = do
   startTimes <- getTruncatedTimes
@@ -87,13 +110,20 @@ initTimeSrc ident clock = do
     t <- c_currentTime clock
     pure (truncateTime t)
 
+-- | Stop a 'TimeSrc' started with 'initTimeSrc', cancelling its background
+-- ticking thread.
 closeTimeSrc :: TimeSrc -> IO ()
 closeTimeSrc tcs = cancel (tcs_thread tcs)
 
+-- | Start a 'TimeSrc', run @action@, and stop it afterwards even if
+-- @action@ throws.
 withTimeSrc :: CompSrcInstanceId -> Clock -> (TimeSrc -> IO a) -> IO a
 withTimeSrc ident clock =
   bracket (initTimeSrc ident clock) closeTimeSrc
 
+-- | 'withTimeSrc' with the default source id (the one 'compGetTime' and
+-- 'defaultTimeSrcId' assume) and 'realClock'. This is what most programs
+-- want.
 withDefaultTimeSrc :: (TimeSrc -> IO a) -> IO a
 withDefaultTimeSrc = withTimeSrc defaultTimeSrcInstanceId realClock
 

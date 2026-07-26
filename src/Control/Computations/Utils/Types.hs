@@ -1,5 +1,12 @@
 {-# LANGUAGE DeriveAnyClass #-}
 
+{- | A grab-bag of small, load-bearing types and helpers, re-exporting all of
+ "Control.Computations.Utils.Fail" ('Fail'\/'Ok') alongside 'Option' -- a
+ strict @Maybe@-alike used across the public API (e.g.
+ 'Control.Computations.CompEngine.Run.RunSettings'\'s
+ @rs_maxRunIterations@ field, 'Control.Computations.CompEngine.CompSink.CompSink'\'s
+ @compSinkListExistingOutputs@).
+-}
 module Control.Computations.Utils.Types (
   -- better name: Misc
   module F,
@@ -41,7 +48,10 @@ import qualified Data.LargeHashable as LH
 import qualified Data.Text as T
 import GHC.Generics (Generic)
 
--- Strict versions of Maybe and Either (note that StrictData is on by default)
+-- | A strict @Maybe@-alike: 'None' or 'Some' a value (StrictData is on by
+-- default in this package, so the field is unboxed the same way @Maybe@'s
+-- would be under @-XStrict@). Convert to\/from 'Maybe' with
+-- 'optionToMaybe'\/'maybeToOption'.
 data Option a
   = None
   | Some a

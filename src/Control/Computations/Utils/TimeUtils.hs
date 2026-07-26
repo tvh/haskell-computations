@@ -1,5 +1,12 @@
 {-# LANGUAGE DeriveAnyClass #-}
 
+{- | Small helpers for working with 'UTCTime': truncating to a coarse
+ interval (see 'TimeIntervalType'), parsing/formatting in the format this
+ library uses throughout (@YYYY-MM-DD HH:MM:SS@, optionally with
+ sub-second precision), and 'TimeSpan' arithmetic. 'TimeSrc' (in
+ "Control.Computations.FlowImpls.TimeSrc") is the main consumer of
+ 'TimeIntervalType'.
+-}
 module Control.Computations.Utils.TimeUtils (
   TimeIntervalType (..),
   truncateTime,
@@ -34,6 +41,10 @@ import Data.Time.Clock.POSIX
 import Data.Time.Format
 import GHC.Generics (Generic)
 
+-- | A coarse, named time granularity to truncate a 'UTCTime' down to (see
+-- 'truncateTime'), e.g. for bucketing periodic ticks. The sub-minute
+-- intervals exist for tests; production code should generally use
+-- 'TimeInterval1min' or coarser.
 data TimeIntervalType
   = TimeInterval1s -- you should only use this in tests
   | TimeInterval10s -- you should only use this in tests
@@ -58,6 +69,8 @@ intervalToSeconds interval =
     TimeInterval1min -> 60
     TimeInterval5min -> 300
 
+-- | Round a 'UTCTime' down to the start of its enclosing interval, e.g.
+-- @truncateTime t TimeInterval1min@ zeroes out the seconds.
 truncateTime :: UTCTime -> TimeIntervalType -> UTCTime
 truncateTime t interval = truncateToNSeconds (intervalToSeconds interval) t
 
@@ -73,9 +86,14 @@ timeFormatStringHiRes = "%Y-%m-%d %H:%M:%S.%q"
 dayFormatString :: String
 dayFormatString = "%Y-%m-%d"
 
+-- | Parse @\"YYYY-MM-DD HH:MM:SS\"@ as a 'UTCTime', failing in any
+-- 'MonadFail' (e.g. 'Maybe' or 'Either' 'String') on a malformed string.
 parseUTCTime :: MonadFail m => String -> m UTCTime
 parseUTCTime = parseTimeM True defaultTimeLocale timeFormatString
 
+-- | Like 'parseUTCTime', but calls 'error' on a malformed string instead of
+-- failing softly. Prefer 'parseUTCTime' unless the input is a compile-time
+-- literal you already know is well-formed.
 unsafeParseUTCTime :: String -> UTCTime
 unsafeParseUTCTime s =
   case parseUTCTime s of
@@ -106,8 +124,10 @@ formatDay = T.pack . formatDay'
 formatDay' :: Day -> String
 formatDay' = formatTime defaultTimeLocale dayFormatString
 
+-- | The 'TimeSpan' between two times, @t1 \`diffTime\` t2 = t1 - t2@.
 diffTime :: UTCTime -> UTCTime -> TimeSpan
 diffTime t1 t2 = nominalDiffTimeSpan (diffUTCTime t1 t2)
 
+-- | Add a 'TimeSpan' to a 'UTCTime'.
 addTimeSpan :: UTCTime -> TimeSpan -> UTCTime
 addTimeSpan t ts = asNominalDiffTime ts `addUTCTime` t

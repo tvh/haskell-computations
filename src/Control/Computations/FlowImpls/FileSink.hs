@@ -1,6 +1,14 @@
 {-# LANGUAGE DeriveAnyClass #-}
 {-# LANGUAGE TypeFamilies #-}
 
+{- | A 'Control.Computations.CompEngine.CompSink.CompSink' that writes files
+ and creates directories under a fixed root, and tracks which outputs it has
+ written so it can clean up any that a comp stops producing. Build one with
+ 'makeFileSink' and register it with a
+ 'Control.Computations.CompEngine.CompFlowRegistry.CompFlowRegistry'; from a
+ comp body, send it a 'FileSinkReq' via
+ 'Control.Computations.CompEngine.Types.compSinkReq'.
+-}
 module Control.Computations.FlowImpls.FileSink (
   FileSinkReq (..),
   FileSink (..),
@@ -64,12 +72,16 @@ instance Show (FileSinkReq a) where
           showString "MakeDirs "
             . showString p
 
+-- | A file sink handle, rooted at a fixed directory. Build one with
+-- 'makeFileSink'.
 data FileSink = FileSink
   { fcs_ident :: CompSinkInstanceId
   , fcs_root :: CanonPath
   }
   deriving (Show)
 
+-- | Create a 'FileSink' rooted at @root@ (canonicalized), identified by the
+-- given name.
 makeFileSink :: T.Text -> FilePath -> IO FileSink
 makeFileSink i root' =
   do
