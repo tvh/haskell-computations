@@ -1,3 +1,23 @@
 #!/bin/bash
+set -euo pipefail
 
-weeder --hie-directory .stack-work/dist/x86_64-osx/Cabal-3.8.1.0/build --require-hs-files
+# The exact path segment between .stack-work/dist and build/ varies by
+# platform, GHC version and Cabal version (e.g.
+# .stack-work/dist/x86_64-osx/Cabal-3.8.1.0/build vs.
+# .stack-work/dist/aarch64-osx/ghc-9.10.3/build), so derive it instead of
+# hardcoding it.
+hie_dirs=$(find .stack-work/dist -maxdepth 3 -type d -name build 2>/dev/null)
+
+if [ -z "$hie_dirs" ]; then
+  echo "error: no .stack-work/dist/*/*/build directory found -- run 'stack build' first" >&2
+  exit 1
+fi
+
+hie_dir_count=$(echo "$hie_dirs" | wc -l | tr -d ' ')
+if [ "$hie_dir_count" -gt 1 ]; then
+  echo "error: found multiple build directories under .stack-work/dist, expected one:" >&2
+  echo "$hie_dirs" >&2
+  exit 1
+fi
+
+weeder --hie-directory "$hie_dirs" --require-hs-files
