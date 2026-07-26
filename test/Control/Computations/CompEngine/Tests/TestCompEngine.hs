@@ -3,6 +3,14 @@
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# OPTIONS_GHC -F -pgmF htfpp #-}
+-- 'test_revive' below uses 'head' on the list of values this deterministic
+-- test's own comp graph puts; the pre-existing "HLint: ignore Partial
+-- function" annotation on that binding already documents that this is
+-- accepted in test code (a crash here is a clear, immediately-debuggable
+-- test failure, not a production partial-function risk). Suppressing the
+-- GHC-side warning here too, scoped to this one module rather than the
+-- whole package.
+{-# OPTIONS_GHC -Wno-x-partial #-}
 
 module Control.Computations.CompEngine.Tests.TestCompEngine (
   Id (..),

@@ -89,7 +89,6 @@ ghc-options:
   - -Wno-name-shadowing
   - -Wpartial-fields
   - -Wredundant-constraints
-  - -Wno-x-partial
 
 when:
   - condition: flag(werror)
