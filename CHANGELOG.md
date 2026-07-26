@@ -48,11 +48,11 @@ publication and makes the following user-facing changes:
   `docs/benchmark-notes.md` and the README's Benchmark section.
 - PVP version bounds on all library dependencies.
 
-### Known issue
+### Packaging
 
-- `large-hashable` is pinned to a git commit in `stack.yaml`'s `extra-deps`
-  rather than a Hackage release. This blocks an actual `cabal upload` of this
-  package until `large-hashable` (or a replacement) is available from
-  Hackage.
+- `stack.yaml` no longer carries any `extra-deps`: every dependency,
+  including `large-hashable`, resolves from the `lts-24.51` snapshot. The
+  previous git-commit pin on `large-hashable` (which would have blocked a
+  Hackage upload) is gone.
 
 ## 0.1.0.0 - YYYY-MM-DD

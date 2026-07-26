@@ -250,8 +250,6 @@ engine's performance characteristics.
 
 ## Known issues
 
-- **`large-hashable` is not on Hackage.** `stack.yaml`'s `extra-deps` pulls
-  it from a git commit rather than a Hackage release. Until it (or a
-  replacement) is available from Hackage, this package cannot be uploaded to
-  Hackage with `cabal upload`, even though it builds and tests cleanly from
-  an sdist tarball otherwise.
+None currently blocking a release. Every dependency resolves from the
+`lts-24.51` snapshot, so `stack.yaml` needs no `extra-deps` and the package
+builds from an sdist tarball on its own.
