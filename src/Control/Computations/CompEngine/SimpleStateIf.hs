@@ -7,13 +7,13 @@
 {-# LANGUAGE UndecidableInstances #-}
 {-# LANGUAGE NoMonomorphismRestriction #-}
 
-{- | The "Tier 2" columnar rewrite of the state layer (docs/benchmark-notes.md,
- "Memory roadmap"): per-definition struct-of-arrays tables
- ("Control.Computations.CompEngine.Utils.DefTable") instead of the five
- boxed, "AnyCompAp"-then-@Int@-keyed persistent containers Stage 0/1 used.
- Row identity is a packed @('DT.DefIdx', 'DT.RowIdx')@ ('DT.DefRef'); a
- def's own hash/flags/edge/typed-value columns live in its own
- 'DT.DefTable', reached from a 'CompId' via 'sifs_defIndex' + 'sifs_defs'.
+{- | Per-definition struct-of-arrays state layer: this module represents the
+ engine's mutable state as per-definition columnar tables
+ ("Control.Computations.CompEngine.Utils.DefTable") rather than a handful of
+ boxed, "AnyCompAp"-then-@Int@-keyed persistent containers shared across
+ every definition. Row identity is a packed @('DT.DefIdx', 'DT.RowIdx')@
+ ('DT.DefRef'); a def's own hash/flags/edge/typed-value columns live in its
+ own 'DT.DefTable', reached from a 'CompId' via 'sifs_defIndex' + 'sifs_defs'.
  'DT.DefRef', 'DT.DefIdx' and 'DT.RowIdx' are real newtypes (not @Int@
  aliases) precisely so this module's own bookkeeping -- which juggles a def
  index, a row index, and a packed ref side by side in almost every function
@@ -38,63 +38,42 @@
  first-rank code, since instantiating a polymorphic function at a local
  skolem is just application, not escape.
 
- = Two semantics changes from Stage 0/1, both mandated by the rewrite
+ = Two design choices in this state representation
 
- * __No more 'VerList'/multi-version reverse-dep buckets.__ Every row's
-   dependents (@rdeps@) are a flat, unversioned list; invalidation walks
-   that list unconditionally whenever a row's result actually changes (a
-   \"changed bit\": the new result hash compared against what was there
-   before). The old \"impure cap\" detection (a cap re-run with an
-   unchanged, same-version dependency set that nonetheless produced a
-   different result) still needs per-edge /observed version/ information
-   to tell that apart from an ordinary recompute where the dependency set
-   is the same *targets* but a *new* observed version -- see
-   'DT.dt_compDeps's haddock for why that column carries a version
-   alongside each target ref.
- * __'CompCacheMeta' lost 'ccm_logrepr'/'ccm_approxCachedSize'/'ccm_cachedSize'__
-   (Types.hs) -- they had no columnar equivalent, and the whole point of a
-   dedicated result-hash column is to not carry a redundant per-row
-   'CompCacheMeta' box around. \"SifCache.hs\"'s per-'CompId' size
-   bookkeeping (@compIdSizeMap@ et al) is gone with it -- grep confirmed
-   nothing outside that file's own tests ever read it. (SifCache.hs itself
-   is now dead code -- deleted in a later increment once nothing else
-   references it, per the incremental-commit plan.)
-
- = The other Stage-0/1 machinery this rewrite retires
-
- @SifCache@, the old global @Control.Computations.CompEngine.Utils.Intern@
- table, and the former @Control.Computations.CompEngine.Utils.DepMap@'s
- @DepMap@/@VerList@ container operations are all unused now: interning is
- intrinsic to 'DT.lookupOrInsertRow' (per-def, keyed by param hash --
- structurally the same per-definition index Rust's Stage 5 uses instead of
- one global table), and comp-dep edges are flat 'DT.DefTable' columns
- instead of a generic reverse-index map. (@DepMap.hs@ itself is deleted;
- its one surviving piece, the 'IsDep' class, moved into
- "Control.Computations.CompEngine.CompSrc" -- still load-bearing for
- "Types.hs"'s 'CompEngDep'/'CompDep' instances and this module's own
- 'depKey'\/'depVer' calls, unrelated to the now-dead container.)
- @sifs_vermap@ is gone -- a row's result hash
- (gated by its result-state flag) is the vermap entry now.
- @sifs_pendingCaps@ is gone -- \"currently mid-evaluation\" is a per-row
- flag bit instead of a separate 'Set'. The output containers
- ("Control.Computations.CompEngine.Utils.OutputsMap") are untouched in
- design, just re-keyed onto packed refs, exactly as the Rust notes say
- Tier 2 leaves its analogous side tables; the empty-outputs 'OM.insert'
- for every output-less cap is dropped (a cap absent from the map now just
- means \"no outputs\", via 'OM.lookup's existing 'Nothing' case).
+ * __No multi-version reverse-dep buckets.__ Every row's dependents
+   (@rdeps@) are a flat, unversioned list; invalidation walks that list
+   whenever a row's result actually changes (a \"changed bit\": the new
+   result hash compared against what was there before). Detecting an
+   /impure/ cap -- one re-run with an unchanged, same-version dependency
+   set that nonetheless produced a different result -- still needs
+   per-edge /observed version/ information to tell that apart from an
+   ordinary recompute where the dependency set has the same *targets* but
+   a *new* observed version -- see 'DT.dt_compDeps's haddock for why that
+   column carries a version alongside each target ref.
+ * __'CompCacheMeta' carries only a hash__ (see "Types.hs"'s haddock for
+   why): nothing in this state layer needs a pre-rendered log string or a
+   per-'CompId' size tally, so neither exists here either. A row's result
+   hash, gated by its result-state flag, doubles as its version -- there
+   is no separate version map. Whether a row is currently mid-evaluation
+   is a flag bit on the row itself, not membership in a separate pending
+   set. Interning is intrinsic to 'DT.lookupOrInsertRow' (per-def, keyed
+   by param hash) rather than a separate global table. The output
+   containers ("Control.Computations.CompEngine.Utils.OutputsMap") are
+   keyed by packed refs; a cap absent from the map means \"no outputs\"
+   via 'OM.lookup's 'Nothing' case, so a row with no current outputs is
+   deleted from the map rather than given an empty entry.
 
  = Concurrency
 
- Genuinely mutable columns are incompatible with the old
- \"@SifState -> (a, SifState)@ run inside @atomically@\" pattern (an STM
- transaction can retry, and retrying arbitrary in-place vector mutation is
- unsound). 'SimpleStateIf' now serializes access to one persistent,
- internally-mutable 'SifState' with an IO action instead of swapping
- immutable snapshots through a @TVar@ -- see
- "Control.Computations.CompEngine.Run"'s @MVar@-guarded @setupSimpleStateIf@.
- This costs the STM free-snapshot property (not used by anything today)
- and matches the roadmap's own call: \"an MVar suffices; stepCompEngine is
- sequential\".
+ Genuinely mutable columns are incompatible with running state transitions
+ as pure @SifState -> (a, SifState)@ functions inside an STM @atomically@
+ block: an STM transaction can retry, and retrying arbitrary in-place
+ vector mutation is unsound. 'SimpleStateIf' instead serializes access to
+ one persistent, internally-mutable 'SifState' with a plain IO action -- see
+ "Control.Computations.CompEngine.Run"'s @MVar@-guarded
+ @setupSimpleStateIf@. This gives up the free, lock-free snapshots a
+ @TVar@ would offer, but 'stepCompEngine' is sequential, so nothing today
+ needs one.
 -}
 module Control.Computations.CompEngine.SimpleStateIf (
   SimpleStateIf (..),
@@ -183,16 +162,16 @@ newtype SimpleStateIf m = SimpleStateIf
  *different* versions of it (one caught up to a newer notification before
  the other), and a notification must invalidate only the row(s) whose
  recorded version doesn't match -- a single flat "last known version" dedup
- (this module's first attempt, pre-Stage-3) can't distinguish that from
- "everyone's stale", and gets it wrong.
+ per key can't distinguish that from "everyone's stale", and gets it
+ wrong.
 
  Storage is columnar (see "Utils/SrcIndex.hs"'s module haddock for the full
  design rationale, mirroring "Utils/DefTable.hs"'s forward-side src-dep
  interning): 'sifs_srcKeyIntern' interns each 'AnyCompSrcKey' to a dense
  'Int', and 'sifs_srcEntries' maps that id to a 'SI.SrcKeyArena' holding the
  key's current @(DefRef, AnyCompSrcVer)@ dependent list as an unboxed
- 'DefRef' column plus a parallel boxed 'AnyCompSrcVer' column, instead of
- the old @HashMap AnyCompSrcKey (HashMap DefRef AnyCompSrcVer)@ (a boxed
+ 'DefRef' column plus a parallel boxed 'AnyCompSrcVer' column, rather than
+ a @HashMap AnyCompSrcKey (HashMap DefRef AnyCompSrcVer)@ (a boxed
  existential key hashed/compared on every access, nested inside a second
  boxed HAMT). A key's arena is created on its first dependent and deleted
  on its last -- see 'addSrcDependent'\/'removeSrcDependent'.
@@ -231,12 +210,10 @@ newSifState =
 {- | Checks invariants about the SifState: every def index referenced by
  the def registry has a table entry, every alive row's forward
  (@compDeps@) or reverse (@rdeps@) edges point only at other alive rows, and
- every 'SI.SrcKeyArena' entry in 'sifs_srcEntries' points at an alive row --
- the reverse-index analogue of the same check, added alongside the
- columnar rewrite of 'sifs_srcIndex'. This is the columnar-rewrite analogue
- of Stage 1's "every id referenced by a container is live in the intern
- table" -- same idea (dangling references are a lifecycle bug), different
- storage to check it against.
+ every 'SI.SrcKeyArena' entry in 'sifs_srcEntries' points at an alive row.
+ Dangling references are always a lifecycle bug -- a row's edges and every
+ arena entry pointing at it must be scrubbed before the row itself is
+ freed, so this check should never fail on correct code.
 -}
 validateSifState :: SifState -> IO ()
 validateSifState st = do
@@ -269,9 +246,9 @@ validateSifState st = do
 {- | Debug/test-only: total number of currently-live interned src-dep ids
  summed across every def's own 'DT.DefTable' (i.e. 'DT.srcDepInternLiveCount'
  per def, added). Exists purely so an engine-level test
- (Tests/TestStateIf.hs) can assert Part 1's refcounting fix holds through
- the real @capEvaluation@/@capEvaluationFinished@ API -- not part of
- 'CompEngineStateIf', never called by "Impl.hs" or "Run.hs".
+ (Tests/TestStateIf.hs) can assert that src-dep refcounting stays correct
+ through the real @capEvaluation@/@capEvaluationFinished@ API -- not part
+ of 'CompEngineStateIf', never called by "Impl.hs" or "Run.hs".
 -}
 debugTotalSrcDepInternLiveCount :: SifState -> IO Int
 debugTotalSrcDepInternLiveCount st = do
@@ -407,8 +384,7 @@ resolveRefToAny st ref = do
       -- lifecycle bug, never a legitimate runtime occurrence -- fail
       -- loudly instead of silently reading whatever garbage (or a
       -- recycled occupant's data) happens to be sitting in the freed row's
-      -- columns, mirroring Stage 1's 'Utils.Intern.resolve' contract for
-      -- a released id.
+      -- columns.
       alive <- DT.isAlive dt row
       unless alive $
         error
@@ -475,15 +451,14 @@ trackOutputImpl sif cap outputs
 
 {- | Commit a row's pending outputs into the durable outputs map, warning
  about (but not preventing) the same output being claimed by more than one
- cap, and reporting any outputs this row *used to* produce but no longer
- does (and that nothing else currently produces either) as garbage -- this
- runs unconditionally on every finish, not just when there are pending
- outputs, exactly like Stage 0/1's @insertCapWithDeps@ did, since a row
- that produced outputs last time and none this time still needs its old
- ones diffed out. Unlike Stage 0/1, a row with no *current* outputs gets
- 'OM.delete'd rather than given an empty 'OM.insert' -- the "empty-outputs
- insert" the roadmap calls out to kill; 'OM.lookup's existing 'Nothing'
- case already means "no outputs" without needing an entry to say so.
+ cap, and reporting any outputs this row *previously* produced but no
+ longer does (and that nothing else currently produces either) as garbage.
+ This runs unconditionally on every finish, not just when there are
+ pending outputs, since a row that produced outputs last time and none
+ this time still needs its old ones diffed out. A row with no *current*
+ outputs gets 'OM.delete'd rather than given an empty 'OM.insert':
+ 'OM.lookup's 'Nothing' case already means "no outputs" without needing an
+ entry to say so, so an empty entry would just be dead weight in the map.
 -}
 commitPendingOutputsForKey :: SifState -> DefRef -> AnyCompAp -> IO Garbage
 commitPendingOutputsForKey st ref capAny = do
@@ -493,10 +468,9 @@ commitPendingOutputsForKey st ref capAny = do
       oldOutputs = fromMaybe mempty (OM.lookup ref outs)
       delOutputs = oldOutputs `diffAnyOutsMap` newOutputs
   -- The existential `s` inside each ForAnyCompFlow can't escape a shared
-  -- list (different sink outputs may carry different s) -- unlike the old
-  -- pure version, which could fold everything in one list-monad
-  -- comprehension, this processes each entry's outputs (including the IO
-  -- resolve step) within its own forM iteration.
+  -- list (different sink outputs may carry different s), so each entry's
+  -- outputs (including the IO resolve step) are processed within their
+  -- own forM iteration rather than folded together in one comprehension.
   warnMsgLists <-
     forM (Map.elems (unAnyCompSinkOutsMap newOutputs)) $
       \(ForAnyCompFlow ident p (SomeCompSinkOuts outsSet)) ->
@@ -613,15 +587,13 @@ mkPaqEntry :: PaqPriority -> DefRef -> Paq.PaqEntry DefRef ()
 mkPaqEntry prio ref = Paq.PaqEntry (Paq.PaqTime 0) prio ref ()
 
 -- | Enqueue a set of refs as stale, skipping any that are currently
--- pending (mid-evaluation) -- same rule as Stage 0/1's @invalidate@,
--- rephrased against a per-row pending flag instead of a separate pending
--- set. Priority comes from each ref's own def (@compId_priority@, via the
--- def's 'Comp' -- Stage 0/1 read this off an 'AnyCompAp' via
--- 'anyCompApPriority'; same source, reached differently). Returns exactly
+-- pending (mid-evaluation): a row already mid-evaluation will re-check its
+-- own staleness when it finishes ('finishCap'\'s @selfStale@ check), so
+-- enqueueing it again here would be redundant. Priority comes from each
+-- ref's own def (@compId_priority@, via the def's 'Comp'). Returns exactly
 -- the refs that were *newly* added to the queue (excludes both
 -- pending-skipped refs and refs that were already queued) -- the set
--- 'finishCap'/'notifyDepChange' report back through the public interface,
--- matching Stage 0/1's @invalidate@ return value.
+-- 'finishCap'\/'notifyDepChange' report back through the public interface.
 enqueueRefs :: SifState -> HashSet DefRef -> IO (HashSet DefRef)
 enqueueRefs st refs = fmap (HashSet.fromList . catMaybes) $ forM (HashSet.toList refs) $ \ref -> do
   let (defIdx, row) = DT.unpackRef ref
@@ -733,7 +705,7 @@ freeRowCascade st defIdx row = do
       -- Only outputs nothing *else* still claims are actually garbage --
       -- e.g. two rows both writing to sink key "output": one dying must
       -- not delete a key the other is still producing. Filtered against
-      -- outs' (this row's own entry already removed), matching Stage 0/1.
+      -- outs' (this row's own entry already removed).
       let garbOutputs = OM.filterUnreferencedOutputs outs' oldOutputs
           outsGarbage =
             if nullAnyOutsMap garbOutputs
@@ -749,10 +721,10 @@ freeRowCascade st defIdx row = do
         )
 
 -- | Add @ref@ (observed at @dep@'s version) as a dependent of @dep@'s
--- source key, interning the key on first use and creating its arena. Like
--- the pre-columnar @HashMap.insert@ this replaces, a second add for a
--- @ref@ already present in this key's arena is not deduplicated -- see
--- 'SI.skaAppend's haddock for why the real call path never hits that case.
+-- source key, interning the key on first use and creating its arena. A
+-- second add for a @ref@ already present in this key's arena is not
+-- deduplicated -- see 'SI.skaAppend's haddock for why the real call path
+-- never hits that case.
 addSrcDependent :: SifState -> AnyCompSrcDep -> DefRef -> IO ()
 addSrcDependent st dep ref = do
   let key = depKey dep
@@ -868,9 +840,8 @@ writeFinishedRow dt row rs mh mres = do
     _ -> pure ()
 
 --
--- Finishing a cap's evaluation: the columnar analogue of Stage 0/1's
--- putCapRes. See the module haddock for the changed-bit semantics this
--- implements in place of VerList.
+-- Finishing a cap's evaluation. See the module haddock for the changed-bit
+-- semantics this implements.
 --
 
 capEvaluationFinishedImpl
@@ -943,9 +914,11 @@ finishCap st cap defIdx dt row deps mres = do
           ++ show oldHash
       )
 
-  -- Commit the new value/hash and edge columns unconditionally -- Stage
-  -- 0/1 also updated its containers before ever branching on the impure
-  -- check.
+  -- Commit the new value/hash and edge columns unconditionally, before
+  -- branching on the impure check below: the row's stored state must
+  -- reflect what this evaluation actually produced regardless of whether
+  -- it gets flagged impure, so a later read sees the real current value
+  -- rather than a stale one just because this run looked suspicious.
   writeFinishedRow dt row newResultState newHash mres
   edgeGarbage <- updateEdges dt st ref oldCompDepsVer newCompDepsVer oldSrcDeps newSrcDeps
   outputGarbage <- commitPendingOutputsForKey st ref capAny
@@ -962,10 +935,12 @@ finishCap st cap defIdx dt row deps mres = do
           then enqueueRefs st (HashSet.fromList (map DT.mkDefRefUnsafe (VU.toList rdeps)))
           else pure HashSet.empty
       selfStale <- checkSelfStale st newCompDepsVer
-      -- self-enqueue happens (it's the mechanism keeping this cap on the
-      -- queue), but -- matching Stage 0/1's putCapRes, where the returned
-      -- newStaleCaps was bound before the self-check ran -- it never shows
-      -- up in the *reported* stale set below, only in the actual queue.
+      -- Self-enqueue happens (it's the mechanism keeping this cap on the
+      -- queue when one of its own deps moved during evaluation), but it
+      -- never shows up in the *reported* stale set below, only in the
+      -- actual queue: the reported set describes what became stale as a
+      -- result of this cap's result changing, not this cap re-enqueueing
+      -- itself.
       when selfStale $ void $ enqueueRefs st (HashSet.singleton ref)
       staleCaps <-
         if resultChanged
@@ -1011,20 +986,18 @@ notifyDepChange st (CompEngDepSrc srcDep) = do
           -- differs from the new version -- not "everyone who depends on
           -- this key" (see the reverse-index haddock on 'SifState' for why
           -- that's required, not just a nicety). Deliberately does not
-          -- write the new version back into the arena: like VerList, a
-          -- dependent's recorded version only moves when *it* re-registers
-          -- via a real finish (updateEdges), not merely because a
-          -- notification went by.
+          -- write the new version back into the arena: a dependent's
+          -- recorded version only moves when *it* re-registers via a real
+          -- finish (updateEdges), not merely because a notification went
+          -- by.
           pairs <- SI.skaToList arena
           let staleRefs = HashSet.fromList [r | (r, v) <- pairs, v /= newVer]
-          -- Actually enqueue (the side effect, internally pending-aware);
-          -- but -- matching Stage 0/1's notifyDepChange, which reported
-          -- DepMap.stale's raw result and discarded invalidate's filtered
-          -- "_addedKeys" -- report the full stale-relative-to-this-
-          -- notification set regardless of whether each one was already
-          -- queued or is mid-evaluation. (EnqueueInfo answers "who's
-          -- affected by this change", not "who did this call newly
-          -- enqueue"; contrast finishCap's staleCaps, which answers the
-          -- latter and does use enqueueRefs's filtered return.)
+          -- Actually enqueue (the side effect, internally pending-aware),
+          -- but report the full stale-relative-to-this-notification set
+          -- regardless of whether each one was already queued or is
+          -- mid-evaluation: 'EnqueueInfo' answers "who's affected by this
+          -- change", not "who did this call newly enqueue". Contrast
+          -- 'finishCap'\'s @staleCaps@, which answers the latter and does
+          -- use 'enqueueRefs'\'s filtered return.
           void $ enqueueRefs st staleRefs
           resolveRefsToAny st staleRefs
