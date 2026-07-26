@@ -103,20 +103,21 @@ garbage (GenDel gen (Garbage garbage_caps garbage_deps garbage_outputs)) =
 newtype CompEngineM a = CompEngineM {unCompEngineM :: StateT GenDel (ReaderT CompEngine IO) a}
 
 {- | Hand-written rather than @deriving (Functor, Applicative, Monad,
- MonadIO)@ (via GeneralizedNewtypeDeriving): profiling after the CompM-over-
- IO rewrite (docs/benchmark-notes.md, Stage 2) found a live, allocating
- `$fMonadCompEngineM_$s$fMonadStateT_$c>>=` cost center on the suspend/
- resume hot path (`loop`/`doSuspended` now do a real monadic bind on every
- round trip, where the old pure representation didn't need one at all) --
- i.e. the derived instance's dictionary-passing wasn't fully specializing
- away even under -O2. Each method here is a one-line unwrap-delegate-
- rewrap around the identical underlying `StateT`/`ReaderT`/`IO` operation
- (so this is representationally a no-op, same as what deriving generated),
- but the explicit INLINE pragma gives GHC's simplifier a direct mandate to
- substitute the body at every call site and keep specializing through
- `mtl`'s own (also INLINE-marked) StateT/ReaderT instances down to concrete
- IO, rather than leaving a standalone dictionary method for the profiler
- (and the runtime) to keep finding.
+ MonadIO)@ (via GeneralizedNewtypeDeriving): the suspend/resume hot path
+ (`loop`/`doSuspended`) performs a real monadic bind on every round trip
+ through the engine, so any per-bind overhead here is paid once per
+ suspension point across an entire evaluation. A derived instance's
+ dictionary-passing does not reliably specialize away under -O2, which
+ leaves a live, allocating `$fMonadCompEngineM_$s$fMonadStateT_$c>>=` cost
+ center sitting on that path. Each method here is a one-line
+ unwrap-delegate-rewrap around the identical underlying
+ `StateT`/`ReaderT`/`IO` operation (so this is representationally a no-op,
+ same as what deriving would generate), but the explicit INLINE pragma
+ gives GHC's simplifier a direct mandate to substitute the body at every
+ call site and keep specializing through `mtl`'s own (also INLINE-marked)
+ StateT/ReaderT instances down to concrete IO, rather than leaving a
+ standalone dictionary method for the profiler (and the runtime) to keep
+ finding.
 -}
 instance Functor CompEngineM where
   fmap f (CompEngineM m) = CompEngineM (fmap f m)
@@ -252,9 +253,10 @@ evalCompAp outerCap =
       ( show outerCap
           ++ " --> "
           ++ ( case ev of
-                -- CompCacheMeta no longer pre-renders/stores a logrepr (see
-                -- its haddock in Types.hs) -- render the already-in-scope
-                -- typed value directly, on demand, only for this log line.
+                -- CompCacheMeta does not pre-render or store a logrepr
+                -- (see its haddock in Types.hs), so render the
+                -- already-in-scope typed value directly, on demand, only
+                -- for this log line.
                 CompResultOk (CompApResult val ccv) ->
                   concat
                     [ take 40 (show val)
@@ -438,9 +440,8 @@ evalCompAp outerCap =
       CompReqCombined reqA reqB -> do
         -- TODO: Make this bit parrallel
         -- Both branches share `env`, so whatever either records via
-        -- tellDep lands directly in the shared accumulator -- no manual
-        -- union needed (contrast the old `tellDep (wA <> wB)` below it
-        -- replaced).
+        -- tellDep lands directly in the shared accumulator; no manual
+        -- union of per-branch dependency sets is needed.
         resA <- doSuspended env reqA return
         resB <- doSuspended env reqB return
         let resCont =

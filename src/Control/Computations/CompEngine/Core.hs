@@ -222,12 +222,14 @@ dependOn :: AnyCompSrcDep -> CompM ()
 dependOn = tellDep . HashSet.singleton . CompEngDepSrc
 
 {- | Records dependencies for the cap currently being evaluated. Appends to
- the per-cap-evaluation accumulator ('CompMEnv's 'cme_deps') instead of
- returning a 'HashSet' for the caller to union in -- the Haxl-shaped fix
- that kills the per-bind 'HashSet' allocation/union (see
- docs/benchmark-notes.md's Stage 2 notes). The fold is strict so the
- accumulator's list spine is fully built as we go rather than left as a
- chain of `(++)` thunks hanging off the 'IORef'.
+ the per-cap-evaluation accumulator ('CompMEnv's 'cme_deps') rather than
+ returning a 'HashSet' for the caller to union in: a computation chains many
+ small binds, and each one would otherwise allocate and union a fresh
+ 'HashSet' just to plumb its dependencies back up to its caller. Writing
+ into a shared mutable accumulator instead turns each dependency record
+ into an O(1) cons. The fold is strict so the accumulator's list spine is
+ fully built as we go rather than left as a chain of `(++)` thunks hanging
+ off the 'IORef'.
 -}
 tellDep :: DepSet -> CompM ()
 tellDep deps
