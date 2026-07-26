@@ -163,11 +163,18 @@ instance Item ListItem where
           Right q -> Just (ListItem q)
       Id r -> fail $ "list items have no id (found id " ++ T.unpack r ++ ")"
 
+-- Necessarily top-level 'unsafeMkTypedCompSrcId'\/'unsafeMkTypedCompSinkId'
+-- CAFs, for the same reason as 'TestHelper.hashMapSrcId': 'getItem'\/
+-- 'writeItem' below are used by comp defs built by this module's callers
+-- before 'runCompEngineTest' constructs the actual 'HashMapFlow' instances.
+-- 'runCompEngineTest' derives each instance's name from the corresponding
+-- id (via 'instTextFromTypedCompSrcId'\/'instTextFromTypedCompSinkId')
+-- rather than duplicating the "input"\/"output" literals a third time.
 inputHashMapSrcId :: TypedCompSrcId HashMapFlow
-inputHashMapSrcId = typedCompSrcId (Proxy @HashMapFlow) "input"
+inputHashMapSrcId = unsafeMkTypedCompSrcId (Proxy @HashMapFlow) "input"
 
 outputHashMapSinkId :: TypedCompSinkId HashMapFlow
-outputHashMapSinkId = typedCompSinkId (Proxy @HashMapFlow) "output"
+outputHashMapSinkId = unsafeMkTypedCompSinkId (Proxy @HashMapFlow) "output"
 
 getItem :: (Item a) => Id -> CompM (Maybe a)
 getItem ident = do
@@ -248,8 +255,8 @@ runCompEngineTest
   -> IO ()
 runCompEngineTest initialItems nextItems compDefs doTest =
   do
-    hmInput <- initHashMapFlow "input"
-    hmOutput <- initHashMapFlow "output"
+    hmInput <- initHashMapFlow (instTextFromTypedCompSrcId inputHashMapSrcId)
+    hmOutput <- initHashMapFlow (instTextFromTypedCompSinkId outputHashMapSinkId)
     mapM_ (insertItem hmInput) initialItems
     reg <- newCompFlowRegistry
     registerCompSrc reg hmInput

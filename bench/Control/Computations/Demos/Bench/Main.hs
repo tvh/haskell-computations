@@ -58,7 +58,6 @@ import qualified Data.ByteString.Char8 as BSC
 import qualified Data.HashMap.Strict as HashMap
 import Data.IORef
 import Data.Maybe (fromMaybe)
-import Data.Proxy
 import Data.Time.Clock
 import Data.Word
 import GHC.Stats
@@ -191,12 +190,6 @@ benchCompDriver counterRef runVar withRegisteredFlows wireComps startVal = do
 -- Flow wiring
 ----------------------------------------
 
-kvSrcId :: TypedCompSrcId HashMapFlow
-kvSrcId = typedCompSrcId (Proxy @HashMapFlow) "bench-kv"
-
-docSinkId :: TypedCompSinkId HashMapFlow
-docSinkId = typedCompSinkId (Proxy @HashMapFlow) "bench-doc-sink"
-
 withCompFlows :: HashMapFlow -> HashMapFlow -> CompFlowRegistry -> IO () -> IO ()
 withCompFlows kv docSink reg action = do
   registerCompSrc reg kv
@@ -220,8 +213,8 @@ parseWord64 = readMaybe . BSC.unpack
 
 -- | Level-0 def body: read source key @show (i \`mod\` srcKeys)@; base is
 -- the parsed value or 0; result is @base + i + d@ (all wrapping 'Word64').
-level0Body :: Word64 -> Word32 -> CompM Word64
-level0Body dWord i = do
+level0Body :: TypedCompSrcId HashMapFlow -> Word64 -> Word32 -> CompM Word64
+level0Body kvSrcId dWord i = do
   mval <- compSrcReq kvSrcId (HashMapLookupReq (srcKeyFor i))
   let base = fromMaybe 0 (mval >>= parseWord64)
   pure (base + fromIntegral i + dWord)
@@ -230,8 +223,9 @@ level0Body dWord i = do
 -- (via fixed modular-arithmetic index formulas, matching the Rust spec
 -- exactly so 'Word32' wraps identically), then combine with @d@ and @i@.
 -- Top-level instances additionally write their result to the doc sink.
-higherLevelBody :: Level -> Word32 -> Bool -> Word64 -> Word32 -> CompM Word64
-higherLevelBody prevLevel prevSize isTop dWord i = do
+higherLevelBody
+  :: TypedCompSinkId HashMapFlow -> Level -> Word32 -> Bool -> Word64 -> Word32 -> CompM Word64
+higherLevelBody docSinkId prevLevel prevSize isTop dWord i = do
   let c0 = (i * 2 + 1) `mod` prevSize
       c1 = (i * 7 + 13) `mod` prevSize
       c2 = (i * 31 + 101) `mod` prevSize
@@ -246,8 +240,9 @@ higherLevelBody prevLevel prevSize isTop dWord i = do
 
 -- | Wires all 'levelsCount' levels (each with 'defsPerLevel' defs), bottom
 -- to top, threading each level's defs and size down as "prev" for the next.
-buildLevels :: [Word32] -> CompWireM [Level]
-buildLevels sizes = go (0 :: Int) Nothing sizes
+buildLevels
+  :: TypedCompSrcId HashMapFlow -> TypedCompSinkId HashMapFlow -> [Word32] -> CompWireM [Level]
+buildLevels kvSrcId docSinkId sizes = go (0 :: Int) Nothing sizes
  where
   numLevels = length sizes
   go :: Int -> Maybe (Level, Word32) -> [Word32] -> CompWireM [Level]
@@ -264,16 +259,22 @@ buildLevels sizes = go (0 :: Int) Nothing sizes
     name = "l" ++ show lvl ++ "_d" ++ show d
     dWord = fromIntegral d :: Word64
     bodyFun = case mPrev of
-      Nothing -> level0Body dWord
-      Just (prevLevel, prevSize) -> higherLevelBody prevLevel prevSize isTop dWord
+      Nothing -> level0Body kvSrcId dWord
+      Just (prevLevel, prevSize) -> higherLevelBody docSinkId prevLevel prevSize isTop dWord
 
 -- | Wires the full graph plus its root: for @i@ in @[0, topSize)@, grouped
 -- by @i \`mod\` defsPerLevel@, evaluate every top-level def at its group's
 -- params (sequential 'mapM' over 'evalCompOrFail', mirroring the Rust
 -- benchmark's use of @eval_all@).
-wireAllComps :: [Word32] -> CompWireM (Comp () ())
-wireAllComps sizes = do
-  levels <- buildLevels sizes
+--
+-- Takes the kv source\/doc sink ids as arguments rather than referencing
+-- top-level ids, so 'benchMain' can derive them with 'typedCompSrcIdOf'\/
+-- 'typedCompSinkIdOf' from the very 'HashMapFlow' instances it constructs --
+-- each instance's name ("bench-kv"\/"bench-doc-sink") is then written down
+-- exactly once, at the 'initHashMapFlow' call site.
+wireAllComps :: TypedCompSrcId HashMapFlow -> TypedCompSinkId HashMapFlow -> [Word32] -> CompWireM (Comp () ())
+wireAllComps kvSrcId docSinkId sizes = do
+  levels <- buildLevels kvSrcId docSinkId sizes
   let topLevel = last levels
       topSize = last sizes
       groups = [[i | i <- [0 .. topSize - 1], i `mod` fromIntegral defsPerLevel == g] | g <- [0 .. fromIntegral defsPerLevel - 1]]
@@ -332,7 +333,15 @@ benchMain = do
   runVar <- newTVarIO None
   counterRef <- newIORef 0
   t0 <- getCurrentTime
-  engineHandle <- async (benchCompDriver counterRef runVar (withCompFlows kv docSink) (wireAllComps sizes) ())
+  engineHandle <-
+    async
+      ( benchCompDriver
+          counterRef
+          runVar
+          (withCompFlows kv docSink)
+          (wireAllComps (typedCompSrcIdOf kv) (typedCompSinkIdOf docSink) sizes)
+          ()
+      )
 
   -- Cold settle: the *entire* initial evaluation runs synchronously inside
   -- Impl.startCompEngine, before the driver loop's first

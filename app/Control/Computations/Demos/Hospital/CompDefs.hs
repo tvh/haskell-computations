@@ -268,17 +268,25 @@ detailsCompDef getPatC getPatNotesC =
     let title = "Note " <> formatUTCTimeNoSeconds (pn_time note)
      in MSection (Some title) $ fromList [MContentText $ pn_text note]
 
+-- These four ids are necessarily top-level 'unsafeMkTypedCompSrcId'\/
+-- 'unsafeMkTypedCompSinkId' CAFs: the comp bodies above reference them at
+-- wiring time, well before 'withCompFlows' constructs the corresponding
+-- instances. Each one's literal instance name is written down exactly
+-- once, right here -- 'withCompFlows' below derives the matching
+-- 'FileSrcConfig'\/'SqliteSrcCfg'\/instance-name argument from the id
+-- itself (via 'instTextFromTypedCompSrcId'\/'instanceIdFromTypedCompSrcId'\/
+-- 'instTextFromTypedCompSinkId'), rather than duplicating the string.
 cfgFileSrcId :: TypedCompSrcId FileSrc
-cfgFileSrcId = typedCompSrcId (Proxy @FileSrc) "cfgFileSrc"
+cfgFileSrcId = unsafeMkTypedCompSrcId (Proxy @FileSrc) "cfgFileSrc"
 
 fileStoreSinkId :: TypedCompSinkId FileStoreSink
-fileStoreSinkId = typedCompSinkId (Proxy @FileStoreSink) "fileStoreSink"
+fileStoreSinkId = unsafeMkTypedCompSinkId (Proxy @FileStoreSink) "fileStoreSink"
 
 patMsgsSrcId :: TypedCompSrcId SqliteSrc
-patMsgsSrcId = typedCompSrcId (Proxy @SqliteSrc) "patMsgsSrc"
+patMsgsSrcId = unsafeMkTypedCompSrcId (Proxy @SqliteSrc) "patMsgsSrc"
 
 patNotesSrcId :: TypedCompSrcId SqliteSrc
-patNotesSrcId = typedCompSrcId (Proxy @SqliteSrc) "patNotesSrc"
+patNotesSrcId = unsafeMkTypedCompSrcId (Proxy @SqliteSrc) "patNotesSrc"
 
 readConfigFile :: FilePath -> CompM BS.ByteString
 readConfigFile p = compSrcReq cfgFileSrcId (ReadFile p)

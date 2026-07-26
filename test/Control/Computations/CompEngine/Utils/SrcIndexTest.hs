@@ -15,10 +15,12 @@ import Control.Computations.CompEngine.CompSrc (
   AnyCompSrcKey,
   AnyCompSrcVer,
   CompSrc (..),
+  CompSrcId,
   CompSrcInstanceId (..),
   SomeCompSrcKey (..),
   SomeCompSrcVer (..),
-  compSrcId,
+  typedCompSrcIdOf,
+  unTypedCompSrcId,
  )
 import Control.Computations.CompEngine.Utils.DefTable (DefRef, mkDefRefUnsafe)
 import Control.Computations.CompEngine.Utils.SrcIndex
@@ -226,11 +228,14 @@ instance CompSrc TestSrc where
   compSrcUnregister _ _ = pure ()
   compSrcWaitChanges _ = retry
 
+testSrcId :: CompSrcId
+testSrcId = unTypedCompSrcId (typedCompSrcIdOf TestSrc)
+
 wrapKey :: T.Text -> AnyCompSrcKey
-wrapKey t = ForAnyCompFlow (compSrcId TestSrc) (Proxy @TestSrc) (SomeCompSrcKey t)
+wrapKey t = ForAnyCompFlow testSrcId (Proxy @TestSrc) (SomeCompSrcKey t)
 
 wrapVer :: Int -> AnyCompSrcVer
-wrapVer v = ForAnyCompFlow (compSrcId TestSrc) (Proxy @TestSrc) (SomeCompSrcVer v)
+wrapVer v = ForAnyCompFlow testSrcId (Proxy @TestSrc) (SomeCompSrcVer v)
 
 mkKey :: Int -> AnyCompSrcKey
 mkKey n = wrapKey (T.pack (show n))

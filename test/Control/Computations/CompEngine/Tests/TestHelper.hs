@@ -44,11 +44,17 @@ type TestCompDef = CompDef
 
 type TestDep = AnyCompSrcDep
 
+-- Necessarily top-level 'unsafeMkTypedCompSrcId'\/'unsafeMkTypedCompSinkId'
+-- CAFs: 'get'\/'put' below are used by many separate test modules' comp
+-- defs, built well before 'initCompEngineTest' constructs the actual
+-- 'HashMapFlow' instance. 'initCompEngineTest' derives the instance's name
+-- from 'hashMapSrcId' (via 'instTextFromTypedCompSrcId') rather than
+-- duplicating the "ident" literal a third time.
 hashMapSrcId :: TypedCompSrcId HashMapFlow
-hashMapSrcId = typedCompSrcId (Proxy @HashMapFlow) "ident"
+hashMapSrcId = unsafeMkTypedCompSrcId (Proxy @HashMapFlow) "ident"
 
 hashMapSinkId :: TypedCompSinkId HashMapFlow
-hashMapSinkId = typedCompSinkId (Proxy @HashMapFlow) "ident"
+hashMapSinkId = unsafeMkTypedCompSinkId (Proxy @HashMapFlow) "ident"
 
 get :: Key -> CompM (Maybe Val)
 get k = compSrcReq hashMapSrcId (HashMapLookupReq k)
@@ -81,7 +87,7 @@ initCompEngineTest
       )
 initCompEngineTest compDefs =
   do
-    hmFlow <- initHashMapFlow "ident"
+    hmFlow <- initHashMapFlow (instTextFromTypedCompSrcId hashMapSrcId)
     reg <- newCompFlowRegistry
     registerCompSrc reg hmFlow
     registerCompSink reg hmFlow

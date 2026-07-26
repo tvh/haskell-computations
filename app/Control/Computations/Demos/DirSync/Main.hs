@@ -23,40 +23,40 @@ import Control.Concurrent.STM
 import Control.Monad
 import qualified Data.ByteString as BS
 import Data.HashSet (HashSet)
-import Data.Proxy
 import System.Directory
 import System.FilePath
 import Prelude hiding (readFile, writeFile)
 
-fileSrcId :: TypedCompSrcId FileSrc
-fileSrcId = typedCompSrcId (Proxy @FileSrc) "fileSrc"
+readFile :: TypedCompSrcId FileSrc -> FilePath -> CompM BS.ByteString
+readFile fileSrcId p = compSrcReq fileSrcId (ReadFile p)
 
-fileSinkId :: TypedCompSinkId FileSink
-fileSinkId = typedCompSinkId (Proxy @FileSink) "fileSink"
+writeFile :: TypedCompSinkId FileSink -> FilePath -> BS.ByteString -> CompM ()
+writeFile fileSinkId p bs = compSinkReq fileSinkId (WriteFile p bs)
 
-readFile :: FilePath -> CompM BS.ByteString
-readFile p = compSrcReq fileSrcId (ReadFile p)
+listDir :: TypedCompSrcId FileSrc -> FilePath -> CompM (HashSet DirEntry)
+listDir fileSrcId p = compSrcReq fileSrcId (ListDir p)
 
-writeFile :: FilePath -> BS.ByteString -> CompM ()
-writeFile p bs = compSinkReq fileSinkId (WriteFile p bs)
+mkdir :: TypedCompSinkId FileSink -> FilePath -> CompM ()
+mkdir fileSinkId p = compSinkReq fileSinkId (MakeDirs p)
 
-listDir :: FilePath -> CompM (HashSet DirEntry)
-listDir p = compSrcReq fileSrcId (ListDir p)
-
-mkdir :: FilePath -> CompM ()
-mkdir p = compSinkReq fileSinkId (MakeDirs p)
-
-fileSyncCompDef :: FilePath -> CompDef FilePath ()
-fileSyncCompDef src = defineComp "fileSyncComp" fullCaching $ \path ->
+fileSyncCompDef
+  :: TypedCompSrcId FileSrc -> TypedCompSinkId FileSink -> FilePath -> CompDef FilePath ()
+fileSyncCompDef fileSrcId fileSinkId src = defineComp "fileSyncComp" fullCaching $ \path ->
   do
-    bs <- readFile (src </> path)
-    writeFile path bs
+    bs <- readFile fileSrcId (src </> path)
+    writeFile fileSinkId path bs
 
-dirSyncCompDef :: FilePath -> Comp FilePath () -> Comp FilePath () -> CompDef FilePath ()
-dirSyncCompDef src fileComp dirComp = defineComp "dirSyncComp" fullCaching $ \path ->
+dirSyncCompDef
+  :: TypedCompSrcId FileSrc
+  -> TypedCompSinkId FileSink
+  -> FilePath
+  -> Comp FilePath ()
+  -> Comp FilePath ()
+  -> CompDef FilePath ()
+dirSyncCompDef fileSrcId fileSinkId src fileComp dirComp = defineComp "dirSyncComp" fullCaching $ \path ->
   do
-    mkdir path
-    contents <- listDir (src </> path)
+    mkdir fileSinkId path
+    contents <- listDir fileSrcId (src </> path)
     forM_ contents $ \entry ->
       case de_type entry of
         RegularFileType -> void $ evalComp fileComp (path </> de_name entry)
@@ -74,18 +74,21 @@ dirSyncCompDef src fileComp dirComp = defineComp "dirSyncComp" fullCaching $ \pa
                 ++ show t
             )
 
-withCompFlows :: FilePath -> CompFlowRegistry -> IO a -> IO a
-withCompFlows tgt reg action =
-  withFileSrc (defaultFileSrcConfig "fileSrc") $ regSrc reg $ do
-    fileSink <- makeFileSink "fileSink" tgt
-    registerCompSink reg fileSink
-    registerCompSink reg ioSink
-    action
+-- | Register the already-built flow instances (see 'syncDirs''), then hand
+-- control to the given action.
+withCompFlows :: FileSrc -> FileSink -> CompFlowRegistry -> IO a -> IO a
+withCompFlows fileSrc fileSink reg action = do
+  registerCompSrc reg fileSrc
+  registerCompSink reg fileSink
+  registerCompSink reg ioSink
+  action
 
-wireComps :: FilePath -> CompWireM (Comp FilePath ())
-wireComps src = do
-  fileComp <- wireComp (fileSyncCompDef src)
-  defineRecursiveComp (dirSyncCompDef src fileComp)
+-- | Wired against the *actual* source\/sink ids (see 'syncDirs''), derived
+-- from the live instances with 'typedCompSrcIdOf'\/'typedCompSinkIdOf'.
+wireComps :: TypedCompSrcId FileSrc -> TypedCompSinkId FileSink -> FilePath -> CompWireM (Comp FilePath ())
+wireComps fileSrcId fileSinkId src = do
+  fileComp <- wireComp (fileSyncCompDef fileSrcId fileSinkId src)
+  defineRecursiveComp (dirSyncCompDef fileSrcId fileSinkId src fileComp)
 
 syncDirs :: FilePath -> FilePath -> IO ()
 syncDirs src tgt =
@@ -93,8 +96,18 @@ syncDirs src tgt =
     runVar <- newTVarIO None
     syncDirs' runVar src tgt
 
+-- | The FileSrc\/FileSink instances are built once here, up front -- their
+-- ids (used by 'wireComps') and their registration (used by
+-- 'withCompFlows') both derive from the very same instances, so each
+-- instance's name is written down exactly once.
 syncDirs' :: TVar (Option RunStats) -> FilePath -> FilePath -> IO ()
 syncDirs' runVar src' tgt' = do
   src <- canonicalizePath src'
   tgt <- canonicalizePath tgt'
-  compDriver' runVar (withCompFlows tgt) (wireComps src) "."
+  withFileSrc (defaultFileSrcConfig "fileSrc") $ \fileSrc -> do
+    fileSink <- makeFileSink "fileSink" tgt
+    compDriver'
+      runVar
+      (withCompFlows fileSrc fileSink)
+      (wireComps (typedCompSrcIdOf fileSrc) (typedCompSinkIdOf fileSink) src)
+      "."

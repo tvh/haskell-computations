@@ -48,8 +48,13 @@ data TestReq a where
   TestReadReq :: TestReq String
   TestPutReq :: String -> TestReq ()
 
+-- Top-level 'unsafeMkTypedCompSrcId' CAF: 'requestExt'\/'putReq' below are
+-- used from comp defs built before any 'TestFlow' instance exists. Its
+-- "TestSrc" literal matches 'TestFlow's own 'compSrcInstanceId', which is
+-- hardcoded (not derived from any config), so there's no second copy to
+-- eliminate here the way the demos' 'defaultFileSrcConfig' ones have.
 testFlowSrcId :: TypedCompSrcId TestFlow
-testFlowSrcId = typedCompSrcId (Proxy @TestFlow) "TestSrc"
+testFlowSrcId = unsafeMkTypedCompSrcId (Proxy @TestFlow) "TestSrc"
 
 requestExt :: CompM String
 requestExt = compSrcReq testFlowSrcId TestReadReq

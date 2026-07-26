@@ -98,7 +98,7 @@ toy_delete key tom =
 
 testOutputs :: CompSinkForTestingOutputs -> [T.Text] -> AnyCompSinkOuts
 testOutputs sink outputs =
-  let i = compSinkId sink
+  let i = unTypedCompSinkId (typedCompSinkIdOf sink)
       outputSet :: SomeCompSinkOuts CompSinkForTestingOutputs
       outputSet = SomeCompSinkOuts (HashSet.fromList outputs)
    in ForAnyCompFlow i (Proxy @CompSinkForTestingOutputs) outputSet
@@ -111,8 +111,11 @@ toy_outputsToReal toyOutputs =
             HashSet.toList toyOutputs
    in AnyCompSinkOutsMap $
         Map.fromList $
-          map (\(dataIf, deps) -> (compSinkId dataIf, testOutputs dataIf (HashSet.toList deps))) $
-            Map.toList toyOutputsMap
+          map
+            ( \(dataIf, deps) ->
+                (unTypedCompSinkId (typedCompSinkIdOf dataIf), testOutputs dataIf (HashSet.toList deps))
+            )
+            $ Map.toList toyOutputsMap
 
 toy_outputsMapToReal :: (Ord k, Hashable k) => ToyOutputsMap k -> OutputsMap k
 toy_outputsMapToReal =
@@ -139,7 +142,7 @@ allPossibleCompSinks =
 
 toyToRealOutputKey :: ToyOutput -> (Proxy CompSinkForTestingOutputs, CompSinkId, T.Text)
 toyToRealOutputKey tok =
-  (Proxy, compSinkId (to_dataIf tok), to_key tok)
+  (Proxy, unTypedCompSinkId (typedCompSinkIdOf (to_dataIf tok)), to_key tok)
 
 newtype ToyKey = ToyKey
   { _unToyKey :: T.Text
