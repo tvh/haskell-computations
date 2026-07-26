@@ -111,14 +111,14 @@ initStateIf shouldValidate =
     let close = liftIO (putMVar exitMVar ())
     return (stateIf, close)
 
-{- | The columnar rewrite's 'SifState' is genuinely, internally mutable
- (growable unboxed/boxed vectors behind 'Data.IORef.IORef's) rather than an
- immutable value swapped through a 'TVar' -- running arbitrary in-place
- vector mutation inside an STM transaction would be unsound (a transaction
- can retry, replaying the mutation). Access is serialized with a plain
- 'MVar' lock instead; per the roadmap, this is a deliberate, accepted cost
- ('stepCompEngine' is sequential, so there's no free-snapshot use case this
- gives up in practice).
+{- | 'SifState' is genuinely, internally mutable (growable unboxed/boxed
+ vectors behind 'Data.IORef.IORef's) rather than an immutable value swapped
+ through a 'TVar' -- running arbitrary in-place vector mutation inside an
+ STM transaction would be unsound (a transaction can retry, replaying the
+ mutation). Access is serialized with a plain 'MVar' lock instead: this
+ gives up the free, lock-free snapshots a 'TVar' would offer, but
+ 'stepCompEngine' is sequential, so there is no use case in practice that
+ would exploit them.
 -}
 setupSimpleStateIf
   :: Bool

@@ -56,14 +56,7 @@ type IsDepConstraints a = (Show a, Eq a, Hashable a)
 {- | A dependency @a@ that can be split into a key (identifying what's
  depended on) and a version (what state it was observed in).
 
- Moved here from the former @CompEngine\/Utils\/DepMap.hs@ (now deleted),
- which used to also define a @DepMap@ container -- a forward+reverse
- dependency index, its reverse side bucketed by dependency version via a
- since-deleted @VerList@ -- that the columnar rewrite replaced with per-def
- "Control.Computations.CompEngine.Utils.DefTable" columns; see
- "Control.Computations.CompEngine.SimpleStateIf"'s module haddock for that
- history. Only the class survives, unrelated to the dead container: it's
- load-bearing for this module's own 'Dep'\/'SomeCompSrcDep'\/'AnyCompSrcDep'
+ Load-bearing for this module's own 'Dep'\/'SomeCompSrcDep'\/'AnyCompSrcDep'
  instances below and for "Control.Computations.CompEngine.Types"'s
  'CompDep'\/'CompEngDep' instances.
 -}
