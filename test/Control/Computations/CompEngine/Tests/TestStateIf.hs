@@ -36,10 +36,9 @@ import Data.Typeable
 import GHC.Generics (Generic)
 import Test.Framework
 
--- | Was 'StateT SifState IO': the columnar rewrite's 'SifState' is a
--- genuinely mutable handle rather than a pure value threaded through
--- 'StateT', so there is no longer any state to thread -- 'TestM' collapses
--- to plain 'IO'.
+-- | 'SifState' is a genuinely mutable handle rather than a pure value that
+-- would need threading through 'StateT', so there is no state to thread --
+-- 'TestM' collapses to plain 'IO'.
 type TestM = IO
 
 data TestStateSrc = TestStateSrc deriving (Show, Read, Eq, Ord, Generic, Typeable)
@@ -132,11 +131,11 @@ test_capBecomesStaleDuringComputationBecauseDependencyChanges =
  bumps of the same source key against a single cap through the real
  @capEvaluation@ round trip (started -> finished, exactly like the driver
  loop calls it) and assert the interned src-dep table never accumulates
- more than the one currently-referenced version -- Part 1's refcounting fix,
- exercised end to end rather than against 'Control.Computations.CompEngine.Utils.DefTable.DefTable'
- directly. Before the fix this would grow without bound (one id per
- distinct @(key, version)@ pair ever observed, docs/benchmark-notes.md's
- Stage 4e "accepted limitation").
+ more than the one currently-referenced version, exercising the
+ refcounting end to end rather than against
+ 'Control.Computations.CompEngine.Utils.DefTable.DefTable' directly.
+ Without refcounting this would grow without bound: one id per distinct
+ @(key, version)@ pair ever observed, never reclaimed.
 -}
 test_srcDepInternTableStaysBoundedAcrossVersionChurn :: IO ()
 test_srcDepInternTableStaysBoundedAcrossVersionChurn = do
@@ -152,12 +151,11 @@ test_srcDepInternTableStaysBoundedAcrossVersionChurn = do
 {- | The same churn, but across many distinct caps all sharing the *same*
  source key at the *same* version at any given moment (so the live-set
  size stays at 1 shared id throughout, even as N rows all reference it) --
- checks that fan-in sharing (this codebase's own benchmark graph: 300
- source keys against ~200k dependent rows, docs/benchmark-notes.md's Stage
- 4e) doesn't inflate the live count past the number of distinct values
- actually referenced, and that freeing every dependent by moving them all
- off the key (via a version bump none of them re-register against) drains
- it back to zero.
+ checks that fan-in sharing (this library's own persistence benchmark has
+ 300 source keys against ~200k dependent rows) doesn't inflate the live
+ count past the number of distinct values actually referenced, and that
+ freeing every dependent by moving them all off the key (via a version
+ bump none of them re-register against) drains it back to zero.
 -}
 test_srcDepInternTableSharedAcrossManyCapsStaysBoundedAndDrains :: IO ()
 test_srcDepInternTableSharedAcrossManyCapsStaysBoundedAndDrains = do
@@ -180,16 +178,16 @@ test_srcDepInternTableSharedAcrossManyCapsStaysBoundedAndDrains = do
   assertEqual 1 c2
 
 {- | The reverse-index analogue of
- 'test_srcDepInternTableStaysBoundedAcrossVersionChurn', against the
- columnar 'Control.Computations.CompEngine.Utils.SrcIndex.KeyIntern' this
- task adds: a single cap repeatedly re-registers the *same* source key at a
- new version on every run (so the key's dependent set drops to zero and is
- immediately re-populated each time -- see 'SimpleStateIf.removeSrcDependent's
- haddock for why that transient drop-to-zero happens on every version bump
- even though a single row \"holds\" the key throughout). Both the live key
- count and the total ids ever assigned must stay bounded, not grow with the
- number of version bumps -- the id-recycling churn test the task brief asks
- for, on the key side rather than the src-dep side.
+ 'test_srcDepInternTableStaysBoundedAcrossVersionChurn', against
+ 'Control.Computations.CompEngine.Utils.SrcIndex.KeyIntern': a single cap
+ repeatedly re-registers the *same* source key at a new version on every
+ run (so the key's dependent set drops to zero and is immediately
+ re-populated each time -- see 'SimpleStateIf.removeSrcDependent's haddock
+ for why that transient drop-to-zero happens on every version bump even
+ though a single row \"holds\" the key throughout). Both the live key count
+ and the total ids ever assigned must stay bounded, not grow with the
+ number of version bumps -- the id-recycling churn test, on the key side
+ rather than the src-dep side.
 -}
 test_srcKeyInternTableStaysBoundedAcrossVersionChurn :: IO ()
 test_srcKeyInternTableStaysBoundedAcrossVersionChurn = do
@@ -259,10 +257,9 @@ test_srcIndexInvalidatesOnlyTheMismatchedDependent =
 
 {- | 'SimpleStateIf.removeSrcDependent' reports a source key as a garbage
  dep (for \"Run.hs\" to unregister) exactly when its dependent set drops to
- zero -- confirms that reporting survives the columnar rewrite of
- 'sifs_srcIndex' bit-for-bit, using 'capEvaluationFinished's returned
- 'Garbage' directly rather than only the app-level DirSync check
- docs/benchmark-notes.md's Stage 4e cites.
+ zero. Checks 'capEvaluationFinished's returned 'Garbage' directly, rather
+ than only through an app-level effect (e.g. DirSync's own check that a
+ deregistered source stops being watched).
 -}
 test_srcIndexReportsGarbageDepWhenLastDependentDrops :: IO ()
 test_srcIndexReportsGarbageDepWhenLastDependentDrops =

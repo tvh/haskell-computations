@@ -217,9 +217,8 @@ test_valueRoundTrips = do
 -- Column representation: mkColumn must pick ColUnboxed for the recognized
 -- primitive types (mirroring the benchmark's own Word32 param / Word64
 -- result) and ColBoxed for everything else (e.g. a non-unboxable param or
--- result type such as String -- the task brief's fallback requirement),
--- and both representations must round-trip correctly through DefTable's
--- ordinary read/write API either way.
+-- result type such as String), and both representations must round-trip
+-- correctly through DefTable's ordinary read/write API either way.
 --
 
 test_columnPicksUnboxedForRecognizedPrimitiveTypes :: IO ()
@@ -231,9 +230,9 @@ test_columnPicksUnboxedForRecognizedPrimitiveTypes = do
   assertBool (columnIsUnboxed (dt_param dtOther))
   assertBool (columnIsUnboxed (dt_value dtOther))
 
--- | A non-unboxable param/result type (here 'String', standing in for the
--- task brief's @ByteString@ example -- real param types in the test suite
--- include both) must fall back to 'ColBoxed', not fail to build.
+-- | A non-unboxable param/result type (here 'String', standing in for
+-- e.g. @ByteString@ -- real param types in the test suite include both)
+-- must fall back to 'ColBoxed', not fail to build.
 test_columnFallsBackToBoxedForNonUnboxableTypes :: IO ()
 test_columnFallsBackToBoxedForNonUnboxableTypes = do
   (dt :: DefTable String String) <- new
@@ -254,10 +253,9 @@ test_unboxedColumnParamValueRoundTrip = do
   assertEqual (maxBound :: Word64) v
 
 -- | Round-trip through the boxed fallback path with a non-unboxable type
--- (String), the case the task brief specifically asks to be covered: a
--- real param/result type that can never satisfy an 'Unbox' constraint
--- (like 'Data.ByteString.ByteString' in the wider test suite) must keep
--- working unchanged.
+-- (String): a real param/result type that can never satisfy an 'Unbox'
+-- constraint (like 'Data.ByteString.ByteString' in the wider test suite)
+-- must keep working unchanged.
 test_boxedColumnParamValueRoundTrip :: IO ()
 test_boxedColumnParamValueRoundTrip = do
   (dt :: DefTable String String) <- new
@@ -593,7 +591,7 @@ test_freeingRowWithNoSrcDepsIsInternTableNoOp = do
   assertEqual 0 c1
 
 --
--- Row reuse and garbage tolerance (Rust Stage 5's rules, ported): freeing a
+-- Row reuse and garbage tolerance: freeing a
 -- row must not physically clear its result-hash/value/edge columns -- only
 -- flags, param hash, and the caller-visible param/edge-reset fields that
 -- lookupOrInsertRow re-establishes on the *next* occupant. Everything else
@@ -610,7 +608,7 @@ test_freeRowLeavesResultHashAndValueAsGarbageButFlagsGateThem = do
   freeRow dt (h 1) r1
   -- the row is dead -- callers must not trust it without checking flags
   -- first (this module doesn't force-clear result_hash/value: reusing the
-  -- row is what re-establishes a safe state, matching Rust Stage 5)
+  -- row is what re-establishes a safe state)
   alive <- isAlive dt r1
   assertBool (not alive)
   -- reuse: a fresh occupant of the same row number gets fresh flags/param,
@@ -747,9 +745,9 @@ test_srcDepsCompactionDoesNotDisturbBystanderRowsOrSharedIds = do
   assertBool (c > 0)
 
 -- | A row freed and reused *between* two forced compactions of the
--- srcDeps arena -- the specific interleaving the task brief calls out.
--- The freed-and-reused row's own src dep must never resurface, and a
--- second compaction after reuse must still leave everything else correct.
+-- srcDeps arena. The freed-and-reused row's own src dep must never
+-- resurface, and a second compaction after reuse must still leave
+-- everything else correct.
 test_rowFreedAndReusedBetweenTwoSrcDepsCompactions :: IO ()
 test_rowFreedAndReusedBetweenTwoSrcDepsCompactions = do
   dt <- newTest

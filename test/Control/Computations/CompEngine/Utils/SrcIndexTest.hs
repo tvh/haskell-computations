@@ -83,11 +83,10 @@ test_keyInternReleaseRecyclesId = do
   assigned <- kiAssignedCount ki
   assertEqual 1 assigned
 
--- | The churn test the task brief asks for: repeatedly intern-then-release
--- the *same* key many times over and assert the assigned-id count (which
--- would grow unboundedly under a never-recycled design, exactly the bug
--- 4g fixed on the forward side) stays bounded, not proportional to the
--- number of cycles.
+-- | Repeatedly intern-then-release the *same* key many times over and
+-- assert the assigned-id count (which would grow unboundedly under a
+-- never-recycled design) stays bounded, not proportional to the number of
+-- cycles.
 test_keyInternChurnStaysBounded :: IO ()
 test_keyInternChurnStaysBounded = do
   ki <- newKeyIntern
