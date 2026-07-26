@@ -1,6 +1,6 @@
 {-# LANGUAGE TypeFamilies #-}
 
-module Control.Computations.FlowImpls.FileStoreSink (
+module Control.Computations.Demos.FlowImpls.FileStoreSink (
   FileStoreSinkReq (..),
   FileStoreSink,
   DocId,
@@ -12,8 +12,8 @@ module Control.Computations.FlowImpls.FileStoreSink (
 ----------------------------------------
 -- LOCAL
 ----------------------------------------
-import Control.Computations.CompEngine.CompSink
-import Control.Computations.Utils.FileStore.Writer
+import Control.Computations.CompEngine
+import Control.Computations.Demos.Utils.FileStore.Writer
 import Control.Computations.Utils.Types
 
 ----------------------------------------

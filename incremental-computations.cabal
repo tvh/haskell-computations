@@ -50,7 +50,6 @@ library
       Control.Computations.FlowImpls.CompLogging
       Control.Computations.FlowImpls.FileSink
       Control.Computations.FlowImpls.FileSrc
-      Control.Computations.FlowImpls.FileStoreSink
       Control.Computations.FlowImpls.HashMapFlow
       Control.Computations.FlowImpls.IOSink
       Control.Computations.FlowImpls.TimeSrc
@@ -62,11 +61,6 @@ library
       Control.Computations.Utils.Clock
       Control.Computations.Utils.IOUtils
       Control.Computations.Utils.TimeUtils
-      Control.Computations.Utils.FileStore.Writer
-      Control.Computations.Utils.FileStore.Types
-      Control.Computations.Utils.Dispatcher
-      Control.Computations.Utils.SqliteUtils
-      Control.Computations.Utils.FileStore.Watcher
   other-modules:
       Control.Computations.CompEngine.CacheBehaviors
       Control.Computations.CompEngine.CompDef
@@ -88,7 +82,6 @@ library
       Control.Computations.Utils.Ansi
       Control.Computations.Utils.ConcUtils
       Control.Computations.Utils.DataSize
-      Control.Computations.Utils.FileStore.Intern
       Control.Computations.Utils.FileWatch
       Control.Computations.Utils.MultiMap
       Control.Computations.Utils.MultiSet
@@ -160,6 +153,7 @@ executable incremental-computations-exe
   other-modules:
       Control.Computations.Demos.DirSync.Main
       Control.Computations.Demos.DirSync.Tests
+      Control.Computations.Demos.FlowImpls.FileStoreSink
       Control.Computations.Demos.FlowImpls.SqliteSrc
       Control.Computations.Demos.Hospital.CompDefs
       Control.Computations.Demos.Hospital.Config
@@ -177,6 +171,14 @@ executable incremental-computations-exe
       Control.Computations.Demos.Main
       Control.Computations.Demos.Simple.Main
       Control.Computations.Demos.Tests
+      Control.Computations.Demos.Utils.Dispatcher
+      Control.Computations.Demos.Utils.DispatcherTest
+      Control.Computations.Demos.Utils.FileStore.Intern
+      Control.Computations.Demos.Utils.FileStore.Tests
+      Control.Computations.Demos.Utils.FileStore.Types
+      Control.Computations.Demos.Utils.FileStore.Watcher
+      Control.Computations.Demos.Utils.FileStore.Writer
+      Control.Computations.Demos.Utils.SqliteUtils
       Paths_incremental_computations
   hs-source-dirs:
       app
@@ -268,9 +270,7 @@ test-suite incremental-computations-test
       Control.Computations.FlowImpls.FileSrcTest
       Control.Computations.FlowImpls.TimeSrcTest
       Control.Computations.Utils.DataSizeTest
-      Control.Computations.Utils.DispatcherTest
       Control.Computations.Utils.FailTest
-      Control.Computations.Utils.FileStore.Tests
       Control.Computations.Utils.FileWatchTest
       Control.Computations.Utils.IOUtilsTest
       Control.Computations.Utils.MultiMapTest
@@ -297,7 +297,6 @@ test-suite incremental-computations-test
       Control.Computations.FlowImpls.CompLogging
       Control.Computations.FlowImpls.FileSink
       Control.Computations.FlowImpls.FileSrc
-      Control.Computations.FlowImpls.FileStoreSink
       Control.Computations.FlowImpls.HashMapFlow
       Control.Computations.FlowImpls.IOSink
       Control.Computations.FlowImpls.TimeSrc
@@ -305,12 +304,7 @@ test-suite incremental-computations-test
       Control.Computations.Utils.Clock
       Control.Computations.Utils.ConcUtils
       Control.Computations.Utils.DataSize
-      Control.Computations.Utils.Dispatcher
       Control.Computations.Utils.Fail
-      Control.Computations.Utils.FileStore.Intern
-      Control.Computations.Utils.FileStore.Types
-      Control.Computations.Utils.FileStore.Watcher
-      Control.Computations.Utils.FileStore.Writer
       Control.Computations.Utils.FileWatch
       Control.Computations.Utils.Hash
       Control.Computations.Utils.IOUtils
@@ -318,7 +312,6 @@ test-suite incremental-computations-test
       Control.Computations.Utils.MultiMap
       Control.Computations.Utils.MultiSet
       Control.Computations.Utils.SourceLocation
-      Control.Computations.Utils.SqliteUtils
       Control.Computations.Utils.TimeSpan
       Control.Computations.Utils.TimeUtils
       Control.Computations.Utils.Types

@@ -8,19 +8,19 @@ module Control.Computations.Demos.Hospital.CompDefs (
 -- LOCAL
 ----------------------------------------
 import Control.Computations.CompEngine
+import Control.Computations.Demos.FlowImpls.FileStoreSink
 import Control.Computations.Demos.FlowImpls.SqliteSrc
 import Control.Computations.Demos.Hospital.Config
 import Control.Computations.Demos.Hospital.MDoc
 import Control.Computations.Demos.Hospital.PatDb
 import Control.Computations.Demos.Hospital.PatNotesDb
 import Control.Computations.Demos.Hospital.PatTypes
+import Control.Computations.Demos.Utils.FileStore.Writer
 import Control.Computations.FlowImpls.CompLogging
 import Control.Computations.FlowImpls.FileSrc
-import Control.Computations.FlowImpls.FileStoreSink
 import Control.Computations.FlowImpls.IOSink
 import Control.Computations.FlowImpls.TimeSrc
 import Control.Computations.Utils.Fail
-import Control.Computations.Utils.FileStore.Writer
 import Control.Computations.Utils.TimeSpan
 import Control.Computations.Utils.TimeUtils
 import Control.Computations.Utils.Types

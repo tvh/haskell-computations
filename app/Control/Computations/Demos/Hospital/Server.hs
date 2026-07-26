@@ -8,8 +8,8 @@ module Control.Computations.Demos.Hospital.Server (serverMain) where
 -- LOCAL
 ----------------------------------------
 
-import Control.Computations.Utils.Dispatcher
-import Control.Computations.Utils.FileStore.Watcher
+import Control.Computations.Demos.Utils.Dispatcher
+import Control.Computations.Demos.Utils.FileStore.Watcher
 import Control.Computations.Utils.Logging
 import Control.Computations.Utils.TimeSpan
 import Control.Computations.Utils.Types

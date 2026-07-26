@@ -18,9 +18,9 @@ import qualified Control.Computations.Demos.Hospital.FakeWords as Fake
 import Control.Computations.Demos.Hospital.PatDb
 import Control.Computations.Demos.Hospital.PatNotesDb
 import Control.Computations.Demos.Hospital.PatTypes
+import qualified Control.Computations.Demos.Utils.SqliteUtils as Sqlite
 import Control.Computations.Utils.Clock
 import Control.Computations.Utils.Logging
-import qualified Control.Computations.Utils.SqliteUtils as Sqlite
 import Control.Computations.Utils.TimeSpan
 import Control.Computations.Utils.TimeUtils
 import Control.Computations.Utils.Types

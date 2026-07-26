@@ -1,5 +1,5 @@
 -- | Dispatches changes from one source to multiple listeners.
-module Control.Computations.Utils.Dispatcher (
+module Control.Computations.Demos.Utils.Dispatcher (
   Dispatcher,
   Listener,
   initDispatcher,

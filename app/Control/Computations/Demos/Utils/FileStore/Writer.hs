@@ -50,26 +50,26 @@ On delete of document with ID i:
 
 - If the current version of the document is v: add row (i, v+1, NULL) to DB
 -}
-module Control.Computations.Utils.FileStore.Writer (
+module Control.Computations.Demos.Utils.FileStore.Writer (
   FileStore,
   FileStoreCfg (..),
   withFileStore,
   storeDoc,
   deleteDocs,
   listAllDocs,
-  module Control.Computations.Utils.FileStore.Types,
+  module Control.Computations.Demos.Utils.FileStore.Types,
 ) where
 
 ----------------------------------------
 -- LOCAL
 ----------------------------------------
 
-import Control.Computations.Utils.FileStore.Intern
-import Control.Computations.Utils.FileStore.Types
+import Control.Computations.Demos.Utils.FileStore.Intern
+import Control.Computations.Demos.Utils.FileStore.Types
+import qualified Control.Computations.Demos.Utils.SqliteUtils as Sqlite
 import Control.Computations.Utils.Hash
 import Control.Computations.Utils.IOUtils
 import Control.Computations.Utils.Logging
-import qualified Control.Computations.Utils.SqliteUtils as Sqlite
 import Control.Computations.Utils.Types
 
 ----------------------------------------

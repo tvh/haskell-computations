@@ -1,4 +1,4 @@
-module Control.Computations.Utils.FileStore.Intern (
+module Control.Computations.Demos.Utils.FileStore.Intern (
   FileStoreRow (..),
   fileStoreDbFile,
   mostRecentRowStmt,
@@ -10,9 +10,9 @@ module Control.Computations.Utils.FileStore.Intern (
 ----------------------------------------
 -- LOCAL
 ----------------------------------------
-import Control.Computations.Utils.FileStore.Types
+import Control.Computations.Demos.Utils.FileStore.Types
+import qualified Control.Computations.Demos.Utils.SqliteUtils as Sqlite
 import Control.Computations.Utils.Logging
-import qualified Control.Computations.Utils.SqliteUtils as Sqlite
 import Control.Computations.Utils.Types
 
 ----------------------------------------

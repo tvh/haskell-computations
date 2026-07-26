@@ -1,6 +1,6 @@
 {-# LANGUAGE TypeFamilies #-}
 
-module Control.Computations.Utils.FileStore.Watcher (
+module Control.Computations.Demos.Utils.FileStore.Watcher (
   FileStoreWatcherCfg (..),
   FileStoreWatcher,
   FileStoreChanges (..),
@@ -8,18 +8,18 @@ module Control.Computations.Utils.FileStore.Watcher (
   waitForFileStoreChanges,
   loadDoc,
   objFile,
-  module Control.Computations.Utils.FileStore.Types,
+  module Control.Computations.Demos.Utils.FileStore.Types,
 ) where
 
 ----------------------------------------
 -- LOCAL
 ----------------------------------------
 
+import Control.Computations.Demos.Utils.FileStore.Intern
+import Control.Computations.Demos.Utils.FileStore.Types
+import qualified Control.Computations.Demos.Utils.SqliteUtils as Sqlite
 import Control.Computations.Utils.Clock
-import Control.Computations.Utils.FileStore.Intern
-import Control.Computations.Utils.FileStore.Types
 import Control.Computations.Utils.Logging
-import qualified Control.Computations.Utils.SqliteUtils as Sqlite
 import Control.Computations.Utils.TimeSpan
 import Control.Computations.Utils.Types
 

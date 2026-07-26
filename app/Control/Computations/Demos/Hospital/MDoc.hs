@@ -18,7 +18,7 @@ module Control.Computations.Demos.Hospital.MDoc (
 -- LOCAL
 ----------------------------------------
 
-import Control.Computations.Utils.FileStore.Types
+import Control.Computations.Demos.Utils.FileStore.Types
 import Control.Computations.Utils.Types
 
 ----------------------------------------

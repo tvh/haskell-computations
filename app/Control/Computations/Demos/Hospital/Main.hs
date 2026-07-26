@@ -22,8 +22,8 @@ import Control.Computations.Demos.Hospital.PatNotesDb
 import Control.Computations.Demos.Hospital.PatTypes
 import Control.Computations.Demos.Hospital.Server
 import Control.Computations.Demos.Hospital.Simulation
+import qualified Control.Computations.Demos.Utils.SqliteUtils as Sqlite
 import Control.Computations.Utils.Logging
-import qualified Control.Computations.Utils.SqliteUtils as Sqlite
 import Control.Computations.Utils.TimeUtils
 import Control.Computations.Utils.Types
 

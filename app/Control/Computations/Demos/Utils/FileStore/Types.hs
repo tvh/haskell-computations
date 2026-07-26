@@ -1,4 +1,4 @@
-module Control.Computations.Utils.FileStore.Types (
+module Control.Computations.Demos.Utils.FileStore.Types (
   DocId (..),
   mkDocId,
   ObjId (..),

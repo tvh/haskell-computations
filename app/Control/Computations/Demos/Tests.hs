@@ -12,6 +12,8 @@ import Test.Framework
 import {-@ HTF_TESTS @-} Control.Computations.Demos.DirSync.Tests
 import {-@ HTF_TESTS @-} Control.Computations.Demos.FlowImpls.SqliteSrc
 import {-@ HTF_TESTS @-} Control.Computations.Demos.Hospital.Tests
+import {-@ HTF_TESTS @-} Control.Computations.Demos.Utils.DispatcherTest
+import {-@ HTF_TESTS @-} Control.Computations.Demos.Utils.FileStore.Tests
 
 testMain :: IO ()
 testMain = do

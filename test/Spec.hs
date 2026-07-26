@@ -20,9 +20,7 @@ import {-@ HTF_TESTS @-} Control.Computations.FlowImpls.FileSinkTest
 import {-@ HTF_TESTS @-} Control.Computations.FlowImpls.FileSrcTest
 import {-@ HTF_TESTS @-} Control.Computations.FlowImpls.TimeSrcTest
 import {-@ HTF_TESTS @-} Control.Computations.Utils.DataSizeTest
-import {-@ HTF_TESTS @-} Control.Computations.Utils.DispatcherTest
 import {-@ HTF_TESTS @-} Control.Computations.Utils.FailTest
-import {-@ HTF_TESTS @-} Control.Computations.Utils.FileStore.Tests
 import {-@ HTF_TESTS @-} Control.Computations.Utils.FileWatchTest
 import {-@ HTF_TESTS @-} Control.Computations.Utils.IOUtilsTest
 import {-@ HTF_TESTS @-} Control.Computations.Utils.MultiMapTest

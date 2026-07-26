@@ -14,7 +14,7 @@ module Control.Computations.Demos.Hospital.PatNotesDb (
 import Control.Computations.CompEngine
 import Control.Computations.Demos.FlowImpls.SqliteSrc
 import Control.Computations.Demos.Hospital.PatTypes
-import qualified Control.Computations.Utils.SqliteUtils as Sqlite
+import qualified Control.Computations.Demos.Utils.SqliteUtils as Sqlite
 import Control.Computations.Utils.TimeSpan
 import Control.Computations.Utils.TimeUtils
 

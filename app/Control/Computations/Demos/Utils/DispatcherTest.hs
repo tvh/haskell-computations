@@ -1,6 +1,6 @@
 {-# OPTIONS_GHC -F -pgmF htfpp #-}
 
-module Control.Computations.Utils.DispatcherTest (
+module Control.Computations.Demos.Utils.DispatcherTest (
   htf_thisModulesTests,
 ) where
 
@@ -8,8 +8,8 @@ module Control.Computations.Utils.DispatcherTest (
 -- LOCAL
 ----------------------------------------
 
+import Control.Computations.Demos.Utils.Dispatcher
 import Control.Computations.Utils.Clock
-import Control.Computations.Utils.Dispatcher
 import Control.Computations.Utils.TimeSpan
 import Control.Computations.Utils.Types
 

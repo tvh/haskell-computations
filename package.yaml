@@ -145,7 +145,6 @@ library:
     - Control.Computations.FlowImpls.CompLogging
     - Control.Computations.FlowImpls.FileSink
     - Control.Computations.FlowImpls.FileSrc
-    - Control.Computations.FlowImpls.FileStoreSink
     - Control.Computations.FlowImpls.HashMapFlow
     - Control.Computations.FlowImpls.IOSink
     - Control.Computations.FlowImpls.TimeSrc
@@ -184,24 +183,12 @@ library:
     # FileKey(..) wraps a `CanonPath`, both defined here.
     - Control.Computations.Utils.TimeUtils
     # ^ likewise forced: TimeSrc's compGetTime takes a `TimeIntervalType`.
-    - Control.Computations.Utils.FileStore.Writer
-    - Control.Computations.Utils.FileStore.Types
-    # ^ likewise forced: FileStoreSink.withFileStoreSink takes a
-    # `FileStoreCfg` and its WriteDoc request yields an `ObjId`, both from
-    # this pair (Writer re-exports Types wholesale, but Types is exposed
-    # directly too since a demo module imports it on its own).
-    - Control.Computations.Utils.Dispatcher
-    - Control.Computations.Utils.SqliteUtils
-    - Control.Computations.Utils.FileStore.Watcher
-    # ^ NOT required by any shipped FlowImpls signature -- these three are
-    # exposed only because in-repo demo code (the Hospital demo's
-    # Control.Computations.Demos.FlowImpls.SqliteSrc and
-    # Control.Computations.Demos.Hospital.Server) imports them directly to
-    # build a bespoke sqlite-backed CompSrc and an HTTP dashboard. There is
-    # no facade to route these through (unlike the CompSrc case above), and
-    # rewriting that demo code is out of scope for this step. This is a
-    # genuine widening of the "narrow" ideal, done deliberately rather than
-    # reflexively -- see the packaging job's report for the full tradeoff.
+    # Control.Computations.FlowImpls.FileStoreSink and its supporting
+    # Control.Computations.Utils.{Dispatcher,SqliteUtils,FileStore.*} used to
+    # be exposed here too, but only because the Hospital demo imported them
+    # directly -- no shipped FlowImpls signature required them. That demo-only
+    # cluster has moved to Control.Computations.Demos.{FlowImpls,Utils}.* under
+    # app/, so the library no longer needs to widen its API for it.
   dependencies:
     - QuickCheck >= 2.15 && < 2.16
     # ^ Not test-only: a handful of library types (TimeSpan, DataSize,

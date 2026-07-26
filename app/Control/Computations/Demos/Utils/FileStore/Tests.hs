@@ -1,7 +1,7 @@
 {-# LANGUAGE TypeFamilies #-}
 {-# OPTIONS_GHC -F -pgmF htfpp #-}
 
-module Control.Computations.Utils.FileStore.Tests (
+module Control.Computations.Demos.Utils.FileStore.Tests (
   htf_thisModulesTests,
 ) where
 
@@ -9,9 +9,9 @@ module Control.Computations.Utils.FileStore.Tests (
 -- LOCAL
 ----------------------------------------
 
+import Control.Computations.Demos.Utils.FileStore.Watcher
+import Control.Computations.Demos.Utils.FileStore.Writer
 import Control.Computations.Utils.Clock
-import Control.Computations.Utils.FileStore.Watcher
-import Control.Computations.Utils.FileStore.Writer
 import Control.Computations.Utils.IOUtils
 import Control.Computations.Utils.Logging
 import Control.Computations.Utils.TimeSpan

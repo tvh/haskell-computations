@@ -9,7 +9,7 @@
  sqlite-backed 'Control.Computations.CompEngine.CompSrc.CompSrc' or
  'Control.Computations.CompEngine.CompSink.CompSink'.
 -}
-module Control.Computations.Utils.SqliteUtils (
+module Control.Computations.Demos.Utils.SqliteUtils (
   TableName,
   ColumnName,
   SQLRow,
