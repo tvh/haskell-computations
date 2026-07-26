@@ -1,10 +1,24 @@
 {-# LANGUAGE TypeFamilies #-}
 
-{- | A 'Control.Computations.CompEngine.CompSink.CompSink' that runs an
- arbitrary 'IO' action and reports whether it threw. Register 'ioSink' with a
- 'Control.Computations.CompEngine.CompFlowRegistry.CompFlowRegistry' and call
- 'unsafeCompIO' from a comp body to run non-deterministic or side-effecting
- 'IO' that shouldn't be cached like a normal computation result.
+{- | The sanctioned escape hatch from 'CompM' into 'IO'.
+
+ 'CompM' deliberately has no @MonadIO@\/@liftIO@ instance, and the public
+ "Control.Computations.CompEngine" facade re-exports it /abstractly/ (hiding
+ its constructor), precisely so that a comp body cannot construct a 'CompM'
+ value by hand and smuggle arbitrary 'IO' into the engine.
+ 'unsafeCompIO', running through this module's 'ioSink'
+ 'Control.Computations.CompEngine.CompSink.CompSink', is the one sanctioned
+ route through that wall.
+
+ Register 'ioSink' with a
+ 'Control.Computations.CompEngine.CompFlowRegistry.CompFlowRegistry' --
+ there is nothing to configure beyond a call to
+ 'Control.Computations.CompEngine.CompFlowRegistry.registerCompSink':
+
+ > registerCompSink reg ioSink
+
+ -- before any comp body calls 'unsafeCompIO'. See 'unsafeCompIO' for what
+ "unsafe" actually costs and why registration is not optional.
 -}
 module Control.Computations.FlowImpls.IOSink (
   unsafeCompIO,
@@ -28,11 +42,38 @@ import qualified Data.HashSet as HashSet
 import Data.Proxy
 import Data.Void
 
--- | Run an arbitrary 'IO' action from within a comp body via the 'ioSink'
--- sink, catching any 'IOException' it throws as a 'Fail'. Marked "unsafe"
--- because, unlike a normal source request, the engine has no way to know
--- whether @action@ is deterministic or side-effecting -- use it deliberately
--- for the cases (logging, metrics, ad hoc side effects) where that's fine.
+{- | Run an arbitrary 'IO' action from within a comp body via the 'ioSink'
+ sink, catching any 'IOException' it throws as a 'Fail'.
+
+ Marked "unsafe" for three reasons, each worth knowing before reaching for
+ it:
+
+ * __It is invisible to the engine's dependency tracking and output GC.__
+   Unlike a 'Control.Computations.CompEngine.CompSrc.CompSrc' request, the
+   engine has no way to know whether @action@ is deterministic, what it
+   read, or what it produced, so it can neither invalidate nor reclaim
+   anything on its account. That's the right tradeoff for fire-and-forget
+   effects (logging, metrics, notifications); it is the wrong tool if the
+   effect produces state a later computation needs to depend on -- model
+   that as a proper 'Control.Computations.CompEngine.CompSrc.CompSrc'\/
+   'Control.Computations.CompEngine.CompSink.CompSink' pair instead.
+
+ * __Effects are subject to early cutoff.__ If a computation doesn't rerun
+   because its inputs are unchanged, nothing inside its body runs --
+   including this call. The absence of an effect therefore means "this
+   computation did not rerun", not "the effect was skipped while the
+   computation still ran". This tends to surprise people using
+   'unsafeCompIO' to trace behaviour.
+
+ * __Registration is mandatory, not optional.__ Calling this without having
+   first registered 'ioSink'
+   (@'Control.Computations.CompEngine.CompFlowRegistry.registerCompSink' reg
+   'ioSink'@) fails the computation outright:
+   'Control.Computations.CompEngine.CompFlowRegistry.withCompSinkId' returns
+   a 'Fail' when the sink id isn't in the registry, it does not silently
+   no-op. Every in-repo demo registers 'ioSink' once at startup; do the same
+   before any comp body calls 'unsafeCompIO'.
+-}
 unsafeCompIO :: IO a -> CompM a
 unsafeCompIO action = compSinkReq i (IOSinkReq action)
  where
