@@ -1,16 +1,18 @@
 # A framework for coarse-grained self-adjusting computations in Haskell
 
-Ensuring that software applications
-presents their users the most recent version of data is not trivial.
-Self-adjusting computations are a technique for automatically and efficiently recomputing
-output data whenever some input changes.
+Keeping what a user sees in sync with data that keeps changing is work you
+normally do by hand. Self-adjusting computations do it for you: when an
+input changes, only the outputs that actually depend on it get recomputed.
 
-This repository contains the code of a framework for coarse-grained self-adjusting computations in Haskell. The framework has been extracted from
-a commercial software product developed by medilyse GmbH, Freiburg, Germany, and
-is maintained here as a fork with a rewritten engine core and a narrowed,
-published API.
+This is the coarse-grained variant. Dependencies are tracked per
+computation rather than per data-flow edge inside one, which keeps the
+bookkeeping cheap enough to run over a million of them.
 
-The repository also contains two demo applications using the framework.
+The framework was extracted from a commercial product built by medilyse
+GmbH, Freiburg, Germany. I maintain this fork, with a rewritten engine core
+and a narrowed public API.
+
+The repository also contains three demo applications.
 
 There is an accompanying article:
 
@@ -19,43 +21,48 @@ There is an accompanying article:
 > Seattle, WA, USA. ACM, 2023.
 > [Preprint](Wehr_A-Software-Architecture-Based-on-Coarse-Grained-Self-Adjusting-Computations.pdf)
 
-The paper describes the architecture in depth; the sections below give a
-practical, code-first introduction to the same ideas.
+The paper describes the architecture in depth.
 
 ## What this library gives you
 
-A *computation* (`Comp`/`CompDef`) is a named, typed step: given an input, it
-produces an output, optionally by requesting data from other computations or
-from external *sources*, and optionally writing results to external *sinks*.
-Computations are wired together into a dependency graph and driven forward by
-a `compDriver`. When an underlying source changes, the engine works out which
-computations actually depend on that change, reruns only those, and leaves
-everything else's cached result alone — including anything downstream that
-turns out, after rerunning, to still produce the same output. This is what
-"coarse-grained self-adjusting" means: correctness comes from tracking
-dependencies at the level of whole computations (not fine-grained data-flow
-edges inside them), while still avoiding wasted recomputation.
+A *computation* (`Comp`/`CompDef`) is a named, typed step. It takes an input
+and produces an output, optionally by requesting data from other
+computations or from external *sources*, and optionally by writing results
+to external *sinks*.
 
-Sources and sinks are pluggable. The library ships six flow implementations:
+You wire computations into a dependency graph and drive it with a
+`compDriver`. When a source changes, the engine works out which computations
+depend on that change and reruns only those.
+
+Early cutoff falls out of this: if a rerun produces the same result as
+before, everything downstream keeps its cached value and never runs at all.
+
+Sources and sinks are pluggable. The library ships six flow implementation
+modules:
 
 | Module | What it is |
 |---|---|
 | `FileSrc` / `FileSink` | read from and write to the filesystem, with output tracking so files a computation no longer produces get cleaned up |
-| `HashMapFlow` | an in-memory key/value source *and* sink — the one to reach for when testing your own computations, or trying the API without touching a filesystem |
+| `HashMapFlow` | an in-memory key/value source *and* sink. Reach for this when testing your own computations, or trying the API without touching a filesystem |
 | `TimeSrc` | periodic ticks, for computations that should rerun as the clock passes a threshold |
-| `IOSink` | an escape hatch for running plain `IO` from a computation body (see its haddock for what "escape hatch" costs you) |
+| `IOSink` | an escape hatch for running plain `IO` from a computation body |
 | `CompLogging` | structured logging from inside a computation body, built on `IOSink` |
 
-You can also implement your own by instantiating the `CompSrc`/`CompSink`
-classes; `HashMapFlow` is a compact worked example of a type that does both,
-and `FileSink` is the reference for getting output tracking right.
+NOTE: `IOSink` is the only route from a computation body to `IO`, and what
+it costs you is real -- effects run that way are invisible to dependency
+tracking and to output cleanup. Its haddock spells out when that is fine and
+when it isn't.
+
+You can also write your own by instantiating the `CompSrc`/`CompSink`
+classes. `HashMapFlow` is a compact example of a type that does both.
+`FileSink` is the one to read for getting output tracking right.
 
 ## Installing
 
-This package has not been uploaded to Hackage yet, though nothing blocks it
-from being — every dependency resolves from a released Stackage snapshot. To
-depend on it from another `stack` project in the meantime, add it as an
-`extra-dep` pointing at this repository in your `stack.yaml`, e.g.:
+Not on Hackage yet. Nothing blocks an upload -- every dependency resolves
+from a released Stackage snapshot -- it just hasn't happened. To depend on
+it from another `stack` project in the meantime, add it as an `extra-dep`
+pointing at this repository in your `stack.yaml`, e.g.:
 
 ```yaml
 extra-deps:
@@ -72,13 +79,14 @@ Requirements: the [`stack`](https://docs.haskellstack.org/en/stable/) build
 tool. The repository pins its GHC and package set via `stack.yaml`
 (`lts-24.51`, GHC 9.10.3), so any reasonably recent `stack` will do.
 
-Build the software by executing
+Build:
 
 ```
 $ stack build
 ```
 
-Run the tests by executing
+There are two test suites. `stack test` runs the library's; `stack run --
+test` runs the demos':
 
 ```
 $ stack test
@@ -87,12 +95,11 @@ $ stack run -- test
 
 ## Development
 
-`-Werror` is **not** part of the default build — it's gated behind a cabal
-flag (`werror`, off by default) so that a warning newly introduced by a
-future GHC release can't break a downstream consumer's build. This repo's
-own build/test loop turns it on by default via the `Makefile`
-(`make all`, `make test`), so warnings still fail locally and in CI. To
-turn it on directly with `stack`:
+`-Werror` is **not** part of the default build. It sits behind a cabal flag
+(`werror`, off by default) so a warning added by a future GHC release can't
+break a downstream build. The `Makefile` turns it on (`make all`,
+`make test`), so warnings still fail locally. To turn it on directly with
+`stack`:
 
 ```
 $ stack build --flag incremental-computations:werror
@@ -101,13 +108,16 @@ $ stack test  --flag incremental-computations:werror
 
 ## A minimal worked example
 
-The following is the complete demo at
+Everything below compiles against the public API alone -- nothing here
+reaches past `Control.Computations.CompEngine` and the shipped `FlowImpls`.
+It defines three computations: one counts the lines in a file, one sums a
+list of such counts, one writes the total out. They are wired to a
+`FileSrc`/`FileSink` pair plus the built-in `IOSink` for logging.
+
+Adapted from
 [`app/Control/Computations/Demos/Simple/Main.hs`](app/Control/Computations/Demos/Simple/Main.hs)
-— a self-contained program that compiles against the library's public API
-(nothing here reaches past `Control.Computations.CompEngine` and the shipped
-`FlowImpls`). It defines two computations chained together — one that counts
-the lines in a file, one that sums a list of such counts — and wires them to
-a `FileSrc`/`FileSink` pair plus the built-in `IOSink` for logging.
+-- the module header is stripped and the comments are written for reading
+rather than for haddock.
 
 ```haskell
 import Control.Computations.CompEngine
@@ -165,12 +175,9 @@ withCompFlows fileSrc fileSink reg action = do
   registerCompSink reg ioSink
   action
 
--- Build the FileSrc/FileSink instances once, up front, then drive the
--- wired computation graph forward until it settles. Each instance's name
--- ("fileSrc"/"fileSink") is written down exactly once, right where the
--- instance is built -- wireAllComps and withCompFlows both derive their
--- ids from these same instances (via typedCompSrcIdOf/typedCompSinkIdOf),
--- so there is no second copy that could drift out of sync.
+-- Build the instances once, up front, then drive the graph until it
+-- settles. Both the ids and the registration derive from these same
+-- instances, so each name is written down exactly once.
 main :: IO ()
 main = withSysTempDir $ \tgt ->
   withFileSrc (defaultFileSrcConfig "fileSrc") $ \fileSrc -> do
@@ -182,7 +189,7 @@ main = withSysTempDir $ \tgt ->
       ()
 ```
 
-Run it (as the `simple` subcommand of the demo executable — see below):
+Run it as the `simple` subcommand of the demo executable:
 
 ```
 $ stack run -- --log-level info simple
@@ -195,10 +202,10 @@ sync works recursively and continuously.
 
 [Source code](app/Control/Computations/Demos/DirSync)
 
-To start the sync from directory `A` to directory `B`, execute the following command.
-Note that `A` must exist, `B` is created automatically.
+To sync directory `A` to directory `B`: `A` must exist, `B` is created
+automatically.
 
-*Attention: everything in B that does not exist in A will be deleted!*
+NOTE: everything in `B` that does not exist in `A` will be deleted.
 
 ```
 $ stack run -- --log-level info sync --source A --target B
@@ -206,10 +213,9 @@ $ stack run -- --log-level info sync --source A --target B
 
 ## Demo: Hospital
 
-This demo shows how a processing pipeline for hospital data might look like.
-The demo is very basic. It supports admission and discharge of patients, as well
-textual notes being added to a patient. A simulation creates a stream of events
-driving the demo.
+A processing pipeline for hospital data. It is deliberately basic: patients
+are admitted and discharged, and notes can be added to a patient. A
+simulation creates the stream of events that drives it.
 
 [Source code](app/Control/Computations/Demos/Hospital)
 
@@ -249,22 +255,14 @@ or the test suite. Run it with:
 $ stack bench
 ```
 
-Its scale is configurable via the `PERSIST_BENCH_SCALE` environment
-variable — a float multiplier applied to the synthetic dependency graph's
-size (defaults to `1.0`, a ~1,000,000-instance run). For a quicker,
-~100,000-instance run:
+`PERSIST_BENCH_SCALE` scales the synthetic dependency graph. It defaults to
+`1.0`, a ~1,000,000-instance run. For a quicker ~100,000-instance run:
 
 ```
 $ PERSIST_BENCH_SCALE=0.1 stack bench
 ```
 
-See [`docs/benchmark-notes.md`](docs/benchmark-notes.md) for working notes
-and measured numbers from prior runs of this benchmark; it isn't polished
-documentation, but it's useful context if you're trying to reason about the
-engine's performance characteristics.
+[`docs/benchmark-notes.md`](docs/benchmark-notes.md) has measured numbers
+from prior runs.
 
-## Known issues
-
-None currently blocking a release. Every dependency resolves from the
-`lts-24.51` snapshot, so `stack.yaml` needs no `extra-deps` and the package
-builds from an sdist tarball on its own.
+NOTE: those are working notes, not polished docs.
