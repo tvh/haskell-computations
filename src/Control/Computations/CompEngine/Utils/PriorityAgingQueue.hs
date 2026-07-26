@@ -107,39 +107,39 @@ data PaqView k v = PaqView
 
 type PaqQueue k v = PSQ.HashPSQ k PaqPrioIndex v
 
--- | Every field explicitly strict. Correction to an earlier version of this
--- comment: this project builds with @-XStrictData@ on by default
--- (package.yaml's @default-extensions@), so every field here -- including
--- the four sub-queues and the counter -- was /already/ forced to WHNF on
--- construction even before the explicit @!@\/'paq_size''s own bang were
--- added; there was no latent laziness bug in this record itself (confirmed
--- empirically: this project's A/B benchmark for the strictness-audit change
--- that added these explicit bangs showed no measurable movement). The
--- explicit @!@ is kept anyway as a documentation/robustness belt-and-
--- suspenders measure -- it makes the invariant survive a hypothetical future
--- @NoStrictData@ pragma on this module rather than depending silently on a
--- package-wide default a reader of this file alone wouldn't see. The one
--- genuine gap this module's write side had was in 'SimpleStateIf.hs'\'s
--- @sifs_stale@ write site: 'enqueue' (unlike 'dequeue'\/'deleteView', whose
--- results are pattern-matched through the strict @:!:@ pair) returns a plain
--- lazy tuple, and @let (how, q') = ...@ leaves @q'@ an unforced *selector
--- thunk* regardless of how strict 'PriorityAgingQueue'\'s own fields are --
--- that thunk was the real fix (see 'colWrite''s haddock in
--- "Utils/DefTable.hs" for the general rationale, and @sifs_stale@'s own
--- write site for this specific one).
+-- | Every field explicitly strict via @!@ (or @{-# UNPACK #-}@\/
+-- @{-# NOUNPACK #-}@ where noted). This project builds with @-XStrictData@
+-- on by default (package.yaml's @default-extensions@), so these fields
+-- would already be forced to WHNF on construction without the explicit
+-- annotations; they are kept anyway as a documentation/robustness
+-- belt-and-suspenders measure -- they make the strictness invariant survive
+-- a hypothetical future @NoStrictData@ pragma on this module rather than
+-- depending silently on a package-wide default a reader of this file alone
+-- wouldn't see.
+--
+-- Strictness on this record's own fields does not, by itself, protect every
+-- caller from building up a chain of thunks: 'enqueue' (unlike
+-- 'dequeue'\/'deleteView', whose results are pattern-matched through the
+-- strict @:!:@ pair) returns a plain lazy tuple. A caller who writes
+-- @let (how, q') = enqueue ... in ...@ and doesn't force @q'@ leaves it an
+-- unforced *selector thunk* regardless of how strict
+-- 'PriorityAgingQueue'\'s own fields are -- the forcing has to happen at
+-- the call site. See 'colWrite''s haddock in "Utils/DefTable.hs" for the
+-- general rationale for forcing selector thunks eagerly, and @sifs_stale@'s
+-- write site in "SimpleStateIf.hs" for a call site that has to do it for
+-- this queue.
 data PriorityAgingQueue k v = PriorityAgingQueue
   { paq_nextCounter :: {-# NOUNPACK #-} !PaqCounter
   -- Total entry count across all four sub-queues, maintained incrementally
   -- by every operation that adds or removes a key (enqueue/deleteView/
   -- dequeue -- upgrade only moves entries between sub-queues, so it never
   -- touches this). Exists purely so 'size' is O(1): the underlying
-  -- Data.HashPSQ.size is O(n) (it folds the whole tree), and 'size' used to
-  -- be called from there directly -- once per dequeued cap on the engine's
-  -- hot per-rerun path (Control.Computations.CompEngine.Impl's
-  -- stepCompEngine) -- an O(queue size) cost paid on every single rerun,
-  -- i.e. quadratic in the size of a propagation round. See
-  -- docs/benchmark-notes.md's live-update investigation for the
-  -- measurement that caught this.
+  -- Data.HashPSQ.size is O(n) (it folds the whole tree), and 'size' is
+  -- called once per dequeued cap on the engine's hot per-rerun path
+  -- (Control.Computations.CompEngine.Impl's stepCompEngine). Without this
+  -- field, each of those calls would cost O(queue size), and an entire
+  -- propagation round -- which dequeues every cap the round touches --
+  -- would become quadratic in the queue's size.
   , paq_size :: {-# UNPACK #-} !Int
   , paq_realTimeQueue :: {-# NOUNPACK #-} !(PaqQueue k v)
   , paq_expressQueue :: {-# NOUNPACK #-} !(PaqQueue k v)
@@ -228,8 +228,9 @@ loopQs def f paq = loop (zip (getQueues paq) (setQueues paq))
       (q : qs) -> f q (loop qs)
       [] -> def
 
--- | /O(1)/ -- see 'paq_size'\'s haddock for why this used to be /O(n)/ and
--- why that mattered.
+-- | /O(1)/, backed by the incrementally maintained 'paq_size' field -- see
+-- its haddock for why an O(n) implementation here would matter on the
+-- engine's hot path.
 size :: PriorityAgingQueue k v -> Int
 size = paq_size
 

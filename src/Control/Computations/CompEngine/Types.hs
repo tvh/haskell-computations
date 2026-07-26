@@ -199,14 +199,15 @@ castCompCacheValue ccv =
  where
   targetType = typeRep (Proxy :: Proxy a)
 
-{- | Shrunk to the one field anything downstream of a cache entry actually
- needs, as part of the columnar state-layer rewrite (docs/benchmark-notes.md
- "Memory roadmap"): 'ccm_logrepr'/'ccm_approxCachedSize'/'ccm_cachedSize'
- had no columnar equivalent (a per-row 'Text' render and a per-CompId size
- tally that only "SifCache.hs" itself ever read) and are gone, not just
- unused -- logging a value now 'show's the already-in-scope typed value
- directly (see "Control.Computations.CompEngine.Impl"'s success-log line),
- rather than pre-rendering and storing a logrepr nothing may ever look at.
+{- | Holds only the one field anything downstream of a cache entry actually
+ needs: the content hash used for cache validation and dependency
+ versioning. It deliberately carries neither a pre-rendered log
+ representation nor a cached size estimate: logging a value 'show's the
+ already-in-scope typed value directly, on demand (see
+ "Control.Computations.CompEngine.Impl"'s success-log line), so there is
+ nothing to gain by pre-rendering and storing a string a given evaluation
+ may never log; and a size estimate carried on every cache entry would pay
+ a per-entry cost for a value only occasional diagnostics read.
 -}
 newtype CompCacheMeta = CompCacheMeta
   { ccm_largeHash :: Hash128
@@ -224,12 +225,12 @@ instance Eq (CompCacheValue a) where
   (==) = (==) `on` (ccm_largeHash . ccv_meta)
 
 {- | The (mutable, per-cap-evaluation) environment threaded through a single
- 'CompM' computation. 'cme_compMap' is the same passthrough plumbing the old
- pure-Reader design carried (nothing in CompM's own machinery inspects it;
- kept for parity). 'cme_deps' is the dependency accumulator: 'tellDep'
- conses onto it directly instead of every bind allocating and unioning a
- 'HashSet' -- the Haxl-shaped fix (see docs/benchmark-notes.md's research
- section on GenHaxl). It is scoped to exactly one top-level cap evaluation:
+ 'CompM' computation. 'cme_compMap' is passthrough plumbing: nothing in
+ 'CompM's own machinery inspects it, it is simply carried so it is available
+ wherever a nested computation lookup needs it. 'cme_deps' is the dependency
+ accumulator: 'tellDep' conses onto it directly rather than every bind
+ allocating and unioning a fresh 'HashSet' of its own dependencies into its
+ caller's. It is scoped to exactly one top-level cap evaluation:
  "Control.Computations.CompEngine.Impl" allocates a fresh one per
  `evalCompAp` call and reads+dedupes it exactly once, at the end.
 -}
@@ -240,11 +241,12 @@ data CompMEnv = CompMEnv
 
 {- | Monad running the body of a computation.
 
- Represented directly over 'IO' (a GenHaxl-shaped resumption monad -- see
- "There is no Fork", Marlow et al, ICFP'14): the suspension protocol
- ('CompYield'/'CompSuspended'/'ContCompM') is unchanged, only what runs
- *between* suspends changed from a pure function returning a paired
- dependency set to an 'IO' action that appends to a shared accumulator.
+ Represented directly over 'IO' rather than as a pure function returning a
+ paired dependency set (a GenHaxl-shaped resumption monad -- see "There is
+ no Fork", Marlow et al, ICFP'14): the code that runs *between* suspension
+ points ('CompYield'/'CompSuspended'/'ContCompM') needs to append to the
+ shared, mutable dependency accumulator described at 'CompMEnv' rather than
+ return a value for its caller to combine, so that code has to run in 'IO'.
 
  The 'CompM' constructor and 'runCompM' accessor are deliberately exported
  here (needed by this module, "Core", and "Impl" to build/run computations)
@@ -346,10 +348,10 @@ compMAp mf mb =
   CompM $ \env -> do
     -- Both sides always run -- and so always append whatever deps they
     -- touch to the shared `env` accumulator, even under the left-error
-    -- bias below. This is the same guarantee the old pure implementation
-    -- gave by unconditionally forcing both `(w, res)` pairs before ever
-    -- inspecting them; here it falls out of simply awaiting both actions
-    -- before the case dispatch.
+    -- bias below. Awaiting both actions unconditionally, before the case
+    -- dispatch inspects either result, is what guarantees a dependency
+    -- recorded by the side whose result ends up discarded is not silently
+    -- dropped.
     resA <- runCompM mf env
     resB <- runCompM mb env
     case (resA, resB) of
