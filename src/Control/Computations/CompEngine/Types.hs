@@ -401,9 +401,11 @@ doAnyRequest req =
 
 -- | Send a request to a registered source from a comp body, failing the
 -- comp (via 'fail') if the source reports an error. The source id (e.g.
--- from 'Control.Computations.CompEngine.CompSrc.typedCompSrcId') identifies
--- which registered source to use; the request type is specific to that
--- source's 'Control.Computations.CompEngine.CompSrc.CompSrc' instance.
+-- from 'Control.Computations.CompEngine.CompSrc.typedCompSrcIdOf' given a
+-- live instance, or 'Control.Computations.CompEngine.CompSrc.unsafeMkTypedCompSrcId'
+-- otherwise) identifies which registered source to use; the request type
+-- is specific to that source's 'Control.Computations.CompEngine.CompSrc.CompSrc'
+-- instance.
 compSrcReq :: CompSrc s => TypedCompSrcId s -> CompSrcReq s a -> CompM a
 compSrcReq s req =
   do
@@ -416,9 +418,11 @@ compSrcReq' s req =
 
 -- | Send a request to a registered sink from a comp body, failing the comp
 -- (via 'fail') if the sink reports an error. The sink id (e.g. from
--- 'Control.Computations.CompEngine.CompSink.typedCompSinkId') identifies
--- which registered sink to use; the request type is specific to that sink's
--- 'Control.Computations.CompEngine.CompSink.CompSink' instance.
+-- 'Control.Computations.CompEngine.CompSink.typedCompSinkIdOf' given a live
+-- instance, or 'Control.Computations.CompEngine.CompSink.unsafeMkTypedCompSinkId'
+-- otherwise) identifies which registered sink to use; the request type is
+-- specific to that sink's 'Control.Computations.CompEngine.CompSink.CompSink'
+-- instance.
 compSinkReq :: CompSink s => TypedCompSinkId s -> CompSinkReq s a -> CompM a
 compSinkReq s req =
   do

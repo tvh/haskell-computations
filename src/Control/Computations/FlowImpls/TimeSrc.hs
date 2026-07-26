@@ -79,8 +79,15 @@ defaultTimeSrcInstanceId = CompSrcInstanceId "defaultTimeSrc"
 
 -- | The typed source id of the 'TimeSrc' registered by 'withDefaultTimeSrc';
 -- pass this to 'compGetTime' if you need the raw request/id pair instead.
+--
+-- Necessarily a top-level 'unsafeMkTypedCompSrcId': this id is part of the
+-- public API and gets baked into comp bodies (via 'compGetTime') long
+-- before any 'TimeSrc' instance exists, so there is no live instance to
+-- derive it from with 'typedCompSrcIdOf'. It shares
+-- 'defaultTimeSrcInstanceId' with 'withDefaultTimeSrc', which is what
+-- actually constructs the instance, so the two names can't drift apart.
 defaultTimeSrcId :: TypedCompSrcId TimeSrc
-defaultTimeSrcId = typedCompSrcId (Proxy @TimeSrc) defaultTimeSrcInstanceId
+defaultTimeSrcId = unsafeMkTypedCompSrcId (Proxy @TimeSrc) defaultTimeSrcInstanceId
 
 -- | Request the current time, truncated to the given granularity, from the
 -- default 'TimeSrc' (see 'withDefaultTimeSrc'). The comp calling this reruns

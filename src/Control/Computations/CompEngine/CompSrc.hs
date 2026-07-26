@@ -15,9 +15,11 @@ module Control.Computations.CompEngine.CompSrc (
   CompSrcDeps,
   CompSrc (..),
   CompSrcId,
-  TypedCompSrcId (..),
+  TypedCompSrcId,
+  unTypedCompSrcId,
   compSrcId,
-  typedCompSrcId,
+  typedCompSrcIdOf,
+  unsafeMkTypedCompSrcId,
   instanceIdFromTypedCompSrcId,
   instTextFromTypedCompSrcId,
   CompSrcInstanceId (..),
@@ -144,11 +146,41 @@ instanceIdFromTypedCompSrcId = csi_instance . unTypedCompSrcId
 instTextFromTypedCompSrcId :: TypedCompSrcId a -> T.Text
 instTextFromTypedCompSrcId = unCompSrcInstanceId . instanceIdFromTypedCompSrcId
 
+-- | Not exported from the public "Control.Computations.CompEngine" facade
+-- (see that module's import of this one) -- kept here, and still exported
+-- from this internal module, purely as a shared helper for the ~15 call
+-- sites elsewhere in the library (logging, 'CompFlowRegistry' hash-map
+-- keys) that need the untyped id of a live instance. Library-external code
+-- should go through 'typedCompSrcIdOf' and keep the typed id, or
+-- 'unTypedCompSrcId' it themselves if the untyped form is genuinely needed.
 compSrcId :: forall s. CompSrc s => s -> CompSrcId
-compSrcId s = unTypedCompSrcId (typedCompSrcId (Proxy @s) (compSrcInstanceId s))
+compSrcId = unTypedCompSrcId . typedCompSrcIdOf
 
-typedCompSrcId :: CompSrc s => Proxy s -> CompSrcInstanceId -> TypedCompSrcId s
-typedCompSrcId p instId =
+{- | Derive a source's typed id directly from a live instance.
+
+ This is the preferred way to get a 'TypedCompSrcId' whenever an instance
+ is already in scope: unlike 'unsafeMkTypedCompSrcId', the id can't drift
+ from what the instance itself reports via 'compSrcInstanceId', because
+ it's computed from that instance.
+-}
+typedCompSrcIdOf :: forall s. CompSrc s => s -> TypedCompSrcId s
+typedCompSrcIdOf s = unsafeMkTypedCompSrcId (Proxy @s) (compSrcInstanceId s)
+
+{- | Build a source's typed id from a bare instance name, with no instance
+ to check it against.
+
+ __Unsafe__: the name is unchecked. A typo, or an instance name that has
+ simply drifted from what the actual 'CompSrc' instance will report via
+ 'compSrcInstanceId' (e.g. because the config passed to that instance's
+ constructor was given a different string), still typechecks fine here --
+ it only surfaces later, at runtime, as a registry-lookup miss (a 'Fail')
+ when a comp body sends a request against the resulting id. Prefer
+ 'typedCompSrcIdOf' whenever a live instance is in scope; reach for this
+ only when the id is genuinely needed before any instance exists, e.g. a
+ top-level id referenced by a comp body at wiring time.
+-}
+unsafeMkTypedCompSrcId :: CompSrc s => Proxy s -> CompSrcInstanceId -> TypedCompSrcId s
+unsafeMkTypedCompSrcId p instId =
   let i = CompSrcId (identifyProxy p) instId
    in TypedCompSrcId i
 

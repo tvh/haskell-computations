@@ -39,7 +39,6 @@ import Control.Computations.Utils.Types
 import Control.Exception
 import Data.HashSet (HashSet)
 import qualified Data.HashSet as HashSet
-import Data.Proxy
 import Data.Void
 
 {- | Run an arbitrary 'IO' action from within a comp body via the 'ioSink'
@@ -75,9 +74,7 @@ import Data.Void
    before any comp body calls 'unsafeCompIO'.
 -}
 unsafeCompIO :: IO a -> CompM a
-unsafeCompIO action = compSinkReq i (IOSinkReq action)
- where
-  i = typedCompSinkId (Proxy @IOSink) ioSinkId
+unsafeCompIO action = compSinkReq (typedCompSinkIdOf ioSink) (IOSinkReq action)
 
 ioSinkId :: CompSinkInstanceId
 ioSinkId = CompSinkInstanceId "IOSink"

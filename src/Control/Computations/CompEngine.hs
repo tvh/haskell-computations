@@ -7,8 +7,17 @@ import Control.Computations.CompEngine.CompDef as X
 import Control.Computations.CompEngine.CompEval as X
 import Control.Computations.CompEngine.CompFlow as X
 import Control.Computations.CompEngine.CompFlowRegistry as X
-import Control.Computations.CompEngine.CompSink as X
-import Control.Computations.CompEngine.CompSrc as X
+
+-- 'compSinkId'\/'compSrcId' are hidden here: they collapse a live instance
+-- straight to its untyped id, which is exactly the kind of unchecked
+-- shortcut this narrow public facade doesn't want to encourage. They stay
+-- exported from the underlying (unexposed) modules for the library's own
+-- internal use (logging, 'CompFlowRegistry' hash-map keys); external code
+-- should reach for 'typedCompSinkIdOf'\/'typedCompSrcIdOf' and keep the
+-- typed id, or apply 'unTypedCompSinkId'\/'unTypedCompSrcId' itself if the
+-- untyped form is genuinely what's needed.
+import Control.Computations.CompEngine.CompSink as X hiding (compSinkId)
+import Control.Computations.CompEngine.CompSrc as X hiding (compSrcId)
 import Control.Computations.CompEngine.Core as X
 import Control.Computations.CompEngine.Driver as X
 import Control.Computations.CompEngine.Run as X

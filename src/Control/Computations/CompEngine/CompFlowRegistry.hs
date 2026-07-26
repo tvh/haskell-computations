@@ -67,8 +67,8 @@ withTypedCompSrcId
   -> TypedCompSrcId s
   -> (s -> m a)
   -> m (Fail a)
-withTypedCompSrcId reg (TypedCompSrcId key) fun =
-  withCompSrcId reg key fun
+withTypedCompSrcId reg typedKey fun =
+  withCompSrcId reg (unTypedCompSrcId typedKey) fun
 
 withCompSrcId
   :: forall m a s
@@ -104,8 +104,8 @@ withTypedCompSinkId
   -> TypedCompSinkId s
   -> (s -> m a)
   -> m (Fail a)
-withTypedCompSinkId reg (TypedCompSinkId key) fun =
-  withCompSinkId reg key fun
+withTypedCompSinkId reg typedKey fun =
+  withCompSinkId reg (unTypedCompSinkId typedKey) fun
 
 withCompSinkId
   :: forall m a s

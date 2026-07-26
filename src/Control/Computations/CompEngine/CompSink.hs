@@ -9,9 +9,11 @@ module Control.Computations.CompEngine.CompSink (
   CompSink (..),
   CompSinkInstanceId (..),
   CompSinkId,
-  TypedCompSinkId (..),
-  typedCompSinkId,
+  TypedCompSinkId,
+  unTypedCompSinkId,
   compSinkId,
+  typedCompSinkIdOf,
+  unsafeMkTypedCompSinkId,
   instanceIdFromTypedCompSinkId,
   instTextFromTypedCompSinkId,
   SomeCompSinkOuts (..),
@@ -101,11 +103,42 @@ instance Show (TypedCompSinkId a) where
   showsPrec p (TypedCompSinkId (CompSinkId (TypeId t) (CompSinkInstanceId i))) =
     showHelper2 p "TypedCompSinkId" t i
 
+-- | Not exported from the public "Control.Computations.CompEngine" facade
+-- (see that module's import of this one) -- kept here, and still exported
+-- from this internal module, purely as a shared helper for the handful of
+-- call sites elsewhere in the library (logging, 'CompFlowRegistry' hash-map
+-- keys) that need the untyped id of a live instance. Library-external code
+-- should go through 'typedCompSinkIdOf' and keep the typed id, or
+-- 'unTypedCompSinkId' it themselves if the untyped form is genuinely
+-- needed.
 compSinkId :: forall s. CompSink s => s -> CompSinkId
-compSinkId s = unTypedCompSinkId (typedCompSinkId (Proxy @s) (compSinkInstanceId s))
+compSinkId = unTypedCompSinkId . typedCompSinkIdOf
 
-typedCompSinkId :: CompSink s => Proxy s -> CompSinkInstanceId -> TypedCompSinkId s
-typedCompSinkId p instId =
+{- | Derive a sink's typed id directly from a live instance.
+
+ This is the preferred way to get a 'TypedCompSinkId' whenever an instance
+ is already in scope: unlike 'unsafeMkTypedCompSinkId', the id can't drift
+ from what the instance itself reports via 'compSinkInstanceId', because
+ it's computed from that instance.
+-}
+typedCompSinkIdOf :: forall s. CompSink s => s -> TypedCompSinkId s
+typedCompSinkIdOf s = unsafeMkTypedCompSinkId (Proxy @s) (compSinkInstanceId s)
+
+{- | Build a sink's typed id from a bare instance name, with no instance to
+ check it against.
+
+ __Unsafe__: the name is unchecked. A typo, or an instance name that has
+ simply drifted from what the actual 'CompSink' instance will report via
+ 'compSinkInstanceId' (e.g. because the config passed to that instance's
+ constructor was given a different string), still typechecks fine here --
+ it only surfaces later, at runtime, as a registry-lookup miss (a 'Fail')
+ when a comp body sends a request against the resulting id. Prefer
+ 'typedCompSinkIdOf' whenever a live instance is in scope; reach for this
+ only when the id is genuinely needed before any instance exists, e.g. a
+ top-level id referenced by a comp body at wiring time.
+-}
+unsafeMkTypedCompSinkId :: CompSink s => Proxy s -> CompSinkInstanceId -> TypedCompSinkId s
+unsafeMkTypedCompSinkId p instId =
   let i = CompSinkId (identifyProxy p) instId
    in TypedCompSinkId i
 
