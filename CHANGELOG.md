@@ -31,6 +31,19 @@ publication and makes the following user-facing changes:
 - `SqliteSrc` moved out of the library and into the Hospital demo
   (`app/Control/Computations/Demos/FlowImpls/SqliteSrc.hs`); it was
   demo-specific and not part of the intended public surface.
+- `Control.Computations.CompEngine.CompSrc.typedCompSrcId` and
+  `Control.Computations.CompEngine.CompSink.typedCompSinkId` (build a typed
+  id from a bare instance-name string, with nothing to check it against)
+  are renamed to `unsafeMkTypedCompSrcId`/`unsafeMkTypedCompSinkId` to mark
+  them as the unchecked escape hatch: a typo, or an instance name that has
+  drifted from what the actual source/sink instance reports, still
+  typechecks and only fails at runtime, as a registry-lookup miss. Prefer
+  the new `typedCompSrcIdOf`/`typedCompSinkIdOf` (see Added below) whenever
+  a live instance is in scope.
+- `TypedCompSrcId`/`TypedCompSinkId` are now exported abstractly (plus the
+  `unTypedCompSrcId`/`unTypedCompSinkId` accessor for the safe
+  typed-to-untyped direction); their raw constructors are no longer part of
+  the public API, closing a second unchecked way to fabricate a typed id.
 
 ### Removed
 
@@ -39,9 +52,22 @@ publication and makes the following user-facing changes:
   test-runner machinery at all; the exposed `QuickCheck` dependency that
   remains is for a small number of `Arbitrary` instances shipped alongside
   their types (see `package.yaml`'s `library.dependencies` comment).
+- `Control.Computations.CompEngine.CompSrc.compSrcId` and
+  `Control.Computations.CompEngine.CompSink.compSinkId` are no longer part
+  of the public API. Both were exactly `unTypedCompSrcId . typedCompSrcIdOf`
+  (resp. sink) and therefore redundant now that `typedCompSrcIdOf`/
+  `typedCompSinkIdOf` exist; use that composition, or keep the typed id,
+  instead.
 
 ### Added
 
+- `Control.Computations.CompEngine.CompSrc.typedCompSrcIdOf` and
+  `Control.Computations.CompEngine.CompSink.typedCompSinkIdOf` derive a
+  source's/sink's typed id directly from a live instance, so it can't drift
+  from what the instance itself reports via `compSrcInstanceId`/
+  `compSinkInstanceId` -- the safe alternative to writing the instance's
+  name out twice (once to build the id, once in the instance's own config)
+  with only a runtime failure if the two copies disagree.
 - A dedicated `benchmarks:` stanza (`incremental-computations-bench`) so the
   scale benchmark can be run with `stack bench` without pulling its
   dependencies into the library or the test suite. See

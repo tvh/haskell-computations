@@ -108,63 +108,69 @@ import Control.Computations.FlowImpls.IOSink
 import Control.Computations.Utils.IOUtils
 import Control.Computations.Utils.Logging
 
-import Data.Proxy
 import Prelude hiding (readFile, writeFile)
 
--- A source and a sink, each identified by a typed, named id.
-fileSrc :: TypedCompSrcId FileSrc
-fileSrc = typedCompSrcId (Proxy @FileSrc) "fileSrc"
-
-fileSink :: TypedCompSinkId FileSink
-fileSink = typedCompSinkId (Proxy @FileSink) "fileSink"
-
--- A computation from a file path to the number of lines in that file.
-numberOfLinesCompDef :: CompDef FilePath Int
-numberOfLinesCompDef =
+-- A computation from a file path to the number of lines in that file. Takes
+-- the FileSrc's typed id as an argument rather than referencing a top-level
+-- id, so the id's instance name is only ever written down once (see `main`
+-- below).
+numberOfLinesCompDef :: TypedCompSrcId FileSrc -> CompDef FilePath Int
+numberOfLinesCompDef fileSrcId =
   defineComp "numberOfLines" fullCaching $ \p -> do
-    string <- compSrcReq fileSrc (ReadTextFile p)
+    string <- compSrcReq fileSrcId (ReadTextFile p)
     pure (length (lines string))
 
 -- A computation that reads a file of paths (one per line) and sums the
 -- line counts of each, by calling back into another computation.
 sumCompDef
-  :: Comp FilePath Int
+  :: TypedCompSrcId FileSrc
+  -> Comp FilePath Int
   -> CompDef FilePath Int
-sumCompDef c = defineComp "sum" fullCaching $ \p -> do
-  string <- compSrcReq fileSrc (ReadTextFile p)
+sumCompDef fileSrcId c = defineComp "sum" fullCaching $ \p -> do
+  string <- compSrcReq fileSrcId (ReadTextFile p)
   list <- mapM (evalCompOrFail c) (lines string)
   pure (sum list)
 
 -- The top-level computation: run the sum over a fixed file and write the
 -- result out through the sink.
-storeCompDef :: Comp FilePath Int -> CompDef () ()
-storeCompDef c = do
+storeCompDef :: TypedCompSinkId FileSink -> Comp FilePath Int -> CompDef () ()
+storeCompDef fileSinkId c = do
   defineComp "store" fullCaching $ \() -> do
     i <- evalCompOrFail c "file_list.txt"
-    compSinkReq fileSink (WriteTextFile "output.txt" ("number of lines: " ++ show i))
+    compSinkReq fileSinkId (WriteTextFile "output.txt" ("number of lines: " ++ show i))
 
--- Wiring: turn each CompDef into a runnable Comp, chaining them together.
-wireAllComps :: CompWireM (Comp () ())
-wireAllComps = do
-  numberOfLinesC <- wireComp numberOfLinesCompDef
-  sumC <- wireComp (sumCompDef numberOfLinesC)
-  wireComp (storeCompDef sumC)
+-- Wiring: turn each CompDef into a runnable Comp, chaining them together,
+-- against the actual source/sink ids passed in by `main`.
+wireAllComps :: TypedCompSrcId FileSrc -> TypedCompSinkId FileSink -> CompWireM (Comp () ())
+wireAllComps fileSrcId fileSinkId = do
+  numberOfLinesC <- wireComp (numberOfLinesCompDef fileSrcId)
+  sumC <- wireComp (sumCompDef fileSrcId numberOfLinesC)
+  wireComp (storeCompDef fileSinkId sumC)
 
--- Register the concrete flow implementations for the source/sink ids used
--- above, then hand control to the given action.
-withCompFlows :: FilePath -> CompFlowRegistry -> IO () -> IO ()
-withCompFlows tgt reg action =
-  withFileSrc (defaultFileSrcConfig "fileSrc") $ regSrc reg $ do
-    fileSink <- makeFileSink "fileSink" tgt
-    registerCompSink reg fileSink
-    registerCompSink reg ioSink
-    action
+-- Register the already-built flow instances, then hand control to the
+-- given action.
+withCompFlows :: FileSrc -> FileSink -> CompFlowRegistry -> IO () -> IO ()
+withCompFlows fileSrc fileSink reg action = do
+  registerCompSrc reg fileSrc
+  registerCompSink reg fileSink
+  registerCompSink reg ioSink
+  action
 
--- Drive the wired computation graph forward until it settles.
+-- Build the FileSrc/FileSink instances once, up front, then drive the
+-- wired computation graph forward until it settles. Each instance's name
+-- ("fileSrc"/"fileSink") is written down exactly once, right where the
+-- instance is built -- wireAllComps and withCompFlows both derive their
+-- ids from these same instances (via typedCompSrcIdOf/typedCompSinkIdOf),
+-- so there is no second copy that could drift out of sync.
 main :: IO ()
-main = withSysTempDir $ \tgt -> do
-  logNote ("Target directory: " ++ tgt)
-  compDriver (withCompFlows tgt) wireAllComps ()
+main = withSysTempDir $ \tgt ->
+  withFileSrc (defaultFileSrcConfig "fileSrc") $ \fileSrc -> do
+    fileSink <- makeFileSink "fileSink" tgt
+    logNote ("Target directory: " ++ tgt)
+    compDriver
+      (withCompFlows fileSrc fileSink)
+      (wireAllComps (typedCompSrcIdOf fileSrc) (typedCompSinkIdOf fileSink))
+      ()
 ```
 
 Run it (as the `simple` subcommand of the demo executable — see below):
