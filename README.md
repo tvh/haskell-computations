@@ -36,17 +36,25 @@ turns out, after rerunning, to still produce the same output. This is what
 dependencies at the level of whole computations (not fine-grained data-flow
 edges inside them), while still avoiding wasted recomputation.
 
-Sources and sinks are pluggable: the library ships flow implementations for
-files (`FileSrc`/`FileSink`), for content-addressed blob storage
-(`FileStoreSink`), for in-memory maps (`HashMapFlow`), for plain `IO` actions
-(`IOSink`), for periodic ticks (`TimeSrc`), and for structured logging
-(`CompLogging`). You can also implement your own by instantiating the
-`CompSrc`/`CompSink` classes.
+Sources and sinks are pluggable. The library ships six flow implementations:
+
+| Module | What it is |
+|---|---|
+| `FileSrc` / `FileSink` | read from and write to the filesystem, with output tracking so files a computation no longer produces get cleaned up |
+| `HashMapFlow` | an in-memory key/value source *and* sink — the one to reach for when testing your own computations, or trying the API without touching a filesystem |
+| `TimeSrc` | periodic ticks, for computations that should rerun as the clock passes a threshold |
+| `IOSink` | an escape hatch for running plain `IO` from a computation body (see its haddock for what "escape hatch" costs you) |
+| `CompLogging` | structured logging from inside a computation body, built on `IOSink` |
+
+You can also implement your own by instantiating the `CompSrc`/`CompSink`
+classes; `HashMapFlow` is a compact worked example of a type that does both,
+and `FileSink` is the reference for getting output tracking right.
 
 ## Installing
 
-This package is not yet on Hackage (see [Known issues](#known-issues)
-below). To depend on it from another `stack` project, add it as a
+This package has not been uploaded to Hackage yet, though nothing blocks it
+from being — every dependency resolves from a released Stackage snapshot. To
+depend on it from another `stack` project in the meantime, add it as an
 `extra-dep` pointing at this repository in your `stack.yaml`, e.g.:
 
 ```yaml
@@ -60,8 +68,9 @@ and add `incremental-computations` to your package's `dependencies:` in
 
 ## Building this repository
 
-Requirements: you need the build tool `stack` (https://docs.haskellstack.org/en/stable/).
-I use version 2.9.3, I guess a slightly older version might work was well.
+Requirements: the [`stack`](https://docs.haskellstack.org/en/stable/) build
+tool. The repository pins its GHC and package set via `stack.yaml`
+(`lts-24.51`, GHC 9.10.3), so any reasonably recent `stack` will do.
 
 Build the software by executing
 
