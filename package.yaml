@@ -1,18 +1,28 @@
 name:                incremental-computations
-version:             0.1.0.0
-github:              "skogsbaer/incremental-computations"
+version:             0.2.0.0
+github:              "tvh/haskell-computations"
 license:             BSD3
 author:              "medilyse GmbH, Freiburg, Germany (https://medilyse.org)"
-maintainer:          "Stefan Wehr"
-copyright:           "2010-2023 medilyse GmbH"
+maintainer:          "Timo von Holtz"
+copyright:           "2010-2023 medilyse GmbH, 2026 Timo von Holtz"
 
 extra-source-files:
   - README.md
   - CHANGELOG.md
 
-synopsis:            A framework for incremental computations
+synopsis:            A framework for coarse-grained self-adjusting (incremental) computations
 category:            Control
-description:         Please see the README on GitHub at <https://github.com/githubuser/incremental-computations>
+description: |
+  A library for coarse-grained self-adjusting computations: define
+  computations as a DAG of typed, named steps wired to pluggable sources and
+  sinks, and let the engine incrementally recompute only what changed when an
+  input updates. State is tracked per definition in a columnar cache, so
+  reruns after a small input change touch a small, targeted slice of the
+  computation graph rather than the whole thing. Originally extracted from a
+  commercial product built by medilyse GmbH; this fork rewrites the engine
+  internals and narrows the public API down to what a library consumer
+  actually needs. See the README for a worked example and the accompanying
+  FUNARCH 2023 paper for the underlying architecture.
 
 dependencies:
   - aeson >= 2.2 && < 2.3
