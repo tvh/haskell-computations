@@ -66,6 +66,17 @@ dependencies:
   # which require ghc-prim as a direct dependency; no module imports
   # System.Log.*) and were dropped entirely.
 
+flags:
+  werror:
+    description: >
+      Turn on -Werror so warnings fail the build. Off by default so this
+      package builds cleanly as a dependency on GHC versions newer than the
+      one it was developed against (a new warning must never break a
+      downstream consumer's build). Enabled by this repo's own dev workflow
+      and CI -- see the README's Development section for the exact command.
+    manual: true
+    default: false
+
 ghc-options:
   - -O2
   - -Wall
@@ -79,7 +90,10 @@ ghc-options:
   - -Wpartial-fields
   - -Wredundant-constraints
   - -Wno-x-partial
-  - -Werror
+
+when:
+  - condition: flag(werror)
+    ghc-options: -Werror
 
 default-extensions:
   - BangPatterns

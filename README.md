@@ -76,6 +76,20 @@ $ stack test
 $ stack run -- test
 ```
 
+## Development
+
+`-Werror` is **not** part of the default build — it's gated behind a cabal
+flag (`werror`, off by default) so that a warning newly introduced by a
+future GHC release can't break a downstream consumer's build. This repo's
+own build/test loop turns it on by default via the `Makefile`
+(`make all`, `make test`), so warnings still fail locally and in CI. To
+turn it on directly with `stack`:
+
+```
+$ stack build --flag incremental-computations:werror
+$ stack test  --flag incremental-computations:werror
+```
+
 ## A minimal worked example
 
 The following is the complete demo at
