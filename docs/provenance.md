@@ -120,11 +120,23 @@ it is an accepted trade inherited from the design.
 
 ### Concurrency without fork
 
-**Marlow, Peyton Jones, Kmett, Mokhov. *There Is No Fork: An Abstraction for
-Efficient, Concurrent, and Concise Data Access.* ICFP 2014** (Haxl). The
-insight: represent a computation as either `Done` or `Blocked` on a set of
+**Simon Marlow, Louis Brandy, Jonathan Coens, Jon Purdy (Facebook). *There is
+no Fork: an Abstraction for Efficient, Concurrent, and Concise Data Access.*
+ICFP 2014** (Haxl).
+[PDF](https://simonmar.github.io/bib/papers/haxl-icfp14.pdf),
+doi:[10.1145/2628136.2628144](https://doi.org/10.1145/2628136.2628144),
+pp. 325–337. Author list and title verified against the PDF's title page; DOI
+and pagination cross-checked against dblp (ACM also carries it under the
+SIGPLAN Notices DOI prefix `10.1145/2692915.2628144`).
+
+The insight: represent a computation as either `Done` or `Blocked` on a set of
 requests, and let the *applicative* combinator explore both branches so
-independent requests batch automatically — no explicit fork.
+independent requests batch automatically — no explicit fork. Verified verbatim
+in the paper (§3.1):
+
+```haskell
+data Fetch a = Done a | Blocked (Fetch a)
+```
 
 `CompM`'s `CompFinished`/`CompSuspended` is that shape, and `compMAp`
 running both sides to combine two suspensions into one `CompReqCombined` is
@@ -146,9 +158,26 @@ directly in `Types.hs`:
 - **Jaskelioff & Rivas. *A Smart View on Datatypes.* ICFP 2015** — the one
   `ContCompM` cites by name.
 
-The deeper root is the codensity/Cayley transform, and before that Hughes'
+The deeper root is the codensity transform, and before that Hughes'
 difference lists: represent a sequence by its composition so appending is
-O(1) regardless of association.
+O(1) regardless of association. Both have real citations, so this is not
+folklore:
+
+- Hughes. *A novel representation of lists and its application to the
+  function "reverse".* Inf. Process. Lett. 22(3), 1986 — difference lists.
+- **Voigtländer. *Asymptotic Improvement of Computations over Free Monads.*
+  MPC 2008, LNCS 5133, pp. 388–403** —
+  [PDF](https://janis-voigtlaender.eu/papers/AsymptoticImprovementOfComputationsOverFreeMonads.pdf),
+  doi:[10.1007/978-3-540-70594-9_20](https://doi.org/10.1007/978-3-540-70594-9_20).
+  This is the paper that shows the codensity monad reduces free-monad
+  complexity from quadratic to linear — the result the three papers above
+  are all reaching for by different routes.
+
+The equivalence between the two is also a stated result rather than a vibe:
+the codensity transform and difference lists are both instances of the
+Cayley representation of monoids in a monoidal category. Kmett's
+*Free Monads for Less* series is the accessible Haskell write-up of the same
+material.
 
 ### The path not (yet) taken
 
@@ -226,15 +255,37 @@ Two things in this arc don't trace to a source I could find:
   *architectural* choice rather than an implementation compromise — which
   is the FUNARCH paper's actual contribution.
 
-## Honest caveats
+## Wehr's bracketed references, resolved
 
-- Wehr's bracketed reference numbers are from the FUNARCH '23 preprint's
-  bibliography; full citations for [5], [14], [21] and others were not
-  transcribed here.
-- The Haxl authorship line is from memory of the ICFP'14 paper and was not
-  re-verified against the PDF; the *technical* claims about `Done`/`Blocked`
-  and applicative batching were verified against the paper's abstract and
-  this codebase.
-- The Hughes difference-list connection to codensity is standard folklore
-  in the Haskell community rather than a claim from any of the three cited
-  papers.
+Every `[n]` used above, transcribed from the FUNARCH '23 preprint's
+bibliography (`Wehr_A-Software-Architecture-Based-on-Coarse-Grained-Self-Adjusting-Computations.pdf`
+in the repo root):
+
+| ref | citation |
+|---|---|
+| [1] | Acar, Blelloch, Blume, Tangwongsan. *An experimental analysis of self-adjusting computation.* PLDI 2006. doi:[10.1145/1133981.1133993](https://doi.org/10.1145/1133981.1133993) |
+| [2] | Acar, Blelloch, Harper. *Adaptive functional programming.* TOPLAS 28(6), 2006. doi:[10.1145/1186632.1186634](https://doi.org/10.1145/1186632.1186634) |
+| [3] | Bainomugisha, Carreton, Van Cutsem, Mostinckx, De Meuter. *A survey on reactive programming.* ACM Comput. Surv. 45(4), 2013. doi:[10.1145/2501654.2501666](https://doi.org/10.1145/2501654.2501666) |
+| [5] | Cooper, Krishnamurthi. *Embedding Dynamic Dataflow in a Call-by-Value Language.* ESOP 2006, LNCS 3924. doi:[10.1007/11693024_20](https://doi.org/10.1007/11693024_20) — this is **FrTime** |
+| [8] | Elliott. *Push-pull functional reactive programming.* Haskell Symposium 2009. doi:[10.1145/1596638.1596643](https://doi.org/10.1145/1596638.1596643) |
+| [9] | Elliott, Hudak. *Functional Reactive Animation.* ICFP 1997. doi:[10.1145/258948.258973](https://doi.org/10.1145/258948.258973) |
+| [14] | *Incremental — Library for Incremental Computations.* Jane Street, 2023. <https://opensource.janestreet.com/incremental> — the OCaml SAC implementation Wehr points at |
+| [16] | Mitchell. *Shake before building: replacing make with Haskell.* ICFP 2012. doi:[10.1145/2364527.2364538](https://doi.org/10.1145/2364527.2364538) |
+| [17] | Mokhov, Mitchell, Peyton Jones. *Build systems à la carte: Theory and practice.* JFP 30, 2020. doi:[10.1017/S0956796820000088](https://doi.org/10.1017/S0956796820000088) |
+| [21] | *Racket, the Programming Language.* <https://racket-lang.org> |
+
+NOTE: [17] is the extended **JFP 2020** version. The ICFP 2018 paper of
+nearly the same name is a different artifact; cite whichever you actually
+read, and don't silently swap the venue.
+
+Two things the resolution turned up that are worth knowing:
+
+- **[14] is Jane Street's `Incremental`.** Wehr's related-work sentence
+  "There exists an OCaml implementation for self-adjusting computations [14]"
+  points at a production library, not a paper. That is the closest thing to
+  an industrial cousin of this engine.
+- **The Haxl author line in §4 was wrong** before this pass — it read
+  "Marlow, Peyton Jones, Kmett, Mokhov", three of whom had nothing to do
+  with the paper. Corrected against the PDF's title page and now carries the
+  verified `data Fetch a = Done a | Blocked (Fetch a)` line as well. This is
+  a good argument for resolving references instead of recalling them.
