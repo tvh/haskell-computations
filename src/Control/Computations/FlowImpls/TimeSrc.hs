@@ -143,6 +143,9 @@ instance CompSrc TimeSrc where
   compSrcUnregister = unregisterImpl
   compSrcWaitChanges = waitChangesImpl
 
+  -- 'executeImpl' is a single 'atomically' block.
+  compSrcConcurrency _ = FlowConcurrent
+
 waitChangesImpl :: TimeSrc -> STM (HashSet TimeDep)
 waitChangesImpl tcs = do
   truncTimes <- readTVar (tcs_truncatedTimes tcs)

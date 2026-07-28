@@ -133,6 +133,14 @@ instance CompSrc FileSrc where
   compSrcUnregister = unregisterImpl
   compSrcWaitChanges = waitChangesImpl
 
+  -- The only in-process state 'executeImpl' touches is the TVar-guarded
+  -- 'FileWatch' (via 'watchFile', itself a single 'atomically' block); the
+  -- read\/stat pair in between is a filesystem TOCTOU race that already
+  -- exists single-threaded (the background poll thread can change the file
+  -- between them), so running several requests concurrently does not make
+  -- it any worse.
+  compSrcConcurrency _ = FlowConcurrent
+
 fileVerFromStatus :: FileStatus -> FileVer
 fileVerFromStatus = FileVer . fs_mtime
 

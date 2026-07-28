@@ -93,6 +93,9 @@ instance CompSrc HashMapFlow where
   compSrcUnregister = unregisterImpl
   compSrcWaitChanges = waitChangesImpl
 
+  -- 'executeImpl' is a 'readTVarIO' followed by a pure 'HashMap.lookup'.
+  compSrcConcurrency _ = FlowConcurrent
+
 initHashMapFlow :: T.Text -> IO HashMapFlow
 initHashMapFlow ident = do
   hmV <- newTVarIO HashMap.empty

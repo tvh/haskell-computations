@@ -14,6 +14,7 @@ module Control.Computations.CompEngine.CompSrc (
   CompSrcDep,
   CompSrcDeps,
   CompSrc (..),
+  FlowConcurrency (..),
   CompSrcId,
   TypedCompSrcId,
   unTypedCompSrcId,
@@ -111,6 +112,11 @@ instance LH.LargeHashable CompSrcInstanceId
 instance IsString CompSrcInstanceId where
   fromString = CompSrcInstanceId . T.pack
 
+-- | Whether the engine may have several 'compSrcExecute' calls to a given
+-- 'CompSrc' instance in flight at once.
+data FlowConcurrency = FlowSerial | FlowConcurrent
+  deriving (Eq, Show)
+
 class (Typeable s, IsCompFlowData (CompSrcKey s), IsCompFlowData (CompSrcVer s)) => CompSrc s where
   type CompSrcReq s :: Type -> Type
   type CompSrcKey s :: Type
@@ -119,6 +125,12 @@ class (Typeable s, IsCompFlowData (CompSrcKey s), IsCompFlowData (CompSrcVer s))
   compSrcExecute :: s -> CompSrcReq s a -> IO (CompSrcDeps s, Fail a)
   compSrcUnregister :: s -> HashSet (CompSrcKey s) -> IO ()
   compSrcWaitChanges :: s -> STM (CompSrcDeps s)
+
+  -- | Whether the engine may have several 'compSrcExecute' calls to this
+  -- instance in flight at once. Defaults to 'FlowSerial', under which the
+  -- engine runs this source's requests on its own thread, one at a time.
+  compSrcConcurrency :: s -> FlowConcurrency
+  compSrcConcurrency _ = FlowSerial
 
 data CompSrcId = CompSrcId
   { csi_type :: TypeId
