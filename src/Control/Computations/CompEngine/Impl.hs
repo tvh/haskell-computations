@@ -606,9 +606,15 @@ evalCompAp outerCap =
    concurrent work yet, this only isolates leaf preparation from the
    continuation-passing 'doSuspended' otherwise uses, ahead of a later
    commit teaching the 'IO' layer to actually queue something.
+
+   Takes the width read from the registry (see 'doSuspended's general path
+   below) as an explicit argument, unused for now, rather than have each
+   branch read it independently: a future commit's per-source-leaf
+   job-or-inline decision needs it, and threading it through here now means
+   that decision won't need a new plumbing path of its own later.
   -}
-  prepLeaf :: forall r. CompReqLeaf r -> Prep r
-  prepLeaf leaf =
+  prepLeaf :: forall r. CompFlowConcurrency -> CompReqLeaf r -> Prep r
+  prepLeaf _width leaf =
     case leaf of
       CompLeafEval cap -> Prep (pure (mempty, pure <$> doAnyEvalReqValue cap))
       CompLeafCache cap -> Prep (pure (mempty, pure <$> doAnyCacheReqValue cap))
@@ -658,7 +664,15 @@ evalCompAp outerCap =
             -- preserves the exact leaf order the recursive walk above has
             -- (see the golden trace in TestCompReqCombined) -- concurrency
             -- is future work, not this commit's.
-            (_jobs, enginePhase) <- liftIO (unPrep (traverseCompReq prepLeaf req))
+            --
+            -- The width read below is likewise unused for now (see
+            -- prepLeaf's haddock) -- reading it here, once per batch,
+            -- ahead of the traversal is where a later commit needs it to
+            -- already be, so this commit wires that read in without
+            -- changing behaviour.
+            reg <- CompEngineM (asks (ce_compFlowRegistry . ce_compEngineIfs))
+            width <- liftIO (readCompFlowConcurrency reg)
+            (_jobs, enginePhase) <- liftIO (unPrep (traverseCompReq (prepLeaf width) req))
             inner <- enginePhase
             loop env (inner >>= contToCompM . cont)
 
