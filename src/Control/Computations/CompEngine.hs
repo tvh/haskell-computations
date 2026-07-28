@@ -36,6 +36,14 @@ import Control.Computations.CompEngine.Utils.PriorityAgingQueue as X (PaqPriorit
 -- this public facade would let a computation body construct a 'CompM'
 -- value by hand and smuggle arbitrary IO into the engine. 'CompMEnv' (the
 -- env that constructor would need) is hidden entirely for the same
--- reason. Everything else Types.hs exports is passed through unchanged.
-import Control.Computations.CompEngine.Types as X hiding (CompM (..), CompMEnv (..))
+-- reason. 'CompReqLeaf'\/'traverseCompReq' are hidden entirely too -- they
+-- are "Control.Computations.CompEngine.Impl"'s own leaf-preparation
+-- plumbing for batched 'CompReqCombined' requests, of no use to a comp
+-- body. Everything else Types.hs exports is passed through unchanged.
+import Control.Computations.CompEngine.Types as X hiding (
+  CompM (..),
+  CompMEnv (..),
+  CompReqLeaf (..),
+  traverseCompReq,
+ )
 import Control.Computations.CompEngine.Types as X (CompM)

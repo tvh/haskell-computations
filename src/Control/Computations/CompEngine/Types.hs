@@ -39,6 +39,8 @@ module Control.Computations.CompEngine.Types (
   CompResult (..),
   CompReq (..),
   CompFlowReq (..),
+  CompReqLeaf (..),
+  traverseCompReq,
   CompCont,
   ContCompM,
   contToCompM,
@@ -287,6 +289,43 @@ data CompReq r where
 data CompFlowReq a where
   CompFlowReqSink :: CompSink s => TypedCompSinkId s -> CompSinkReq s a -> CompFlowReq (Fail a)
   CompFlowReqSrc :: CompSrc s => TypedCompSrcId s -> CompSrcReq s a -> CompFlowReq (Fail a)
+
+{- | One indivisible unit of suspension inside a 'CompReq' -- everything a
+ 'CompReq' can be built from except 'CompReqCombined' itself, which only
+ ever nests other 'CompReq's together. 'traverseCompReq' walks a 'CompReq'
+ down to these; see there for why the split exists, and
+ "Control.Computations.CompEngine.Impl"'s @Prep@ for what consumes them.
+-}
+data CompReqLeaf r where
+  CompLeafEval :: IsCompResult a => CompAp a -> CompReqLeaf (Maybe (CompApResult a))
+  CompLeafCache :: IsCompResult a => CompAp a -> CompReqLeaf (Maybe a)
+  CompLeafSrc :: CompSrc s => TypedCompSrcId s -> CompSrcReq s a -> CompReqLeaf (Fail a)
+  CompLeafSink :: CompSink s => TypedCompSinkId s -> CompSinkReq s a -> CompReqLeaf (Fail a)
+
+{- | Flatten a 'CompReq' tree into its leaves, left to right, recombining
+ the results back into the tree's original shape via an arbitrary
+ 'Applicative' @f@. This lets "Control.Computations.CompEngine.Impl" prepare
+ every leaf of a 'CompReqCombined' batch through one traversal instead of
+ the recursive walk 'CompReq'\'s own consumer otherwise uses -- and, once
+ @f@'s effects are engine-thread effects (as @Prep@'s are), it is what makes
+ that traversal preserve the recursive walk's left-to-right leaf order:
+ 'Applicative'\'s own left-to-right sequencing does the ordering work, not
+ anything specific to 'CompReq'.
+-}
+traverseCompReq
+  :: forall f a
+   . Applicative f
+  => (forall r. CompReqLeaf r -> f r)
+  -> CompReq a
+  -> f a
+traverseCompReq k = go
+ where
+  go :: forall b. CompReq b -> f b
+  go (CompReqCombined x y) = (,) <$> go x <*> go y
+  go (CompReqEval cap) = k (CompLeafEval cap)
+  go (CompReqCache cap) = k (CompLeafCache cap)
+  go (CompReqFlow (CompFlowReqSrc sid req)) = k (CompLeafSrc sid req)
+  go (CompReqFlow (CompFlowReqSink sid req)) = k (CompLeafSink sid req)
 
 -- | Smart representation of the continuation `r -> CompM a`.
 type CompCont r a = r -> ContCompM a
