@@ -49,12 +49,16 @@ import Control.Monad.IO.Class
 import qualified Data.Foldable as F
 import qualified Data.HashMap.Strict as HashMap
 import qualified Data.HashSet as HashSet
+import Data.IORef
 import qualified Data.Map.Strict as Map
 import qualified Data.Text as T
 import Data.Time.Clock
 import Data.Typeable
 import Data.Word
+import GHC.Clock (getMonotonicTimeNSec)
 import GHC.Stack
+import System.Environment (lookupEnv)
+import Text.Printf (printf)
 
 newtype RunSettings = RunSettings
   { rs_maxRunIterations :: Option CompRunIterationLimit
@@ -106,9 +110,16 @@ initStateIf
   -> IO (CompEngineStateIf IO, IO ())
 initStateIf shouldValidate =
   do
-    stateIf <- setupSimpleStateIf shouldValidate
+    (stateIf, reportLockStats) <- setupSimpleStateIf shouldValidate
     exitMVar <- liftIO newEmptyMVar
-    let close = liftIO (putMVar exitMVar ())
+    -- NOTE: 'reportLockStats' is a no-op unless 'setupSimpleStateIf' turned
+    -- on lock instrumentation (see its haddock). @close@ is already run via
+    -- 'withStateIf'\'s 'bracket' on every path that tears an engine down --
+    -- including 'Control.Concurrent.Async.cancel', whose release-action
+    -- guarantee is what the bench relies on (see "Bench/Main.hs") -- so this
+    -- is the one place a stats dump is guaranteed to happen exactly once,
+    -- after the engine has genuinely stopped taking the lock.
+    let close = reportLockStats >> liftIO (putMVar exitMVar ())
     return (stateIf, close)
 
 {- | 'SifState' is genuinely, internally mutable (growable unboxed/boxed
@@ -122,21 +133,73 @@ initStateIf shouldValidate =
 -}
 setupSimpleStateIf
   :: Bool
-  -> IO (CompEngineStateIf IO)
+  -> IO (CompEngineStateIf IO, IO ())
 setupSimpleStateIf shouldValidate =
   do
     st <- newSifState
     lock <- newMVar ()
-    let stateIf =
-          SimpleStateIf
-            { ssif_withState =
-                \f ->
-                  withMVar lock $ \() -> do
-                    x <- f st
-                    when shouldValidate $ validateSifState st
-                    return x
-            }
-    return (mkSimpleCompEngineStateIf stateIf)
+    -- Read once, here, rather than per-call: 'ssif_withState' is on the
+    -- hottest path in the engine (every 'withCompState' call, millions of
+    -- times in the 1M-instance bench), so the choice between the plain and
+    -- instrumented body has to be made once, at setup time, and baked into
+    -- which closure 'stateIf' below actually captures -- not re-checked on
+    -- every call. This is also why lock stats are opt-in via an env var
+    -- rather than always-on: even a single branch or a pair of IORef bumps
+    -- per call would perturb the very hold-time baseline this exists to
+    -- measure.
+    mLockStatsEnv <- lookupEnv "COMP_ENGINE_LOCK_STATS"
+    let lockStatsEnabled = case mLockStatsEnv of
+          Nothing -> False
+          Just "" -> False
+          Just "0" -> False
+          Just _ -> True
+    if lockStatsEnabled
+      then do
+        callsRef <- newIORef (0 :: Word64)
+        holdNsRef <- newIORef (0 :: Word64)
+        let stateIf =
+              SimpleStateIf
+                { ssif_withState =
+                    \f ->
+                      withMVar lock $ \() -> do
+                        t0 <- getMonotonicTimeNSec
+                        x <- f st
+                        when shouldValidate $ validateSifState st
+                        t1 <- getMonotonicTimeNSec
+                        modifyIORef' callsRef (+ 1)
+                        modifyIORef' holdNsRef (+ (t1 - t0))
+                        return x
+                }
+            -- Reports how long the engine-state lock was actually *held*
+            -- (time inside this 'withMVar' body, from just before @f st@ to
+            -- just after @validateSifState@), not how long any caller spent
+            -- *waiting* for it. 'ssif_withState' is only ever called under
+            -- this single 'MVar', one caller at a time, so wait time is
+            -- definitionally zero today ('stepCompEngine' is sequential --
+            -- see this module's own haddock) and hold time is the whole
+            -- story. That stops being true the moment something makes
+            -- concurrent calls into the same 'CompEngineStateIf' (e.g. a
+            -- future parallel-engine-threads project) -- at that point this
+            -- number alone would understate actual lock cost and a wait-time
+            -- counter would need adding alongside it.
+            reportLockStats = do
+              calls <- readIORef callsRef
+              holdNs <- readIORef holdNsRef
+              let holdS = fromIntegral holdNs / (1e9 :: Double)
+              putStrLn "=== COMP_ENGINE_LOCK_STATS ==="
+              printf "engine-state lock: %d calls, %d ns total hold time (%.6f s)\n" calls holdNs holdS
+        return (mkSimpleCompEngineStateIf stateIf, reportLockStats)
+      else do
+        let stateIf =
+              SimpleStateIf
+                { ssif_withState =
+                    \f ->
+                      withMVar lock $ \() -> do
+                        x <- f st
+                        when shouldValidate $ validateSifState st
+                        return x
+                }
+        return (mkSimpleCompEngineStateIf stateIf, return ())
 
 data RunCompEngineIf a = RunCompEngineIf
   { rcif_shouldStartWithRun :: ShouldStartNextRun a IO
