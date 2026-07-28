@@ -235,7 +235,18 @@ benchmarks:
     ghc-options:
     - -threaded
     - -rtsopts
-    - -with-rtsopts=-A64m
+    # NOTE: -with-rtsopts is single-valued -- a second -with-rtsopts= entry
+    # does not concatenate with this one, it replaces it (this repo lost a
+    # silently-dropped -N2 to that for an entire optimization campaign). Both
+    # options this benchmark needs (allocation area size, and -T so
+    # GHC.Stats.getRTSStats doesn't throw) must live in this one entry. The
+    # surrounding double quotes are load-bearing: Cabal's ghc-options field
+    # tokenizes on whitespace, so without them "-A64m -T" splits into two
+    # separate GHC arguments and "-T" is rejected as an unknown flag. The
+    # quotes must wrap the *entire* token (Cabal field-string syntax), not
+    # just the value after "=", or the quote characters themselves leak
+    # through as literal text and the tokenizer still splits on the space.
+    - '"-with-rtsopts=-A64m -T"'
     dependencies:
     - incremental-computations
     - process
