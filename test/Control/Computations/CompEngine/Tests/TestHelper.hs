@@ -9,6 +9,7 @@ module Control.Computations.CompEngine.Tests.TestHelper (
   runCompEngineTest,
   runCompEngineTest',
   initCompEngineTest,
+  initCompEngineTestWith,
   get,
   put,
   unsafeCompIO,
@@ -85,7 +86,27 @@ initCompEngineTest
         -> (HashMapFlow -> IO ())
         -> IO ()
       )
-initCompEngineTest compDefs =
+initCompEngineTest = initCompEngineTestWith id
+
+{- | Like 'initCompEngineTest', but lets the caller wrap the
+ 'CompEngineStateIf' this test drives its engine with -- e.g. with
+ 'Control.Computations.CompEngine.ObservingStateIf.observingStateIf' to
+ record which caps actually get (re-)evaluated. @id@ (i.e.
+ 'initCompEngineTest') is the no-observation default.
+-}
+initCompEngineTestWith
+  :: (Show r, Typeable r)
+  => (CompEngineStateIf IO -> CompEngineStateIf IO)
+  -> CompWireM (Comp () r)
+  -> IO
+      ( HashMapFlow
+      , CompRunIterationLimit
+        -> (HashMapFlow -> ShouldStartNextRun a IO)
+        -> a
+        -> (HashMapFlow -> IO ())
+        -> IO ()
+      )
+initCompEngineTestWith wrapStateIf compDefs =
   do
     hmFlow <- initHashMapFlow (instTextFromTypedCompSrcId hashMapSrcId)
     reg <- newCompFlowRegistry
@@ -93,8 +114,9 @@ initCompEngineTest compDefs =
     registerCompSink reg hmFlow
     registerCompSink reg ioSink
     (_compMap, mainComp) <- failInM $ runCompWireM compDefs
-    (stateIf, closeSif) <- initStateIf True
-    let caps = [wrapCompAp (mkCompAp mainComp ())]
+    (rawStateIf, closeSif) <- initStateIf True
+    let stateIf = wrapStateIf rawStateIf
+        caps = [wrapCompAp (mkCompAp mainComp ())]
         startTest u v w x =
           runCompEngineTest' hmFlow stateIf reg caps u v w x
             `finally` closeSif

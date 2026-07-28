@@ -72,6 +72,7 @@ library
       Control.Computations.CompEngine.Core
       Control.Computations.CompEngine.Driver
       Control.Computations.CompEngine.Impl
+      Control.Computations.CompEngine.ObservingStateIf
       Control.Computations.CompEngine.Run
       Control.Computations.CompEngine.SimpleStateIf
       Control.Computations.CompEngine.Types
@@ -254,6 +255,7 @@ test-suite incremental-computations-test
   main-is: Spec.hs
   other-modules:
       Control.Computations.CompEngine.Tests.TestCompEngine
+      Control.Computations.CompEngine.Tests.TestCompReqCombined
       Control.Computations.CompEngine.Tests.TestDriver
       Control.Computations.CompEngine.Tests.TestDynamicChanges
       Control.Computations.CompEngine.Tests.TestHelper
@@ -286,6 +288,7 @@ test-suite incremental-computations-test
       Control.Computations.CompEngine.Core
       Control.Computations.CompEngine.Driver
       Control.Computations.CompEngine.Impl
+      Control.Computations.CompEngine.ObservingStateIf
       Control.Computations.CompEngine.Run
       Control.Computations.CompEngine.SimpleStateIf
       Control.Computations.CompEngine.Types
@@ -384,9 +387,51 @@ benchmark incremental-computations-bench
   main-is: Main.hs
   other-modules:
       Control.Computations.Demos.Bench.Main
+      Control.Computations.CompEngine
+      Control.Computations.CompEngine.CacheBehaviors
+      Control.Computations.CompEngine.CompDef
+      Control.Computations.CompEngine.CompEval
+      Control.Computations.CompEngine.CompFlow
+      Control.Computations.CompEngine.CompFlowRegistry
+      Control.Computations.CompEngine.CompSink
+      Control.Computations.CompEngine.CompSrc
+      Control.Computations.CompEngine.Core
+      Control.Computations.CompEngine.Driver
+      Control.Computations.CompEngine.Impl
+      Control.Computations.CompEngine.ObservingStateIf
+      Control.Computations.CompEngine.Run
+      Control.Computations.CompEngine.SimpleStateIf
+      Control.Computations.CompEngine.Types
+      Control.Computations.CompEngine.Utils.DefTable
+      Control.Computations.CompEngine.Utils.OutputsMap
+      Control.Computations.CompEngine.Utils.PriorityAgingQueue
+      Control.Computations.CompEngine.Utils.SrcIndex
+      Control.Computations.FlowImpls.CompLogging
+      Control.Computations.FlowImpls.FileSink
+      Control.Computations.FlowImpls.FileSrc
+      Control.Computations.FlowImpls.HashMapFlow
+      Control.Computations.FlowImpls.IOSink
+      Control.Computations.FlowImpls.TimeSrc
+      Control.Computations.Utils.Ansi
+      Control.Computations.Utils.Clock
+      Control.Computations.Utils.ConcUtils
+      Control.Computations.Utils.DataSize
+      Control.Computations.Utils.Fail
+      Control.Computations.Utils.FileWatch
+      Control.Computations.Utils.Hash
+      Control.Computations.Utils.IOUtils
+      Control.Computations.Utils.Logging
+      Control.Computations.Utils.MultiMap
+      Control.Computations.Utils.MultiSet
+      Control.Computations.Utils.SourceLocation
+      Control.Computations.Utils.TimeSpan
+      Control.Computations.Utils.TimeUtils
+      Control.Computations.Utils.Types
+      Control.Computations.Utils.VirtualTime
       Paths_incremental_computations
   hs-source-dirs:
       bench
+      src
   default-extensions:
       BangPatterns
       DeriveDataTypeable
@@ -410,7 +455,8 @@ benchmark incremental-computations-bench
       ViewPatterns
   ghc-options: -O2 -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-export-lists -Wmissing-home-modules -Wno-name-shadowing -Wpartial-fields -Wredundant-constraints -threaded -rtsopts "-with-rtsopts=-A64m -T"
   build-depends:
-      aeson ==2.2.*
+      QuickCheck ==2.15.*
+    , aeson ==2.2.*
     , async ==2.2.*
     , base >=4.7 && <5
     , base16-bytestring ==1.0.*
@@ -420,7 +466,6 @@ benchmark incremental-computations-bench
     , exceptions ==0.10.*
     , filepath ==1.5.*
     , hashable ==1.5.*
-    , incremental-computations
     , large-hashable ==0.1.*
     , megaparsec ==9.7.*
     , monad-control ==1.0.*

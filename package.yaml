@@ -232,6 +232,15 @@ benchmarks:
     main:                Main.hs
     source-dirs:
     - bench
+    - src
+    # ^ 'src' alongside 'bench': mirrors the tests: stanza below. Needed so
+    # this benchmark can reach Control.Computations.CompEngine.ObservingStateIf
+    # (shared with test/, and deliberately not in exposed-modules -- see
+    # that module's haddock) without adding it to the public API. As with
+    # tests:, this means the benchmark compiles its own copy of src rather
+    # than linking the built library, so 'incremental-computations' is not
+    # (and must not be) listed as a dependency below -- doing both would
+    # give GHC two distinct compiled copies of the same modules.
     ghc-options:
     - -threaded
     - -rtsopts
@@ -248,7 +257,12 @@ benchmarks:
     # through as literal text and the tokenizer still splits on the space.
     - '"-with-rtsopts=-A64m -T"'
     dependencies:
-    - incremental-computations
+    - QuickCheck >= 2.15 && < 2.16
+    # ^ not used directly by this benchmark; needed because compiling src
+    # directly (see the source-dirs note above) pulls in the library's own
+    # Arbitrary-instance modules (TimeSpan, DataSize, MultiMap,
+    # PriorityAgingQueue), which import it -- same reason tests: below
+    # lists it.
     - process
 
 tests:
