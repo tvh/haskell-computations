@@ -25,14 +25,13 @@
  reliably anyway, since GHC's optimizer is free to float, share, or
  eliminate a "pure" IO action that doesn't genuinely vary per call, and in
  practice does exactly that -- this benchmark counts at the engine's own
- interface boundary instead: 'observingStateIf' (shared with @test/@, see
- "Control.Computations.CompEngine.ObservingStateIf") wraps
- 'CompEngineStateIf' with a hook run on every call to
+ interface boundary instead: 'countingStateIf' wraps 'CompEngineStateIf'
+ (see "Control.Computations.CompEngine.Core") so that every call to
  'capEvaluationStarted' -- which "Control.Computations.CompEngine.Impl"
- calls exactly once, immediately before running each computation body.
- Here that hook bumps an 'IORef'; the original implementation still runs
- straight afterwards. This is ordinary, honest IO in the orchestrating
- driver thread, and observes precisely the same event the Rust benchmark's
+ calls exactly once, immediately before running each computation body --
+ first bumps an 'IORef', then delegates to the original implementation.
+ This is ordinary, honest IO in the orchestrating driver thread, and
+ observes precisely the same event the Rust benchmark's
  @run_counter.fetch_add@ observes, just from outside the body rather than
  inside it. Comp bodies themselves stay pure 'CompM' code with no counting
  plumbing at all.
@@ -43,7 +42,6 @@ module Control.Computations.Demos.Bench.Main (benchMain) where
 -- LOCAL
 ----------------------------------------
 import Control.Computations.CompEngine
-import Control.Computations.CompEngine.ObservingStateIf
 import Control.Computations.FlowImpls.HashMapFlow
 import Control.Computations.Utils.Logging
 import Control.Computations.Utils.TimeSpan
@@ -110,9 +108,37 @@ scaledLevelSizes scale = map scaleOne baseLevelSizes
 -- Counting interceptor + adapted driver
 ----------------------------------------
 
+{- | Wraps a 'CompEngineStateIf' so every call to 'capEvaluationStarted' --
+ the engine's own per-instance "about to run this computation body" hook,
+ called exactly once immediately before each real (non-cache-hit)
+ invocation -- first bumps @ref@, then delegates to the original
+ implementation. All other fields delegate unchanged.
+
+ Built as an explicit record rather than a record update
+ (@orig { capEvaluationStarted = ... }@): most fields are higher-rank
+ (@forall a. IsCompResult a => ...@), and GHC rejects record-update syntax
+ against a record with higher-rank fields.
+-}
+countingStateIf :: IORef Int -> CompEngineStateIf IO -> CompEngineStateIf IO
+countingStateIf ref orig =
+  CompEngineStateIf
+    { lookupCapResult = lookupCapResult orig
+    , capEvaluationStarted = \cap -> do
+        atomicModifyIORef' ref (\n -> (n + 1, ()))
+        capEvaluationStarted orig cap
+    , capEvaluationFinished = capEvaluationFinished orig
+    , dequeueGivenCap = dequeueGivenCap orig
+    , dequeueNextCap = dequeueNextCap orig
+    , staleQueueSize = staleQueueSize orig
+    , enqueueStaleCaps = enqueueStaleCaps orig
+    , trackOutput = trackOutput orig
+    , getCompSinkOuts = getCompSinkOuts orig
+    , getQueue = getQueue orig
+    }
+
 {- | Adapted from 'compDriver'' (see
  "Control.Computations.CompEngine.Driver"): identical driver-loop wiring,
- but wraps the state-if record with 'observingStateIf' before building
+ but wraps the state-if record with 'countingStateIf' before building
  'CompEngineIfs', so every genuine computation-body invocation is honestly
  counted in @counterRef@.
 -}
@@ -130,7 +156,7 @@ benchCompDriver counterRef runVar withRegisteredFlows wireComps startVal = do
     let ifs =
           CompEngineIfs
             { ce_compFlowRegistry = reg
-            , ce_stateIf = observingStateIf (\_cap -> atomicModifyIORef' counterRef (\n -> (n + 1, ()))) stateIf
+            , ce_stateIf = countingStateIf counterRef stateIf
             }
         rifs =
           RunCompEngineIf

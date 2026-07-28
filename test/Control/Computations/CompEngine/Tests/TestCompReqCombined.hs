@@ -23,8 +23,8 @@ import Control.Computations.CompEngine.CompFlowRegistry
 import Control.Computations.CompEngine.CompSink
 import Control.Computations.CompEngine.CompSrc
 import Control.Computations.CompEngine.Core
-import Control.Computations.CompEngine.ObservingStateIf
 import Control.Computations.CompEngine.Run
+import Control.Computations.CompEngine.Tests.ObservingStateIf
 import Control.Computations.CompEngine.Tests.TestHelper
 import Control.Computations.CompEngine.Types
 import Control.Computations.FlowImpls.HashMapFlow

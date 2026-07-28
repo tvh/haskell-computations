@@ -90,7 +90,7 @@ initCompEngineTest = initCompEngineTestWith id
 
 {- | Like 'initCompEngineTest', but lets the caller wrap the
  'CompEngineStateIf' this test drives its engine with -- e.g. with
- 'Control.Computations.CompEngine.ObservingStateIf.observingStateIf' to
+ 'Control.Computations.CompEngine.Tests.ObservingStateIf.observingStateIf' to
  record which caps actually get (re-)evaluated. @id@ (i.e.
  'initCompEngineTest') is the no-observation default.
 -}

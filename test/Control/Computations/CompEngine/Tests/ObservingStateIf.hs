@@ -3,22 +3,17 @@
 {- | A single generic 'CompEngineStateIf' wrapper that observes every genuine
  computation-body evaluation.
 
- Factored out of what used to be a benchmark-only @countingStateIf@ in
- "Control.Computations.Demos.Bench.Main": the @bench:@ and @test:@ cabal
- stanzas don't share a source directory (@test:@ compiles @src@ directly
- alongside @test@; @bench@ only has its own directory -- see the
- @benchmarks:@ stanza in @package.yaml@), so a helper both need has to live
- somewhere both can reach. This module is other-modules of the library (not
- listed in @exposed-modules@ in @package.yaml@ -- it has no business being
- part of the public API), reachable by @test:@ because it recompiles @src@
- directly, and by @bench:@ because its stanza does the same.
-
- Not re-exported from the public "Control.Computations.CompEngine" facade,
- for the same reason: this exists purely to instrument the engine's own
- state-if for tests and benchmarks, not as something a library consumer
- wires into a real engine.
+ Test-only: the @tests:@ stanza in @package.yaml@ already compiles @src@
+ alongside @test@ (see that stanza's @source-dirs@), so this lives in the
+ test tree rather than as unexposed library code -- it's scaffolding for
+ these tests, not part of the engine. The benchmark has its own local
+ @countingStateIf@ (see
+ "Control.Computations.Demos.Bench.Main") rather than importing this: the
+ benchmark stanza deliberately links the built library instead of
+ recompiling @src@, so it can't reach a test-tree module (or an unexposed
+ library one) without giving that up.
 -}
-module Control.Computations.CompEngine.ObservingStateIf (
+module Control.Computations.CompEngine.Tests.ObservingStateIf (
   observingStateIf,
 ) where
 
