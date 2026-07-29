@@ -50,7 +50,9 @@ import qualified Data.Foldable as F
 import qualified Data.HashMap.Strict as HashMap
 import qualified Data.HashSet as HashSet
 import Data.IORef
+import Data.List (sortOn)
 import qualified Data.Map.Strict as Map
+import Data.Ord (Down (..))
 import qualified Data.Text as T
 import Data.Time.Clock
 import Data.Typeable
@@ -122,6 +124,80 @@ initStateIf shouldValidate =
     let close = reportLockStats >> liftIO (putMVar exitMVar ())
     return (stateIf, close)
 
+-- | Per-method call counter and elapsed-time accumulator, one instance per
+-- 'CompEngineStateIf' field. Same shape as the aggregate @callsRef@\/
+-- @holdNsRef@ pair in 'setupSimpleStateIf' below, just multiplied by ten.
+data MethodStats = MethodStats
+  { ms_calls :: !(IORef Word64)
+  , ms_ns :: !(IORef Word64)
+  }
+
+newMethodStats :: IO MethodStats
+newMethodStats = MethodStats <$> newIORef 0 <*> newIORef 0
+
+-- | Time one call, bumping @stats@'s counters around it. Unlike the
+-- aggregate instrumentation in 'ssif_withState' (which only sees time spent
+-- *inside* the 'withMVar' body), this wraps the whole method call as seen
+-- from 'Impl.hs' -- lock wait included, not just lock hold -- because that is
+-- the only boundary a per-method wrapper *can* sit at without threading a
+-- method tag down into 'ssif_withState' itself (see this module's own
+-- haddock on why the flag-off path must stay a single baked-in closure, and
+-- "Tests/ObservingStateIf.hs" for the same per-field wrapping shape used
+-- here). See 'reportLockStats'\'s haddock for why that makes these numbers
+-- not directly comparable to the aggregate hold-time line.
+timeMethod :: MethodStats -> IO a -> IO a
+timeMethod stats act = do
+  t0 <- getMonotonicTimeNSec
+  x <- act
+  t1 <- getMonotonicTimeNSec
+  modifyIORef' (ms_calls stats) (+ 1)
+  modifyIORef' (ms_ns stats) (+ (t1 - t0))
+  return x
+
+-- | Print the ten methods' stats as one table, sorted by total time
+-- descending, alongside how much of the *instrumented* total (sum of the
+-- ten methods' own totals, not the aggregate hold-time line) each accounts
+-- for.
+printMethodStatsTable :: [(String, MethodStats)] -> IO ()
+printMethodStatsTable methods = do
+  rows <- forM methods $ \(name, stats) -> do
+    calls <- readIORef (ms_calls stats)
+    ns <- readIORef (ms_ns stats)
+    return (name, calls, ns)
+  let totalNs = sum [ns | (_, _, ns) <- rows]
+      totalCalls = sum [c | (_, c, _) <- rows]
+      sorted = sortOn (\(_, _, ns) -> Down ns) rows
+      pct ns = if totalNs == 0 then 0 else 100 * fromIntegral ns / fromIntegral totalNs :: Double
+      meanNs calls ns = if calls == 0 then 0 else fromIntegral ns / fromIntegral calls :: Double
+  putStrLn "=== COMP_ENGINE_LOCK_STATS: per-method breakdown ==="
+  putStrLn
+    ( "NOTE: each row times the *whole* CompEngineStateIf method call (wait "
+        ++ "for the lock, plus holding it), not lock hold time alone -- it is "
+        ++ "not the same quantity as the aggregate hold-time line above, and "
+        ++ "the two should not be read as measuring the same thing (see "
+        ++ "Run.hs's 'timeMethod' haddock)."
+    )
+  printf
+    "%-24s %10s %14s %12s %10s\n"
+    ("method" :: String)
+    ("calls" :: String)
+    ("total (s)" :: String)
+    ("mean (ns)" :: String)
+    ("% of total" :: String)
+  forM_ sorted $ \(name, calls, ns) ->
+    printf
+      "%-24s %10d %14.6f %12.1f %9.2f%%\n"
+      name
+      calls
+      (fromIntegral ns / (1e9 :: Double))
+      (meanNs calls ns)
+      (pct ns)
+  printf
+    "%-24s %10d %14.6f\n"
+    ("TOTAL" :: String)
+    totalCalls
+    (fromIntegral totalNs / (1e9 :: Double))
+
 {- | 'SifState' is genuinely, internally mutable (growable unboxed/boxed
  vectors behind 'Data.IORef.IORef's) rather than an immutable value swapped
  through a 'TVar' -- running arbitrary in-place vector mutation inside an
@@ -170,6 +246,52 @@ setupSimpleStateIf shouldValidate =
                         modifyIORef' holdNsRef (+ (t1 - t0))
                         return x
                 }
+            baseCeif = mkSimpleCompEngineStateIf stateIf
+        -- One 'MethodStats' per 'CompEngineStateIf' field, so
+        -- 'ssif_withState's aggregate (which can't tell methods apart, see
+        -- its own haddock) can be broken down by which of the ten methods
+        -- actually did the work.
+        msLookupCapResult <- newMethodStats
+        msCapEvaluationStarted <- newMethodStats
+        msCapEvaluationFinished <- newMethodStats
+        msDequeueGivenCap <- newMethodStats
+        msDequeueNextCap <- newMethodStats
+        msStaleQueueSize <- newMethodStats
+        msEnqueueStaleCaps <- newMethodStats
+        msTrackOutput <- newMethodStats
+        msGetCompSinkOuts <- newMethodStats
+        msGetQueue <- newMethodStats
+        -- Written out as an explicit record rather than a record update
+        -- (@baseCeif { lookupCapResult = ... }@): most fields are
+        -- higher-rank (@forall a. IsCompResult a => ...@), and GHC rejects
+        -- record-update syntax against a record with higher-rank fields --
+        -- same reason "Tests/ObservingStateIf.hs" builds its wrapper this
+        -- way.
+        let instrumentedCeif =
+              CompEngineStateIf
+                { lookupCapResult = \cap -> timeMethod msLookupCapResult (lookupCapResult baseCeif cap)
+                , capEvaluationStarted = \cap -> timeMethod msCapEvaluationStarted (capEvaluationStarted baseCeif cap)
+                , capEvaluationFinished = \cap deps mres -> timeMethod msCapEvaluationFinished (capEvaluationFinished baseCeif cap deps mres)
+                , dequeueGivenCap = \cap -> timeMethod msDequeueGivenCap (dequeueGivenCap baseCeif cap)
+                , dequeueNextCap = timeMethod msDequeueNextCap (dequeueNextCap baseCeif)
+                , staleQueueSize = timeMethod msStaleQueueSize (staleQueueSize baseCeif)
+                , enqueueStaleCaps = \deps -> timeMethod msEnqueueStaleCaps (enqueueStaleCaps baseCeif deps)
+                , trackOutput = \cap outs -> timeMethod msTrackOutput (trackOutput baseCeif cap outs)
+                , getCompSinkOuts = \s -> timeMethod msGetCompSinkOuts (getCompSinkOuts baseCeif s)
+                , getQueue = timeMethod msGetQueue (getQueue baseCeif)
+                }
+            methodStatsTable =
+              [ ("lookupCapResult", msLookupCapResult)
+              , ("capEvaluationStarted", msCapEvaluationStarted)
+              , ("capEvaluationFinished", msCapEvaluationFinished)
+              , ("dequeueGivenCap", msDequeueGivenCap)
+              , ("dequeueNextCap", msDequeueNextCap)
+              , ("staleQueueSize", msStaleQueueSize)
+              , ("enqueueStaleCaps", msEnqueueStaleCaps)
+              , ("trackOutput", msTrackOutput)
+              , ("getCompSinkOuts", msGetCompSinkOuts)
+              , ("getQueue", msGetQueue)
+              ]
             -- Reports how long the engine-state lock was actually *held*
             -- (time inside this 'withMVar' body, from just before @f st@ to
             -- just after @validateSifState@), not how long any caller spent
@@ -182,13 +304,24 @@ setupSimpleStateIf shouldValidate =
             -- future parallel-engine-threads project) -- at that point this
             -- number alone would understate actual lock cost and a wait-time
             -- counter would need adding alongside it.
+            --
+            -- The per-method table printed alongside it measures a
+            -- *different* quantity (see 'timeMethod's haddock): whole-call
+            -- time (wait + hold) per method, not hold time alone. The two
+            -- numbers are related but not equal, and are not expected to
+            -- match exactly -- only to be in the same ballpark, since on
+            -- this single-writer sequential driver wait time is ~0 and the
+            -- per-method overhead (two extra 'getMonotonicTimeNSec' calls
+            -- and two 'IORef' bumps per call, over and above the aggregate's
+            -- own) is the only structural difference between them.
             reportLockStats = do
               calls <- readIORef callsRef
               holdNs <- readIORef holdNsRef
               let holdS = fromIntegral holdNs / (1e9 :: Double)
               putStrLn "=== COMP_ENGINE_LOCK_STATS ==="
               printf "engine-state lock: %d calls, %d ns total hold time (%.6f s)\n" calls holdNs holdS
-        return (mkSimpleCompEngineStateIf stateIf, reportLockStats)
+              printMethodStatsTable methodStatsTable
+        return (instrumentedCeif, reportLockStats)
       else do
         let stateIf =
               SimpleStateIf
