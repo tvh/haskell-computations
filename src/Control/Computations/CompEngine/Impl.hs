@@ -712,16 +712,30 @@ evalCompAp outerCap =
       CompReqFlow (CompFlowReqSink sink req) -> doCompSinkReq env sink req cont
       CompReqEval compAp -> doAnyEvalReq env compAp cont
       CompReqCache compAp -> doAnyCacheReq env compAp cont
-      CompReqCombined reqA reqB
-        | not (isCompReqCombined reqA), not (isCompReqCombined reqB) -> do
-            -- Fast path for two *leaves* combined directly (e.g. plain
-            -- `f <$> a <*> b`, the overwhelmingly common shape a batch of
-            -- exactly two suspended actions takes) -- today's pre-Prep code,
-            -- kept verbatim rather than routed through traverseCompReq/Prep.
-            -- Measured: at ~1.1M cap evaluations, going through Prep even
-            -- for this shape cost a small but real (~1.5-2%, beyond
-            -- run-to-run noise) cold-eval wall-time regression for no
-            -- change in max_live_bytes, so it isn't worth paying here.
+      CompReqCombined reqA reqB -> do
+        reg <- CompEngineM (asks (ce_compFlowRegistry . ce_compEngineIfs))
+        width <- liftIO (readCompFlowConcurrency reg)
+        if not (isCompReqCombined reqA)
+          && not (isCompReqCombined reqB)
+          && unCompFlowConcurrency width == 1
+          then do
+            -- Fast path for two *leaves* combined directly at width 1 (e.g.
+            -- plain `f <$> a <*> b`, the overwhelmingly common shape a batch
+            -- of exactly two suspended actions takes) -- today's pre-Prep
+            -- code, kept verbatim rather than routed through
+            -- traverseCompReq/Prep. At width 1 this is the *only* path such
+            -- a batch ever takes, since no source leaf could be dispatched
+            -- as a job anyway (prepSrcLeaf only queues a job when width > 1
+            -- and the instance is 'FlowConcurrent'). Measured: at ~1.1M cap
+            -- evaluations, going through Prep even for this shape cost a
+            -- small but real (~1.5-2%, beyond run-to-run noise) cold-eval
+            -- wall-time regression for no change in max_live_bytes, so it
+            -- isn't worth paying here -- that measurement was itself taken
+            -- at width 1, so gating this shortcut on width costs it
+            -- nothing. Above width 1, a two-leaf batch instead falls
+            -- through to the general path below and goes through Prep like
+            -- everything else, so its source leaves can actually be queued
+            -- and overlap.
             -- Both branches share `env`, so whatever either records via
             -- tellDep lands directly in the shared accumulator; no manual
             -- union of per-branch dependency sets is needed.
@@ -732,11 +746,11 @@ evalCompAp outerCap =
                     res <- (,) <$> compMFinished resA <*> compMFinished resB
                     contToCompM (cont res)
             loop env resCont
-        | otherwise -> do
+          else do
             -- General path, for batches with more than two leaves (deeper
-            -- CompReqCombined nesting): flatten the whole thing to its
-            -- leaves in one traversal (see traverseCompReq and Prep)
-            -- instead of recursing node by node.
+            -- CompReqCombined nesting), or a two-leaf batch at width > 1:
+            -- flatten the whole thing to its leaves in one traversal (see
+            -- traverseCompReq and Prep) instead of recursing node by node.
             --
             -- Dispatch-then-drain, never overlapping dispatchJobs with the
             -- engine phase that follows it, for three reasons:
@@ -762,8 +776,6 @@ evalCompAp outerCap =
             -- during the dispatch phase (see the golden trace in
             -- TestCompReqCombined, and its width-8 companion assertion
             -- that only *src* trace entries may float).
-            reg <- CompEngineM (asks (ce_compFlowRegistry . ce_compEngineIfs))
-            width <- liftIO (readCompFlowConcurrency reg)
             (jobs, enginePhase) <- liftIO (unPrep (traverseCompReq (prepLeaf reg width) req))
             liftIO (dispatchJobs (unCompFlowConcurrency width) (srcJobsToList jobs))
             inner <- enginePhase

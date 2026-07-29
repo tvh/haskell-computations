@@ -324,3 +324,62 @@ test_cancelTearsDownBlockedWorker =
     threadDelay 50000
     activityAfter <- readIORef activityRef
     assertEqual 0 activityAfter
+
+----------------------------------------------------------------------------
+-- 6: the plain two-leaf shape `(,) <$> compSrcReq srcA .. <*> compSrcReq
+-- srcB ..` -- the overwhelmingly common shape a batch of exactly two
+-- suspended actions takes -- must still let its two FlowConcurrent source
+-- leaves genuinely overlap once width > 1. doSuspended's CompReqCombined
+-- case (Impl.hs) used to take a fast path whenever neither child was
+-- itself a CompReqCombined, with no regard for width at all, so a plain
+-- `f <$> a <*> b` never reached dispatchJobs at any width -- only batches
+-- of three or more leaves (reached via traverse, as in the mutex/dedup
+-- tests above) ever got dispatched as jobs. The fast path is now taken
+-- only at width 1, where it is provably a no-op change (no source leaf
+-- could ever be dispatched as a job at width 1 anyway).
+----------------------------------------------------------------------------
+
+twoLeafMainCompDef
+  :: TypedCompSrcId ScriptedSrc -> TypedCompSrcId ScriptedSrc -> CompDef () ()
+twoLeafMainCompDef srcAId srcBId =
+  defineComp "two-leaf-main" inMemoryShowCaching $ \() ->
+    void $ (,) <$> compSrcReq srcAId ScriptedReq <*> compSrcReq srcBId ScriptedReq
+
+-- | Two distinct 'FlowConcurrent' instances sharing one @inFlight@\/
+-- @highWater@ pair, so 'highWater' after the run is the *global* high-water
+-- mark across both -- 2 only if the two leaves' 'compSrcExecute' calls
+-- genuinely ran at the same time, not merely if each instance's own calls
+-- never overlapped themselves (there's only one call per instance here
+-- anyway).
+runTwoLeafOverlapCase :: Int -> IO Int
+runTwoLeafOverlapCase width =
+  do
+    inFlight <- newTVarIO 0
+    highWater <- newTVarIO 0
+    let srcA = ScriptedSrc "two-leaf-a" FlowConcurrent (mkOverlapAction inFlight highWater)
+        srcB = ScriptedSrc "two-leaf-b" FlowConcurrent (mkOverlapAction inFlight highWater)
+    reg <- newCompFlowRegistry
+    setCompFlowConcurrency reg (mkCompFlowConcurrency width)
+    registerCompSrc reg srcA
+    registerCompSrc reg srcB
+    runOnce reg (twoLeafMainCompDef (typedCompSrcIdOf srcA) (typedCompSrcIdOf srcB))
+    readTVarIO highWater
+
+-- | Guarded on 'rtsSupportsBoundThreads' for the same reason as
+-- test_flowConcurrentSourceGenuinelyOverlapsAtWidth8 above: without real
+-- OS-thread concurrency, width > 1 is deliberately a no-op.
+test_twoLeafBatchGenuinelyOverlapsAtWidth4 :: IO ()
+test_twoLeafBatchGenuinelyOverlapsAtWidth4 =
+  when rtsSupportsBoundThreads $
+    do
+      hw <- runTwoLeafOverlapCase 4
+      assertEqual 2 hw
+
+-- | Same two-leaf shape, but at width 1 -- the fast path's own domain --
+-- where the two source leaves must run one at a time, exactly as before
+-- jobs existed.
+test_twoLeafBatchNeverOverlapsAtWidth1 :: IO ()
+test_twoLeafBatchNeverOverlapsAtWidth1 =
+  do
+    hw <- runTwoLeafOverlapCase 1
+    assertEqual 1 hw
