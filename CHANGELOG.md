@@ -8,6 +8,41 @@ and this project adheres to the
 
 ## Unreleased
 
+### Added
+
+- `FlowConcurrency(..)` and a defaulted `compSrcConcurrency :: s ->
+  FlowConcurrency` method on `CompSrc`, so a source can declare that the
+  engine may run several of its `compSrcExecute` calls concurrently.
+  Defaults to `FlowSerial`, so no existing instance's behaviour changes;
+  `HashMapFlow`, `TimeSrc`, and `FileSrc` now declare `FlowConcurrent`.
+- `CompFlowConcurrency`, `mkCompFlowConcurrency`, `setCompFlowConcurrency`,
+  and `readCompFlowConcurrency` on `CompFlowRegistry`: a width knob for how
+  many `FlowConcurrent` source leaves of an applicative batch
+  (`CompReqCombined`) may be dispatched to a bounded worker pool at once,
+  instead of running one at a time on the engine thread. Default width 1 is
+  exactly the historical behaviour; `newCompFlowRegistry`'s signature is
+  unchanged, so this is purely additive. See the README's "Concurrent flow
+  execution" section and `docs/benchmark-notes.md`'s Stage 5 for the design,
+  what still runs serially (cap evaluation, cache lookups, sink writes), and
+  measured numbers (up to 2.6x cold-eval speedup on a workload shaped to use
+  it; ~1.2x overhead when there's no source latency to hide).
+- A second benchmark, the Hospital pipeline benchmark
+  (`HOSPITAL_BENCH=1 stack bench`), exercising concurrent source dispatch
+  with a graph that builds real applicative batches against sources with
+  configurable latency — something the existing scale benchmark's graph
+  cannot do. Env vars: `HOSPITAL_BENCH_SCALE`, `HOSPITAL_BENCH_SRC_LATENCY_US`,
+  `HOSPITAL_BENCH_CONCURRENCY`. See the README's Benchmark section.
+- `COMP_ENGINE_LOCK_STATS` env var: when set, instruments the engine's
+  single state-lock with acquisition count and total hold time, printed at
+  engine shutdown. Off by default; adds no overhead when unset.
+
+### Fixed
+
+- `stack bench` (the plain scale benchmark, no env vars) errored out before
+  printing its memory section, because the benchmark's baked-in
+  `-with-rtsopts=-A64m` was missing `-T`, so `GHC.Stats.getRTSStats` threw.
+  User-visible since it broke the exact command the README documents.
+
 ## 0.2.0.0 - 2026-07-25
 
 This release is a fork of the original `incremental-computations` package

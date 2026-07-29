@@ -706,6 +706,21 @@ the space** — no build error, just a wrong runtime default. Two separate
 `-with-rtsopts=` entries concatenate correctly (verified via
 `+RTS --info`).
 
+> **⚠ Correction (surfaced by Stage 5's work):** the claim above that two
+> separate `-with-rtsopts=` entries concatenate is **wrong** — `-with-rtsopts`
+> is single-valued; GHC keeps only the last occurrence, and a second entry
+> silently drops the first rather than joining it. Per commit `24b3ad5`
+> (blog-post review, prior to this doc's Stage 5): once `e3f500a` (Stage 4a)
+> added `-with-rtsopts=-A64m` as a *second* entry alongside the executable's
+> existing `-with-rtsopts=-N2`, `-N2` was silently dropped — "every
+> measurement was on 1 capability" from that point on, not caught until the
+> blog post's repro commands were run against a clean build. This doc's own
+> stage sections were not individually re-audited against that fact; treat
+> any `-N2`-attributed conclusion from Stage 4a onward with that in mind. The
+> benchmark's own stanza got the correct quoted single-entry form
+> (`'"-with-rtsopts=-A64m -T"'`) in Stage 5 below, precisely to not repeat
+> this.
+
 Also noted: `-A64m`'s RSS-after-settle is noisy run to run (1056–1492 MB);
 the win is unambiguous on the time axis only. One `--nonmoving-gc` run
 showed RSS *dropping* 1594 → 767 MB mid-run (pages returned to the OS),
@@ -1214,3 +1229,331 @@ layout itself — 4e, where it cost 683× duplication.
 - The persistence port itself (Interlude 3 sketches it: LMDB store, revival
   from `(Comp, typed param)`, STM-based debounced flush) — out of scope until
   the engine-only numbers are understood.
+
+## Stage 5 — concurrent execution of applicative source batches (commits `b933dd1`…`71bf2a2`)
+
+A different kind of change from Stages 0–4: not a diet or a constant-factor
+squeeze over the existing engine, but a new capability — running the source
+leaves of an applicative batch (`CompReqCombined`) concurrently, bounded by a
+width knob, for sources that declare themselves safe for it. Off by default
+(width 1 reproduces every prior stage's numbers exactly, unchanged code
+path). Alongside it: a second benchmark purpose-built to exercise this (the
+existing one structurally cannot, see below), an engine-state-lock
+instrumentation flag, and a `stack bench` packaging fix.
+
+### Before: `CompReqCombined` was fully sequential
+
+`doSuspended`'s `CompReqCombined reqA reqB` case (`Impl.hs`) recursed into
+`doSuspended` for each branch in turn — `resA <- doSuspended env reqA return;
+resB <- doSuspended env reqB return` — sharing `env`'s dependency accumulator
+but doing each branch's suspend/resume work strictly one after the other, on
+the engine thread, regardless of what either branch actually was (a cap
+eval, a cache lookup, a source read, a sink write). The code carried a literal
+`-- TODO: Make this bit parrallel` at that case. A deeper batch (nested
+`CompReqCombined`, e.g. a wide `traverse`-built applicative) recursed the
+same way node by node.
+
+### Design
+
+**Declared per-source concurrency.** `CompSrc` gained a defaulted method,
+`compSrcConcurrency :: s -> FlowConcurrency` (`FlowSerial | FlowConcurrent`,
+default `FlowSerial`) — opt-in, not opt-out, so an existing instance is
+unaffected until its author actively marks it safe. The three shipped
+sources were marked `FlowConcurrent`, each justified from its own
+`executeImpl`: `HashMapFlow` is a `readTVarIO` plus a pure lookup, `TimeSrc`
+is a single `atomically` block, `FileSrc`'s only in-process state is the
+`TVar`-guarded `FileWatch` — the read/stat pair around it is a filesystem
+TOCTOU race that already exists single-threaded (the background poll thread
+can change the file in between), so concurrency doesn't make it worse.
+
+**A width knob on the registry.** `CompFlowRegistry` gained
+`CompFlowConcurrency` (an `Int` wrapper floored at 1 by
+`mkCompFlowConcurrency`) plus `setCompFlowConcurrency`/
+`readCompFlowConcurrency`. Default width 1 — no worker pool, every leaf
+inline — is exactly the historical behaviour. The width lives on the
+registry rather than on `CompEngineIfs`/`RunCompEngineIf`/`compDriver`'s own
+type specifically so nothing else has to change signature to thread it
+through: `Impl.hs` already has the registry in hand at every flow-request
+site, and `compDriver`/`compDriver'` already construct a fresh registry and
+hand it to the caller's `withRegisteredFlows` callback before running
+anything — so a caller sets the width from inside that same callback, no
+driver fork required.
+
+**Flattening a batch to its leaves.** `CompReqLeaf` (`CompLeafEval`/
+`CompLeafCache`/`CompLeafSrc`/`CompLeafSink` — everything a `CompReq` can be
+built from except `CompReqCombined` itself, which only nests) plus
+`traverseCompReq :: Applicative f => (forall r. CompReqLeaf r -> f r) ->
+CompReq a -> f a` walk a `CompReq` tree down to its leaves left to right in
+one traversal, recombining through `f`, instead of the old node-by-node
+recursion. Ordering is `Applicative`'s own left-to-right sequencing, not
+anything `CompReq`-specific.
+
+**`Prep`, a four-layer applicative built by hand** (`IO (SrcJobs, CompEngineM
+(CompM a))`, not pulled from `Data.Functor.Compose` — a composition of
+lawful applicatives is itself lawful, so `Prep`'s laws follow structurally):
+the outer `IO` layer is where `prepSrcLeaf` decides, per source leaf, whether
+its `compSrcExecute` becomes a queued job or still runs inline; `SrcJobs` (a
+difference-list, `[IO ()] -> [IO ()]`, so a thousand-leaf batch's job list is
+still built in one pass rather than quadratically re-copied) accumulates
+queued work across leaves; `CompEngineM` is the engine-thread computation
+(cache lookups, `compSrcExecute`/`compSinkExecute` calls, recursive cap
+eval, or — for a leaf whose work was queued — reading that job's already-
+finished result back out of its slot); `CompM` is the leaf's own deferred
+result, combined via `CompM`'s own `compMAp` so a batch built this way keeps
+`compMAp`'s left-error bias and "both sides always run" guarantee.
+
+**Dispatch-then-drain, never overlapped with anything else.**
+`dispatchJobs width jobs` (`ConcUtils.hs`) runs a fixed pool of at most
+`width` workers — each pops the next job off a shared `IORef` queue via
+`atomicModifyIORef'`, so a ten-thousand-leaf batch still spawns at most
+`width` threads — built on `Async.replicateConcurrently_` (not a bare
+`forkIO` per worker) so an asynchronous exception unwinding the caller tears
+down every still-running worker with it, and blocks until every job has
+finished before returning. The `CompReqCombined` case calls
+`dispatchJobs` and only then runs `enginePhase` (the `CompEngineM` action
+`Prep` built), for three reasons: `allCompSrcChanges` folds every source's
+`compSrcWaitChanges` into one STM transaction on the engine thread and must
+never race a concurrently-running `compSrcExecute`; a nested batch (an eval
+leaf whose own body issues another wide batch) can't starve the pool, since
+every worker from the outer `dispatchJobs` call has already exited by the
+time `enginePhase` could recurse into `doSuspended` again; and reading a job
+leaf's slot back can then never block, because the job that fills it has
+unconditionally already finished. Each job is guarded by `trySync`
+(`ConcUtils.hs`): catches a synchronous exception into the leaf's own slot,
+but re-throws anything that `fromException`s to `SomeAsyncException` (so a
+genuine `Async.cancel` reaching a worker still propagates instead of being
+swallowed).
+
+**A leaf becomes a job only when three things hold**: `width > 1`, the
+leaf's resolved `CompSrc` instance reports `FlowConcurrent`, and
+`rtsSupportsBoundThreads` (without real OS-thread concurrency, handing work
+to the pool would only add `replicateConcurrently_`'s bookkeeping for no
+actual overlap — width > 1 is then a no-op rather than a pessimisation).
+Otherwise the leaf runs inline, byte-for-byte the same code path as before
+`Prep` existed. The pre-existing two-leaf fast path (`f <$> a <*> b`, the
+overwhelmingly common batch shape, kept as the old pre-`Prep` recursive code
+rather than routed through `traverseCompReq`/`Prep` — measured at ~1.1M cap
+evaluations to cost ~1.5–2% cold-eval wall time through `Prep` for no memory
+change) is gated on `width == 1` (`7246a03`): at width 1 it is the *only*
+path such a batch could take anyway, since no leaf could ever be dispatched
+as a job regardless; above width 1 a two-leaf batch falls through to the
+general `Prep` path so its source leaves can actually overlap.
+
+**Why only source leaves move off the engine thread.** Everything else a
+batch's leaves can be — cap evaluation, a cache lookup, a sink write — reads
+or writes the engine's single mutable state (`SifState`/`DefTable`, guarded
+by the one `MVar` `ssif_withState` takes — see the lock measurement below)
+and stays on the engine thread inside `enginePhase`, unchanged. A source's
+`compSrcExecute`, by contrast, is the one piece of work a `CompSrc` instance
+can *itself* promise is safe to run overlapped with itself
+(`compSrcConcurrency`) — the engine never has to reason about it, the source
+author does, once, per instance. That is also why sink writes and cap
+evaluation are explicitly not part of this change (see "What is not done"
+below): nothing analogous to `compSrcConcurrency` exists for them yet, and
+inventing it means reasoning about the shared engine state itself, not just
+one instance's own I/O.
+
+**Honest behavioural difference at width > 1**, documented on
+`setCompFlowConcurrency`: if one leaf throws, every other leaf in that batch
+has still had its `compSrcExecute` run by the time the exception is
+observed — every queued job is dispatched and drained together before any
+result is inspected. At the `Fail` level this already matches today's
+behaviour (`compMAp` runs both sides of every applicative combination
+unconditionally, by design). At the *exception* level it's new: at width 1,
+no worker pool exists, so a throwing leaf aborts the batch immediately and
+nothing after it runs. Both cases still surface only the leftmost failing
+leaf's exception, matching `compMAp`'s left-error bias.
+
+Tests: a new module, `TestCompFlowConcurrency.hs` (registry-level: blocking,
+throwing, and overlap-counting `CompSrc` fixtures, exercised at several
+widths), plus three invariant tests added to `TestCompReqCombined.hs` ahead
+of this change (`B.1` wide-batch dedup, `B.2` a golden leaf-ordering trace
+across source/eval/sink, `B.3` `compMAp`'s left-error bias) and a width-8
+companion to `B.2` asserting only *source* trace entries may float relative
+to the frozen golden order — everything else must not reorder. Full suite: **152 tests, all passing** (verified this session by running
+`stack test`). Not re-derived as a before/after delta against Stage 4i's
+145, the way earlier stages track it: this session did not capture a
+same-commit baseline before this stage's first commit, and Stage 1's own
+correction elsewhere in this doc is the standing reminder that a delta
+computed across sessions rather than within one is not reliable enough to
+report as a clean number.
+
+### The engine-state lock, measured
+
+`COMP_ENGINE_LOCK_STATS=1` instruments `setupSimpleStateIf`'s
+`ssif_withState` (`Run.hs`) with a wall-clock timer around the whole
+critical section (`withMVar lock $ \() -> ...`), read once at setup so the
+choice between the plain and instrumented closure is baked in rather than
+branched on every call — this is on the hottest path in the engine, millions
+of calls per run. It reports **hold** time (time spent inside the lock),
+not wait time — under today's fully-sequential `stepCompEngine`, calls into
+`CompEngineStateIf` never contend, so wait time is definitionally zero and
+hold time is the whole story. That stops being true the moment something
+makes concurrent calls into the same state interface (a future
+multi-threaded engine); at that point this number alone would understate
+lock cost.
+
+Existing benchmark, scale 1.0, default width (1):
+
+| metric | value |
+|---|---|
+| lock acquisitions | 7,577,638 |
+| total hold time | 4.731 s |
+| cold eval | 6.757 s |
+| live update | 0.818 s |
+| hold time / (cold + live) | **62.5%** |
+
+**What this does and does not mean.** 62.5% of measured wall time is spent
+inside the single global engine-state lock — but that is time doing
+state-layer *work* (cache reads/writes, dependency tracking, queue
+operations), not lock *overhead*: an uncontended `withMVar` costs
+nanoseconds, and nothing here makes the lock contended (there is exactly one
+caller). It matters because it bounds what a future multi-threaded engine
+could gain from running multiple cap evaluations concurrently, while that
+work stays serialised behind one lock: by Amdahl's law, about **1.5x** — a
+ceiling, not a target this stage's own change is trying to hit (this
+stage's concurrency is entirely on the source-I/O side, which never touches
+this lock while a leaf's `compSrcExecute` is actually running).
+
+### The new benchmark, and why the existing one cannot measure this
+
+The existing benchmark's bodies fan in dependencies with `forM_`/`mapM_`,
+which for `CompM` discard results via `(>>)` — the ordinary monadic
+`compMBind`, never the engine's own `<*>`/`compMAp`. It builds **zero**
+applicative batches, so `CompReqCombined` never exists in its graph and its
+width knob (wired for symmetry via `PERSIST_BENCH_CONCURRENCY`) is a
+documented no-op regardless of value. Its source (`HashMapFlow`) also has no
+latency to hide, so even a hypothetical batch would have nothing for
+concurrency to overlap.
+
+The Hospital benchmark (`bench/Control/Computations/Demos/Bench/Hospital.hs`,
+`HOSPITAL_BENCH=1 stack bench`) exists specifically to fix both: it enables
+`{-# LANGUAGE ApplicativeDo #-}` and fans in with `traverse` (never
+`mapM_`/`forM_`), so independent binds inside one comp body desugar into a
+real `<*>`-combined `CompReqCombined` batch; most source reads are
+genuinely multi-key against the same source instance (`vitalComp` reads 3
+keys, `labResultComp` 3, `medOrderComp` 2, `noteComp` 2), and
+`patientSummaryComp` is a deliberate 8-leaf batch reading one key from each
+of five separate source instances. `SystemSrc` (a `HashMapFlow`-shaped
+source with a configurable per-call `threadDelay`, standing in for real
+service latency, plus a call counter and a concurrency high-water mark)
+backs five instances, one per simulated clinical system
+(admissions/vitals/labs/pharmacy/notes). Graph: 1,000 patients across 20
+wards at the default scale, ~976 instances/patient (an exact analytic
+target, not sampled).
+
+Full scale, latency 0, width 1:
+
+| metric | value |
+|---|---|
+| instances | 976,063 (exactly the analytic target) |
+| patients / wards | 1,000 / 20 |
+| cold eval | 20.5 s |
+| live update | 0.0071 s / 8 reruns |
+| RSS | 5,265 MB |
+| `max_live_bytes` | 3,957 MB |
+| bytes/instance | 4,054 B |
+| source calls | 1,612,013 (99.94% inside a dispatchable batch) |
+
+For comparison, the existing benchmark, unchanged throughout (the
+no-regression guard, not a measurement of this feature): ~1.14M instances,
+cold ~6.5 s, live ~0.78 s, RSS 747 MB, `max_live_bytes` 365 MB.
+
+### The width × latency grid
+
+Scale 0.05 (50 patients), source latency 500 µs:
+
+| width | cold wall | speedup |
+|---|---|---|
+| 1 | 109.1 s | 1.00x |
+| 2 | 70.7 s | 1.54x |
+| 4 | 42.6 s | 2.56x |
+| 8 | 42.1 s | 2.59x |
+
+The plateau at width 4 is the expected shape, not a limitation of the
+dispatcher: the widest batch in this graph is 5 leaves
+(`patientSummaryComp`'s cross-system read), and most batches are 2–3 leaves,
+so width 8 has nothing left in any single batch to overlap.
+
+At latency 0, width > 1 costs roughly **1.2x** — dispatch overhead
+(`dispatchJobs`'s queue/pool machinery, the extra `IORef` slot per job) with
+no latency for concurrency to hide.
+
+### The source-key interning finding — a real opportunity, not a bug
+
+The Hospital benchmark's memory tracks *source-call count*, not instance
+count, at roughly **2,500 bytes per distinct source key** — very different
+from the existing benchmark's per-instance figure, because of what the two
+graphs' key distributions actually look like. The existing benchmark's
+300-key `make_kv` is shared across all ~1.14M instances; the Hospital graph
+deliberately never shares or pre-populates a key (every reading is its own
+clinical fact), so its ~1.6M source reads intern ~1.6M genuinely distinct
+keys. Each distinct key is interned **twice**: once in
+`SrcIndex`'s `KeyIntern` (the reverse source-key index) and once again in
+`DefTable`'s own per-def `SrcDepIntern` (the source-dependency table) — both
+boxed `HashMap` entries over a `ForAnyCompSrcDep`/`AnyCompSrcKey`
+existential. Both interning tables are correct, deliberate designs *for a
+shared-key workload* (see Stage 4e/4h above) — they simply are not being
+asked to do that here. That is why this benchmark needs ~4 GB where the
+existing one needs 365 MB, and it is a real, identified optimisation
+opportunity (deduplicating or restructuring how a genuinely-unshared key
+gets interned across two independent tables), not a defect in this stage's
+own code — `src/` is untouched by this stage.
+
+### What is NOT done
+
+- **Source-request deduplication and bundling.** Two leaves in the same
+  batch requesting the same key against the same instance still run as two
+  separate `compSrcExecute` calls (queued as two separate jobs, if both are
+  eligible) rather than being coalesced into one. Bundling would need a
+  batch-scoped identity for "same source, same request" recognized *before*
+  `prepSrcLeaf` decides how to run each leaf — today each leaf is prepared
+  independently, with no visibility into its siblings.
+- **Sinks moving off the engine thread.** `doCompSinkReqValue` still runs
+  `compSinkExecute` inline inside `enginePhase`, unconditionally. Nothing
+  analogous to `compSrcConcurrency` exists on `CompSink` — adding one would
+  need the same per-instance safety contract this stage built for sources,
+  plus deciding how a sink's own output-tracking bookkeeping
+  (`trackOutput`, `tellOutputs`) — currently engine-thread-only state
+  writes — behaves when the write itself has moved off-thread.
+- **Parallel cap evaluation.** Only source leaves — genuinely external I/O a
+  `CompSrc` instance vouches for — ever leave the engine thread; a
+  `CompLeafEval`/`CompLeafCache` leaf's cap evaluation always runs inside
+  `enginePhase`, still serialized behind the single engine-state lock
+  measured above. Running cap evaluations themselves concurrently would mean
+  making `SifState`/`DefTable` safe for concurrent access (today they
+  assume one caller, and the columnar mutable-column work of Stages 3–4 was
+  built on that assumption) — the lock measurement above is exactly the
+  ceiling (~1.5x) that work would be racing against, for a materially larger
+  engineering cost than this stage's source-leaf dispatch.
+
+### Tooling fixes landed alongside this stage
+
+- **`stack bench` was broken for the published command.** The benchmark's
+  `-with-rtsopts=-A64m` entry lacked `-T`, so `GHC.Stats.getRTSStats` threw
+  before the memory section ever printed — a user-visible bug, since
+  `-with-rtsopts=-A64m -T` cannot be two separate `ghc-options` entries (see
+  the correction above the Stage 4a section: a second `-with-rtsopts=`
+  entry replaces the first, it does not concatenate) and cannot be
+  unquoted either (Cabal's `ghc-options` field word-splits on whitespace, so
+  an unquoted `-A64m -T` becomes two GHC arguments and `-T` is rejected as
+  unknown). Fixed with a single quoted entry,
+  `'"-with-rtsopts=-A64m -T"'` (`0aca394`).
+- **`HOSPITAL_BENCH`** dispatches `bench/Main.hs` between the two
+  benchmarks (unset/`"0"` runs the existing one, still the default and the
+  no-regression guard; anything else runs the Hospital benchmark). Never
+  both in one process.
+
+### Disposition: kept
+
+Width 1 is the default and reproduces every prior stage's numbers exactly
+(no code path changes at width 1 beyond the two-leaf fast path's new width
+check, itself a no-op when width is already 1). The width knob is genuine,
+measured speedup up to 2.6x on a workload actually shaped to use it, at a
+bounded, honestly-reported cost (1.2x) when there is nothing to overlap.
+The three explicitly-not-done items above are each a materially separate
+piece of work, not oversights — deduplication needs batch-scoped leaf
+visibility that does not exist yet, sinks need their own safety contract,
+and parallel cap evaluation needs the engine's single state lock to stop
+being single first, which is exactly what the lock measurement in this
+stage quantifies the ceiling for.

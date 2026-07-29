@@ -262,7 +262,53 @@ $ stack bench
 $ PERSIST_BENCH_SCALE=0.1 stack bench
 ```
 
+A second benchmark, the Hospital pipeline benchmark, exercises concurrent
+source dispatch (see below) with a graph whose comp bodies build real
+applicative batches and whose source has configurable latency to hide —
+things the scale benchmark's graph structurally cannot do. Run it with:
+
+```
+$ HOSPITAL_BENCH=1 stack bench
+```
+
+Env vars: `HOSPITAL_BENCH_SCALE` (default `1.0`, ~1,000 patients across 20
+wards, ~976,000 instances) scales the patient/ward count continuously;
+`HOSPITAL_BENCH_SRC_LATENCY_US` (default `0`) adds a simulated per-call
+source latency, in microseconds, to stand in for a real service call;
+`HOSPITAL_BENCH_CONCURRENCY` (default `1`) sets the concurrent flow
+execution width (see below).
+
 [`docs/benchmark-notes.md`](docs/benchmark-notes.md) has measured numbers
-from prior runs.
+from prior runs, stage by stage, with what was kept and what was reverted.
 
 NOTE: those are working notes, not polished docs.
+
+## Concurrent flow execution
+
+By default, every request a comp body makes — even ones batched together
+via `<*>` into one `CompReqCombined` — runs one at a time on the engine
+thread. A `CompSrc` can declare it tolerates concurrent calls to its own
+`compSrcExecute` (`compSrcConcurrency`, defaulting to `FlowSerial`), and a
+`CompFlowRegistry` can be given a concurrency width above its default of 1;
+when both are true, the source leaves of a batch may be dispatched to a
+bounded worker pool instead of running inline. Everything else in a batch —
+cap evaluation, cache lookups, sink writes — still runs on the engine
+thread regardless.
+
+To turn it on, call `setCompFlowConcurrency` inside the `withRegisteredFlows`
+callback `compDriver`/`compDriver'` already hand you:
+
+```haskell
+compDriver
+  (\reg action -> do
+      setCompFlowConcurrency reg (mkCompFlowConcurrency 4)
+      registerCompSrc reg mySrc
+      action)
+  wireComps
+  ()
+```
+
+`HashMapFlow`, `TimeSrc`, and `FileSrc` all declare `FlowConcurrent`. A
+source that hasn't opted in stays serialized no matter how wide the
+registry's width is. See `docs/benchmark-notes.md`'s Stage 5 for the design
+and measured numbers.
