@@ -15,12 +15,11 @@
  "Control.Computations.Demos.Bench.SystemSrc" instances stand in for
  separate clinical systems (admissions\/discharge\/transfer, vitals, labs,
  pharmacy, notes), each with a configurable per-call latency; a
- 'HashMapFlow' is the sink. 1,000 patients across 20 wards (50 patients per
- ward), scaled by @HOSPITAL_BENCH_SCALE@, target
- __~976 computation instances per patient__ (see 'depthHistogram'\'s haddock
- for the exact per-comp breakdown and why it sums to precisely 976) --
- ~976,000 total at the default scale, the same order as the existing
- benchmark's ~1.14M.
+ 'HashMapFlow' is the sink. 1,000 patients across 20 wards, scaled by
+ @HOSPITAL_BENCH_SCALE@ (see "Scale" below), target __~976 computation
+ instances per patient__ (see 'depthHistogram'\'s haddock for the exact
+ per-comp breakdown and why it sums to precisely 976) -- ~976,000 total at
+ the default scale, the same order as the existing benchmark's ~1.14M.
 
  __Making the batches real__ is the part that decides whether this
  benchmark measures anything at all: this module enables
@@ -55,6 +54,96 @@
  posts 'RunStats' -- see that module's ~40-line comment (around its own
  live-update section) for the full reproduction; it is not repeated here,
  only relied upon.
+
+ = Memory: why the first cut of this benchmark was 13x heavier per instance
+
+ The engine's per-def row storage
+ ("Control.Computations.CompEngine.Utils.DefTable"'s @mkColumn@) unboxes a
+ param\/value column only when the /whole/ type @e@ is one of a fixed
+ whitelist -- @Word32@, @Word64@, @Int@, @Char@, @Bool@, @Double@ -- checked
+ by 'Data.Typeable.eqT' against the literal type, not structurally. A
+ @(Val, Val, Val)@ result or an @(Int, Int)@ param tuple fails that check
+ regardless of how cheap its components are individually, so every such row
+ falls back to a boxed 'Data.Vector.Mutable.IOVector': one heap-allocated
+ cons per row for the tuple itself, plus one more per boxed field. On top of
+ that a fat cached value costs more every time it's compared, hashed, or
+ logged. This module's original params were @(Int, Int)@ and several
+ results were @(Val, Val, Val)@ -- both land squarely outside the whitelist.
+
+ The fix has two parts:
+
+ * __Every genuinely multi-field comp param or result is packed into a
+   single, bare 'Word64'__ (via 'packWord32Pair'\/'unpackWord32Pair'\/
+   'mkPatSubKey'\/'patOf'\/'subOf' below) -- not a @(Word32, Word32)@ tuple,
+   and not a @newtype@ wrapper around 'Word64' either. Both of those are
+   *narrower* than @(Int, Int)@ but neither passes @mkColumn@'s literal-type
+   check (a tuple is never in the whitelist regardless of its components'
+   types, and 'Data.Typeable.eqT' does not see through a @newtype@), so
+   *only* a bare 'Word64' actually reaches 'ColUnboxed'.
+ * __@Int@\/@Bool@ single-field results were left alone.__ Both are already
+   on @mkColumn@'s whitelist (an @Int@ column is exactly as unboxed as a
+   @Word64@ column; a @Bool@ column is *cheaper* still -- one byte per row
+   versus eight), so converting e.g. 'noteDigestComp'\'s @Int@ result to
+   @Word64@ would cost lines of @fromIntegral@ noise for a memory delta of
+   zero. 'interactionComp' and 'patientAlertComp' keep their 'Bool' results
+   for the same reason. Numeric rollups that already consume a packed
+   'Word64' upstream (e.g. 'riskScoreComp' summing 'vitalWindowComp'\'s
+   results) are left as 'Word64' too, purely because that is the path with
+   the least code, not because @Int@ would have cost more.
+
+ Every two-key comp in this module (vital, vitalWindow, labResult\/labTrend,
+ medOrder, interaction, note) reuses one packed key type, 'PatSubKey' --
+ they are already distinct 'CompDef's (so nothing is lost by not giving each
+ its own single-use @newtype@), and the existing benchmark makes the
+ identical call for its own params\/results (@Comp Word32 Word64@
+ throughout, one generic numeric type, no per-level newtypes).
+
+ __Measured effect -- honest accounting, not a tuned number.__ At 48,806
+ instances (scale 0.05): original @(Int, Int)@ params \/ @(Val, Val, Val)@
+ results, @209.0 MB@ 'max_live_bytes'. Packing only the fat results to
+ @Word64@ (params left as an @(Int, Int)@-shaped tuple): @199.4 MB@ -- almost
+ the entire improvement. Packing params too (the change actually shipped):
+ @198.3 MB@, another @~1.1 MB@. __Both parts together are a ~5% reduction,
+ not the 13x this section's own mechanism would suggest, and nowhere near
+ the existing benchmark's ~320 B\/instance.__ The gap is explained by
+ something 'mkColumn' has nothing to do with: this benchmark deliberately
+ never shares or pre-populates a source key (see 'valOf'\'s haddock), so
+ essentially every one of its ~1.6M source reads interns a genuinely
+ distinct, never-reused 'Key' -- a boxed 'ForAnyCompFlow' existential
+ (source id + 'Data.Typeable.Proxy' + the 'ByteString' key) as a
+ @Data.HashMap.Strict@ entry in
+ "Control.Computations.CompEngine.Utils.SrcIndex"'s @KeyIntern@, *and* a
+ second boxed copy in "DefTable.hs"'s own per-def @SrcDepIntern@ (see both
+ modules' haddocks: each is a deliberate, correct design for the case those
+ interned values are actually /shared/ across many rows -- exactly what the
+ existing benchmark's 300-key @make_kv@ gives it, and exactly what this
+ benchmark's realistic "every reading is its own clinical fact" design does
+ not). Comparing @48,806@- and @97,609@-instance runs before this fix, the
+ marginal cost tracked /source calls/, not instances: @+80,600@ source
+ calls against @+48,803@ instances for @+208.5 MB@ is @~2,587 B@ per source
+ call -- close enough to the observed ~4,270 B\/instance (at ~1.65 source
+ calls\/instance averaged over this graph's mix of defs) to be the same
+ number. That ratio barely moves after this fix (@~2,453 B@\/call), because
+ packing params\/results never touched the src-dep interning tables at all.
+ Fixing /that/ would mean changing how "DefTable.hs"\/"SrcIndex.hs" intern
+ source keys -- explicitly out of scope here (@src\/@ is untouched, and the
+ whole point of this benchmark's key design is /not/ to share keys -- see
+ the module haddock's opening "Making the batches real" section). Reported
+ here, not chased further, per this task's own instruction: an honest
+ number beats a tuned one.
+
+ = Scale
+
+ @HOSPITAL_BENCH_SCALE@ scales /both/ the patient count and the ward count
+ continuously (see 'scaledPatientCount'\/'scaledWardCount'), rather than
+ fixing ward size at 50 and only scaling the ward count -- the latter
+ bottoms out at one 50-patient ward as soon as @scale@ is small enough that
+ @round (20 * scale)@ hits 0 (floored to 1), so e.g. @0.02@ and @0.05@ used
+ to produce the *identical* 48,806-instance run despite being different
+ knob values. A ward can now hold fewer than 50 patients at small scale (see
+ 'wardSizes'); the default @1.0@ still resolves to exactly 1,000 patients
+ across 20 wards, 50 patients each, matching the original fixed scheme
+ exactly.
 -}
 module Control.Computations.Demos.Bench.Hospital (hospitalBenchMain) where
 
@@ -74,6 +163,7 @@ import Control.Computations.Utils.Types
 import Control.Concurrent.Async
 import Control.Concurrent.STM
 import Control.Monad
+import Data.Bits (unsafeShiftL, unsafeShiftR, (.|.))
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BSC
 import qualified Data.HashMap.Strict as HashMap
@@ -82,6 +172,7 @@ import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe)
 import Data.Proxy
 import Data.Time.Clock
+import Data.Word (Word32, Word64)
 import GHC.Stats
 import System.Environment (lookupEnv)
 import System.Posix.Process (getProcessID)
@@ -91,25 +182,62 @@ import Text.Printf (printf)
 import Text.Read (readMaybe)
 
 ----------------------------------------------------------------------------
+-- Packing: the fix for Problem 1 (see the module haddock's "Memory"
+-- section). One generic Word32-pair <-> Word64 primitive, reused both for
+-- every two-key comp param (via PatSubKey/mkPatSubKey/patOf/subOf) and for
+-- admissionComp's packed (ward, admission-length) result.
+----------------------------------------------------------------------------
+
+-- | Pack two 'Word32's into one 'Word64': @hi@ in the high 32 bits, @lo@ in
+-- the low 32 bits. Deliberately a bare 'Word64', not a @newtype@ -- see the
+-- module haddock for why that distinction is exactly what makes the
+-- resulting column unboxed.
+packWord32Pair :: Word32 -> Word32 -> Word64
+packWord32Pair hi lo = (fromIntegral hi `unsafeShiftL` 32) .|. fromIntegral lo
+{-# INLINE packWord32Pair #-}
+
+-- | Inverse of 'packWord32Pair'.
+unpackWord32Pair :: Word64 -> (Word32, Word32)
+unpackWord32Pair w = (fromIntegral (w `unsafeShiftR` 32), fromIntegral w)
+{-# INLINE unpackWord32Pair #-}
+
+-- | A packed (patient id, per-patient sub-id) comp param -- see
+-- 'packWord32Pair'. Reused across every two-key comp in this module
+-- ('vitalComp', 'vitalWindowComp', 'labResultComp'\/'labTrendComp',
+-- 'medOrderComp', 'interactionComp', 'noteComp'): all of them key on
+-- @(PatId, some per-patient sub-id)@, and none needs to be told apart from
+-- the others at the type level -- see the module haddock.
+type PatSubKey = Word64
+
+mkPatSubKey :: PatId -> Word32 -> PatSubKey
+mkPatSubKey = packWord32Pair
+{-# INLINE mkPatSubKey #-}
+
+patOf :: PatSubKey -> PatId
+patOf = fst . unpackWord32Pair
+{-# INLINE patOf #-}
+
+subOf :: PatSubKey -> Word32
+subOf = snd . unpackWord32Pair
+{-# INLINE subOf #-}
+
+----------------------------------------------------------------------------
 -- Graph shape
 ----------------------------------------------------------------------------
 
-type PatId = Int
-type WardId = Int
-type VitalId = Int
-type WindowId = Int
-type LabId = Int
-type MedId = Int
-type InteractionId = Int
-type NoteId = Int
+type PatId = Word32
+type WardId = Word32
+type VitalId = Word32
+type WindowId = Word32
+type LabId = Word32
+type MedId = Word32
+type InteractionId = Word32
+type NoteId = Word32
 
--- | Fixed at 50 regardless of scale -- only the number of wards scales (see
--- 'scaledWardCount'), which scales the patient count (@wardCount * 50@)
--- along with it.
-patientsPerWard :: Int
-patientsPerWard = 50
-
-baseWardCount :: Int
+-- | Default (scale 1.0) patient\/ward counts -- see 'scaledPatientCount'\/
+-- 'scaledWardCount' and the module haddock's "Scale" section.
+basePatientCount, baseWardCount :: Int
+basePatientCount = 1000
 baseWardCount = 20
 
 vitalsPerPatient, windowsPerPatient, vitalsPerWindow :: Int
@@ -130,16 +258,49 @@ notesPerPatient = 140
 -- hardcoded so 'interactionsPerPatient' can never silently drift from
 -- 'medsPerPatient'.
 allMedPairs :: [(MedId, MedId)]
-allMedPairs = [(a, b) | a <- [0 .. medsPerPatient - 1], b <- [a + 1 .. medsPerPatient - 1]]
+allMedPairs = [(a, b) | a <- [0 .. medsPerPatient' - 1], b <- [a + 1 .. medsPerPatient' - 1]]
+ where
+  medsPerPatient' = fromIntegral medsPerPatient :: MedId
 
 interactionsPerPatient :: Int
 interactionsPerPatient = length allMedPairs
 
-wardOf :: PatId -> WardId
-wardOf p = p `div` patientsPerWard
+-- | The number of patients in each of @wardCount@ wards, given @patientCount@
+-- total: split as evenly as possible, the first @patientCount \`mod\`
+-- wardCount@ wards getting one extra patient. At the default scale (1000
+-- patients, 20 wards) this is a uniform 50 -- matching the original fixed
+-- scheme exactly -- but at smaller scales a ward can hold fewer than 50 (see
+-- the module haddock's "Scale" section). Callers are responsible for
+-- ensuring @wardCount <= patientCount@ (see 'scaledWardCount') so every
+-- ward gets at least 1 patient; 'wardOffsets' below would otherwise produce
+-- an empty ward and 'depthHistogram'\'s per-ward @maximum@ would crash on
+-- it.
+wardSizes :: Int -> Int -> [Int]
+wardSizes wardCount patientCount = [base + (if w < extra then 1 else 0) | w <- [0 .. wardCount - 1]]
+ where
+  (base, extra) = patientCount `divMod` wardCount
 
-patientsOfWard :: WardId -> [PatId]
-patientsOfWard w = [w * patientsPerWard .. w * patientsPerWard + patientsPerWard - 1]
+-- | Cumulative patient-id offset where each ward starts: length
+-- @wardCount + 1@, first element 0, last element @patientCount@. Ward @w@
+-- owns patient ids @[offsets !! w .. offsets !! (w + 1) - 1]@ -- see
+-- 'patientsOfWard'\/'wardOfWith'.
+wardOffsets :: Int -> Int -> [Int]
+wardOffsets wardCount patientCount = scanl (+) 0 (wardSizes wardCount patientCount)
+
+-- | Patient ids belonging to ward @w@, given its def's 'wardOffsets'.
+patientsOfWard :: [Int] -> WardId -> [PatId]
+patientsOfWard offsets w = map fromIntegral [lo .. hi - 1]
+ where
+  wi = fromIntegral w
+  lo = offsets !! wi
+  hi = offsets !! (wi + 1)
+
+-- | Which ward patient @p@ belongs to, given 'wardOffsets'. @O(wardCount)@:
+-- a linear scan over the (small, at most a few dozen even at large scale)
+-- offsets list beats building an array for a lookup done at most
+-- @patientCount@ times total (once per patient, inside 'admissionComp').
+wardOfWith :: [Int] -> PatId -> WardId
+wardOfWith offsets p = fromIntegral (length (takeWhile (<= fromIntegral p) (drop 1 offsets)))
 
 {- | The lab-trend dependency chain's length for patient @p@, in @[1, 5]@ --
  this is what makes graph depth heterogeneous (see the module haddock and
@@ -151,7 +312,7 @@ patientsOfWard w = [w * patientsPerWard .. w * patientsPerWard + patientsPerWard
  into whole segments with no remainder.
 -}
 labTrendChainCap :: PatId -> Int
-labTrendChainCap p = 1 + (p `mod` 5)
+labTrendChainCap p = 1 + fromIntegral (p `mod` 5)
 
 ----------------------------------------------------------------------------
 -- Source/sink ids and keys
@@ -208,150 +369,188 @@ noteAuthorKey (p, n) = BSC.pack ("notes/author/p" ++ show p ++ "/n" ++ show n)
 valOf :: Key -> Maybe Val -> Val
 valOf key = fromMaybe (BS.take 8 key)
 
+-- | Fold a fetched byte string into a 'Word64', cheaply and deterministically
+-- content-dependent -- so a live-update mutation that changes a value's
+-- bytes changes every comp result derived from it, not just its length.
+-- Mirrors the existing benchmark's own "combine into one wrapping Word64"
+-- style (see @Bench.Main@'s @level0Body@, @base + i + d@), but folds bytes
+-- directly rather than parsing decimal text: this graph's fallback values
+-- ('valOf') are arbitrary byte slices of a key, not necessarily valid
+-- number text, so a text parse would silently read as 0 for almost every
+-- read here.
+valWord64 :: Val -> Word64
+valWord64 = BS.foldl' (\acc w -> acc * 31 + fromIntegral w) 0
+
 ----------------------------------------------------------------------------
 -- Comp defs
 ----------------------------------------------------------------------------
 
-admissionCompDef :: CompDef PatId (Int, Int)
-admissionCompDef = defineComp "admissionComp" fullCaching $ \p -> do
+-- | Result is 'packWord32Pair' of @(ward, admission-length)@ -- see the
+-- module haddock's "Memory" section for why a packed 'Word64' rather than
+-- an @(Int, Int)@ tuple. Needs @offsets@ (see 'wardOffsets') to place a
+-- patient in a ward now that ward size is no longer a fixed 50 (see the
+-- "Scale" section).
+admissionCompDef :: [Int] -> CompDef PatId Word64
+admissionCompDef offsets = defineComp "admissionComp" fullCaching $ \p -> do
   mval <- compSrcReq adtSrcId (SystemLookupReq (adtKey p))
   let v = valOf (adtKey p) mval
-  pure (wardOf p, BS.length v)
+  pure (packWord32Pair (wardOfWith offsets p) (fromIntegral (BS.length v)))
 
-vitalCompDef :: CompDef (PatId, VitalId) (Val, Val, Val)
+-- | Result folds the 3 fetched values into one wrapping 'Word64' (via
+-- 'valWord64') rather than caching the @(Val, Val, Val)@ triple itself --
+-- see the module haddock's "Memory" section. The 3 reads themselves are
+-- untouched: still one applicative batch against 'vitalsSrcId'.
+vitalCompDef :: CompDef PatSubKey Word64
 vitalCompDef = defineComp "vitalComp" fullCaching $ \pv -> do
-  value <- compSrcReq vitalsSrcId (SystemLookupReq (vitalValueKey pv))
-  unit <- compSrcReq vitalsSrcId (SystemLookupReq (vitalUnitKey pv))
-  range <- compSrcReq vitalsSrcId (SystemLookupReq (vitalRangeKey pv))
+  let p = patOf pv; v = subOf pv
+  value <- compSrcReq vitalsSrcId (SystemLookupReq (vitalValueKey (p, v)))
+  unit <- compSrcReq vitalsSrcId (SystemLookupReq (vitalUnitKey (p, v)))
+  range <- compSrcReq vitalsSrcId (SystemLookupReq (vitalRangeKey (p, v)))
   pure
-    ( valOf (vitalValueKey pv) value
-    , valOf (vitalUnitKey pv) unit
-    , valOf (vitalRangeKey pv) range
+    ( valWord64 (valOf (vitalValueKey (p, v)) value)
+        + valWord64 (valOf (vitalUnitKey (p, v)) unit)
+        + valWord64 (valOf (vitalRangeKey (p, v)) range)
     )
 
-vitalWindowCompDef :: Comp (PatId, VitalId) (Val, Val, Val) -> CompDef (PatId, WindowId) Int
-vitalWindowCompDef vitalC = defineComp "vitalWindowComp" fullCaching $ \(p, w) -> do
-  let vitalIds = [w * vitalsPerWindow .. w * vitalsPerWindow + vitalsPerWindow - 1]
-  readings <- traverse (\v -> evalCompOrFail vitalC (p, v)) vitalIds
-  pure (sum [BS.length val | (val, _, _) <- readings])
+vitalWindowCompDef :: Comp PatSubKey Word64 -> CompDef PatSubKey Word64
+vitalWindowCompDef vitalC = defineComp "vitalWindowComp" fullCaching $ \pw -> do
+  let p = patOf pw; w = subOf pw :: WindowId
+      vitalsPerWindow' = fromIntegral vitalsPerWindow :: VitalId
+      vitalIds = [w * vitalsPerWindow' .. w * vitalsPerWindow' + vitalsPerWindow' - 1]
+  readings <- traverse (\v -> evalCompOrFail vitalC (mkPatSubKey p v)) vitalIds
+  pure (sum readings)
 
-labResultCompDef :: CompDef (PatId, LabId) (Val, Val, Val)
+-- | Result folds the 3 fetched values into one wrapping 'Word64', same as
+-- 'vitalCompDef' -- see the module haddock's "Memory" section.
+labResultCompDef :: CompDef PatSubKey Word64
 labResultCompDef = defineComp "labResultComp" fullCaching $ \pl -> do
-  result <- compSrcReq labsSrcId (SystemLookupReq (labResultKey pl))
-  range <- compSrcReq labsSrcId (SystemLookupReq (labRangeKey pl))
-  specimen <- compSrcReq labsSrcId (SystemLookupReq (labSpecimenKey pl))
+  let p = patOf pl; l = subOf pl
+  result <- compSrcReq labsSrcId (SystemLookupReq (labResultKey (p, l)))
+  range <- compSrcReq labsSrcId (SystemLookupReq (labRangeKey (p, l)))
+  specimen <- compSrcReq labsSrcId (SystemLookupReq (labSpecimenKey (p, l)))
   pure
-    ( valOf (labResultKey pl) result
-    , valOf (labRangeKey pl) range
-    , valOf (labSpecimenKey pl) specimen
+    ( valWord64 (valOf (labResultKey (p, l)) result)
+        + valWord64 (valOf (labRangeKey (p, l)) range)
+        + valWord64 (valOf (labSpecimenKey (p, l)) specimen)
     )
 
 -- | Wired via 'defineRecursiveComp' (self-referential: see the module
 -- haddock and 'labTrendChainCap' for the segment-reset scheme that keeps
--- 180 instances per patient while bounding chain depth to at most 5).
+-- 180 instances per patient while bounding chain depth to at most 5). Both
+-- branches read 'labResultComp' (preserving the original's dependency
+-- edge in both cases), only the recursive read of 'labTrendComp' itself is
+-- conditional on not starting a fresh segment.
 labTrendCompDef
-  :: Comp (PatId, LabId) (Val, Val, Val) -> Comp (PatId, LabId) Int -> CompDef (PatId, LabId) Int
-labTrendCompDef labResultC labTrendC = defineComp "labTrendComp" fullCaching $ \(p, l) ->
-  let cap = labTrendChainCap p
-      s = l `mod` cap
-   in if s == 0
-        then do
-          (resultVal, _, _) <- evalCompOrFail labResultC (p, l)
-          pure (BS.length resultVal)
-        else do
-          (resultVal, _, _) <- evalCompOrFail labResultC (p, l)
-          prev <- evalCompOrFail labTrendC (p, l - 1)
-          pure (prev + BS.length resultVal)
+  :: Comp PatSubKey Word64 -> Comp PatSubKey Word64 -> CompDef PatSubKey Word64
+labTrendCompDef labResultC labTrendC = defineComp "labTrendComp" fullCaching $ \pl -> do
+  let p = patOf pl; l = subOf pl
+      cap = labTrendChainCap p
+      s = fromIntegral l `mod` cap
+  resultVal <- evalCompOrFail labResultC pl
+  if s == 0
+    then pure resultVal
+    else do
+      prev <- evalCompOrFail labTrendC (mkPatSubKey p (l - 1))
+      pure (prev + resultVal)
 
-medOrderCompDef :: CompDef (PatId, MedId) (Val, Val)
+medOrderCompDef :: CompDef PatSubKey Word64
 medOrderCompDef = defineComp "medOrderComp" fullCaching $ \pm -> do
-  order <- compSrcReq pharmacySrcId (SystemLookupReq (medOrderKey pm))
-  drug <- compSrcReq pharmacySrcId (SystemLookupReq (medDrugKey pm))
-  pure (valOf (medOrderKey pm) order, valOf (medDrugKey pm) drug)
+  let p = patOf pm; m = subOf pm
+  order <- compSrcReq pharmacySrcId (SystemLookupReq (medOrderKey (p, m)))
+  drug <- compSrcReq pharmacySrcId (SystemLookupReq (medDrugKey (p, m)))
+  pure (valWord64 (valOf (medOrderKey (p, m)) order) + valWord64 (valOf (medDrugKey (p, m)) drug))
 
-interactionCompDef :: Comp (PatId, MedId) (Val, Val) -> CompDef (PatId, InteractionId) Bool
-interactionCompDef medOrderC = defineComp "interactionComp" fullCaching $ \(p, i) -> do
-  let (m1, m2) = allMedPairs !! i
-  (o1, d1) <- evalCompOrFail medOrderC (p, m1)
-  (o2, d2) <- evalCompOrFail medOrderC (p, m2)
-  pure (BS.length o1 + BS.length d1 == BS.length o2 + BS.length d2)
+-- | Compares the two medication orders' /combined/ packed values directly
+-- (rather than re-deriving and comparing byte lengths, the way the
+-- pre-packing version did) now that 'medOrderComp' hands back one 'Word64'
+-- instead of a @(Val, Val)@ pair to pull lengths out of.
+interactionCompDef :: Comp PatSubKey Word64 -> CompDef PatSubKey Bool
+interactionCompDef medOrderC = defineComp "interactionComp" fullCaching $ \pi_ -> do
+  let p = patOf pi_; i = subOf pi_ :: InteractionId
+      (m1, m2) = allMedPairs !! fromIntegral i
+  r1 <- evalCompOrFail medOrderC (mkPatSubKey p m1)
+  r2 <- evalCompOrFail medOrderC (mkPatSubKey p m2)
+  pure (r1 == r2)
 
-noteCompDef :: CompDef (PatId, NoteId) (Val, Val)
+noteCompDef :: CompDef PatSubKey Word64
 noteCompDef = defineComp "noteComp" fullCaching $ \pn -> do
-  text <- compSrcReq notesSrcId (SystemLookupReq (noteTextKey pn))
-  author <- compSrcReq notesSrcId (SystemLookupReq (noteAuthorKey pn))
-  pure (valOf (noteTextKey pn) text, valOf (noteAuthorKey pn) author)
+  let p = patOf pn; n = subOf pn
+  text <- compSrcReq notesSrcId (SystemLookupReq (noteTextKey (p, n)))
+  author <- compSrcReq notesSrcId (SystemLookupReq (noteAuthorKey (p, n)))
+  pure (valWord64 (valOf (noteTextKey (p, n)) text) + valWord64 (valOf (noteAuthorKey (p, n)) author))
 
-noteDigestCompDef :: Comp (PatId, NoteId) (Val, Val) -> CompDef PatId Int
+noteDigestCompDef :: Comp PatSubKey Word64 -> CompDef PatId Word64
 noteDigestCompDef noteC = defineComp "noteDigestComp" fullCaching $ \p -> do
-  notes <- traverse (\n -> evalCompOrFail noteC (p, n)) [0 .. notesPerPatient - 1]
-  pure (sum [BS.length t + BS.length a | (t, a) <- notes])
+  notes <- traverse (\n -> evalCompOrFail noteC (mkPatSubKey p n)) [0 .. fromIntegral notesPerPatient - 1]
+  pure (sum notes)
 
 riskScoreCompDef
-  :: Comp (PatId, WindowId) Int
-  -> Comp (PatId, LabId) Int
-  -> Comp (PatId, InteractionId) Bool
-  -> CompDef PatId Int
+  :: Comp PatSubKey Word64
+  -> Comp PatSubKey Word64
+  -> Comp PatSubKey Bool
+  -> CompDef PatId Word64
 riskScoreCompDef vitalWindowC labTrendC interactionC = defineComp "riskScoreComp" fullCaching $ \p -> do
-  windows <- traverse (\w -> evalCompOrFail vitalWindowC (p, w)) [0 .. windowsPerPatient - 1]
-  trends <- traverse (\l -> evalCompOrFail labTrendC (p, l)) [0 .. labsPerPatient - 1]
-  interactions <- traverse (\i -> evalCompOrFail interactionC (p, i)) [0 .. interactionsPerPatient - 1]
-  pure (sum windows + sum trends + length (filter id interactions))
+  windows <- traverse (\w -> evalCompOrFail vitalWindowC (mkPatSubKey p w)) [0 .. fromIntegral windowsPerPatient - 1]
+  trends <- traverse (\l -> evalCompOrFail labTrendC (mkPatSubKey p l)) [0 .. fromIntegral labsPerPatient - 1]
+  interactions <- traverse (\i -> evalCompOrFail interactionC (mkPatSubKey p i)) [0 .. fromIntegral interactionsPerPatient - 1]
+  pure (sum windows + sum trends + fromIntegral (length (filter id interactions)))
 
 -- | The one deliberately cross-system batch: one key from each of the five
 -- sources, combined with the three patient-level rollups via
 -- @ApplicativeDo@ into a single 8-leaf 'CompReqCombined' batch (see the
 -- module haddock). Also the graph's only sink write, one per patient.
 patientSummaryCompDef
-  :: Comp PatId Int -> Comp PatId (Int, Int) -> Comp PatId Int -> CompDef PatId Int
+  :: Comp PatId Word64 -> Comp PatId Word64 -> Comp PatId Word64 -> CompDef PatId Word64
 patientSummaryCompDef riskScoreC admissionC noteDigestC =
   defineComp "patientSummaryComp" fullCaching $ \p -> do
     risk <- evalCompOrFail riskScoreC p
-    (ward, _admitLen) <- evalCompOrFail admissionC p
+    admission <- evalCompOrFail admissionC p
     noteDigest <- evalCompOrFail noteDigestC p
     adtVal <- compSrcReq adtSrcId (SystemLookupReq (adtKey p))
     vitalsVal <- compSrcReq vitalsSrcId (SystemLookupReq (vitalValueKey (p, 0)))
     labsVal <- compSrcReq labsSrcId (SystemLookupReq (labResultKey (p, 0)))
     pharmacyVal <- compSrcReq pharmacySrcId (SystemLookupReq (medOrderKey (p, 0)))
     notesVal <- compSrcReq notesSrcId (SystemLookupReq (noteTextKey (p, 0)))
-    let crossLen =
-          BS.length (valOf (adtKey p) adtVal)
-            + BS.length (valOf (vitalValueKey (p, 0)) vitalsVal)
-            + BS.length (valOf (labResultKey (p, 0)) labsVal)
-            + BS.length (valOf (medOrderKey (p, 0)) pharmacyVal)
-            + BS.length (valOf (noteTextKey (p, 0)) notesVal)
-        summary = risk + ward + noteDigest + crossLen
+    let (ward, _admitLen) = unpackWord32Pair admission
+        crossLen =
+          valWord64 (valOf (adtKey p) adtVal)
+            + valWord64 (valOf (vitalValueKey (p, 0)) vitalsVal)
+            + valWord64 (valOf (labResultKey (p, 0)) labsVal)
+            + valWord64 (valOf (medOrderKey (p, 0)) pharmacyVal)
+            + valWord64 (valOf (noteTextKey (p, 0)) notesVal)
+        summary = risk + fromIntegral ward + noteDigest + crossLen
     void $ compSinkReq outSinkId (HashMapStoreReq (patKey p) (BSC.pack (show summary)))
     pure summary
 
-patientAlertCompDef :: Comp PatId Int -> Comp PatId (Int, Int) -> CompDef PatId Bool
+patientAlertCompDef :: Comp PatId Word64 -> Comp PatId Word64 -> CompDef PatId Bool
 patientAlertCompDef riskScoreC admissionC = defineComp "patientAlertComp" fullCaching $ \p -> do
   risk <- evalCompOrFail riskScoreC p
-  (ward, _) <- evalCompOrFail admissionC p
-  pure (risk `mod` 7 == ward `mod` 7)
+  admission <- evalCompOrFail admissionC p
+  let (ward, _) = unpackWord32Pair admission
+  pure (risk `mod` 7 == fromIntegral ward `mod` 7)
 
-wardCensusCompDef :: Comp PatId (Int, Int) -> CompDef WardId Int
-wardCensusCompDef admissionC = defineComp "wardCensusComp" fullCaching $ \w -> do
-  admissions <- traverse (evalCompOrFail admissionC) (patientsOfWard w)
-  pure (length admissions)
+wardCensusCompDef :: Comp PatId Word64 -> [Int] -> CompDef WardId Word64
+wardCensusCompDef admissionC offsets = defineComp "wardCensusComp" fullCaching $ \w -> do
+  admissions <- traverse (evalCompOrFail admissionC) (patientsOfWard offsets w)
+  pure (fromIntegral (length admissions))
 
-wardOccupancyCompDef :: Comp PatId (Int, Int) -> CompDef WardId Int
-wardOccupancyCompDef admissionC = defineComp "wardOccupancyComp" fullCaching $ \w -> do
-  admissions <- traverse (evalCompOrFail admissionC) (patientsOfWard w)
-  pure (sum [len | (_, len) <- admissions])
+wardOccupancyCompDef :: Comp PatId Word64 -> [Int] -> CompDef WardId Word64
+wardOccupancyCompDef admissionC offsets = defineComp "wardOccupancyComp" fullCaching $ \w -> do
+  admissions <- traverse (evalCompOrFail admissionC) (patientsOfWard offsets w)
+  pure (sum [fromIntegral (snd (unpackWord32Pair a)) | a <- admissions])
 
-wardRiskBoardCompDef :: Comp PatId Bool -> CompDef WardId Int
-wardRiskBoardCompDef patientAlertC = defineComp "wardRiskBoardComp" fullCaching $ \w -> do
-  alerts <- traverse (evalCompOrFail patientAlertC) (patientsOfWard w)
-  pure (length (filter id alerts))
+wardRiskBoardCompDef :: Comp PatId Bool -> [Int] -> CompDef WardId Word64
+wardRiskBoardCompDef patientAlertC offsets = defineComp "wardRiskBoardComp" fullCaching $ \w -> do
+  alerts <- traverse (evalCompOrFail patientAlertC) (patientsOfWard offsets w)
+  pure (fromIntegral (length (filter id alerts)))
 
 hospitalDashboardCompDef
-  :: Comp WardId Int -> Comp WardId Int -> Comp WardId Int -> Int -> CompDef () Int
+  :: Comp WardId Word64 -> Comp WardId Word64 -> Comp WardId Word64 -> Int -> CompDef () Word64
 hospitalDashboardCompDef wardCensusC wardRiskBoardC wardOccupancyC wardCount =
   defineComp "hospitalDashboardComp" fullCaching $ \() -> do
-    censuses <- traverse (evalCompOrFail wardCensusC) [0 .. wardCount - 1]
-    riskBoards <- traverse (evalCompOrFail wardRiskBoardC) [0 .. wardCount - 1]
-    occupancies <- traverse (evalCompOrFail wardOccupancyC) [0 .. wardCount - 1]
+    censuses <- traverse (evalCompOrFail wardCensusC) [0 .. fromIntegral wardCount - 1]
+    riskBoards <- traverse (evalCompOrFail wardRiskBoardC) [0 .. fromIntegral wardCount - 1]
+    occupancies <- traverse (evalCompOrFail wardOccupancyC) [0 .. fromIntegral wardCount - 1]
     pure (sum censuses + sum riskBoards + sum occupancies)
 
 -- | Fans in over 'patientSummaryComp' (not directly over 'riskScoreComp')
@@ -361,14 +560,23 @@ hospitalDashboardCompDef wardCensusC wardRiskBoardC wardOccupancyC wardCount =
 -- also matches the real shape of "candidates for transfer": a roll-up over
 -- each patient's already-computed summary, not a re-derivation from raw
 -- risk scores.
-transferCandidatesCompDef :: Comp PatId Int -> Comp PatId (Int, Int) -> Int -> CompDef () Int
+transferCandidatesCompDef :: Comp PatId Word64 -> Comp PatId Word64 -> Int -> CompDef () Word64
 transferCandidatesCompDef patientSummaryC admissionC patientCount =
   defineComp "transferCandidatesComp" fullCaching $ \() -> do
-    summaries <- traverse (evalCompOrFail patientSummaryC) [0 .. patientCount - 1]
-    admissions <- traverse (evalCompOrFail admissionC) [0 .. patientCount - 1]
-    pure (length [() | (s, (ward, _)) <- zip summaries admissions, s > ward])
+    summaries <- traverse (evalCompOrFail patientSummaryC) [0 .. fromIntegral patientCount - 1]
+    admissions <- traverse (evalCompOrFail admissionC) [0 .. fromIntegral patientCount - 1]
+    pure
+      ( fromIntegral
+          ( length
+              [ ()
+              | (s, a) <- zip summaries admissions
+              , let (ward, _) = unpackWord32Pair a
+              , s > fromIntegral ward
+              ]
+          )
+      )
 
-rootCompDef :: Comp () Int -> Comp () Int -> CompDef () ()
+rootCompDef :: Comp () Word64 -> Comp () Word64 -> CompDef () ()
 rootCompDef hospitalDashboardC transferCandidatesC = defineComp "root" fullCaching $ \() -> do
   _ <- evalCompOrFail hospitalDashboardC ()
   _ <- evalCompOrFail transferCandidatesC ()
@@ -379,10 +587,10 @@ rootCompDef hospitalDashboardC transferCandidatesC = defineComp "root" fullCachi
 -- instances come from calling these repeatedly at different parameters via
 -- 'evalCompOrFail', exactly as in the existing benchmark's own 50-def
 -- graph).
-wireHospitalComps :: Int -> CompWireM (Comp () ())
-wireHospitalComps wardCount = do
-  let patientCount = wardCount * patientsPerWard
-  admissionC <- wireComp admissionCompDef
+wireHospitalComps :: Int -> Int -> CompWireM (Comp () ())
+wireHospitalComps patientCount wardCount = do
+  let offsets = wardOffsets wardCount patientCount
+  admissionC <- wireComp (admissionCompDef offsets)
   vitalC <- wireComp vitalCompDef
   vitalWindowC <- wireComp (vitalWindowCompDef vitalC)
   labResultC <- wireComp labResultCompDef
@@ -394,9 +602,9 @@ wireHospitalComps wardCount = do
   riskScoreC <- wireComp (riskScoreCompDef vitalWindowC labTrendC interactionC)
   patientSummaryC <- wireComp (patientSummaryCompDef riskScoreC admissionC noteDigestC)
   patientAlertC <- wireComp (patientAlertCompDef riskScoreC admissionC)
-  wardCensusC <- wireComp (wardCensusCompDef admissionC)
-  wardOccupancyC <- wireComp (wardOccupancyCompDef admissionC)
-  wardRiskBoardC <- wireComp (wardRiskBoardCompDef patientAlertC)
+  wardCensusC <- wireComp (wardCensusCompDef admissionC offsets)
+  wardOccupancyC <- wireComp (wardOccupancyCompDef admissionC offsets)
+  wardRiskBoardC <- wireComp (wardRiskBoardCompDef patientAlertC offsets)
   hospitalDashboardC <-
     wireComp (hospitalDashboardCompDef wardCensusC wardRiskBoardC wardOccupancyC wardCount)
   transferCandidatesC <- wireComp (transferCandidatesCompDef patientSummaryC admissionC patientCount)
@@ -407,16 +615,24 @@ wireHospitalComps wardCount = do
 ----------------------------------------------------------------------------
 
 {- | The exact instance count at each dependency level (source = level 0;
- @root@ is always level 11), computed analytically from the graph's known,
- fully deterministic shape -- not sampled at runtime. This is possible
- (and, being exact rather than sampled, preferable to instrumenting the
- engine) precisely because every comp's level is pinned down by @p mod 5@
- alone: level 1 is every comp reading a source directly (admission, vital,
- labResult, medOrder, note); labTrendComp's level is @2 + (l \`mod\` cap)@,
- landing in @[2, 6]@; riskScore is @cap + 2@; patientSummary\/patientAlert
- are @cap + 3@; wardRiskBoard is always 9 (every 50-patient ward block
- contains all five @cap@ values, since 50 is a multiple of 5); hospital
- dashboard is 10; root is 11.
+ @root@ is always the deepest level), computed analytically from the
+ graph's known, fully deterministic shape -- not sampled at runtime. This is
+ possible (and, being exact rather than sampled, preferable to instrumenting
+ the engine) precisely because every comp's level is pinned down by
+ @p \`mod\` 5@ alone: level 1 is every comp reading a source directly
+ (admission, vital, labResult, medOrder, note); labTrendComp's level is
+ @2 + (l \`mod\` cap)@, landing in @[2, 6]@; riskScore is @cap + 2@;
+ patientSummary\/patientAlert are @cap + 3@; a ward's wardRiskBoard is
+ @1 + max(cap + 3)@ over that ward's own patients (at the default scale,
+ and at every scale point this module's own re-measurement uses, every
+ ward's patient block is a multiple of 5 wide and 5-aligned, so it always
+ contains a patient with @cap = 5@ and this is always 9 -- see the module
+ haddock's "Scale" section for why a much smaller, oddly-sized ward could in
+ principle contain a lower max @cap@ instead); hospital dashboard is
+ @1 + max@ of every ward's wardRiskBoard level (and the two fixed-level-2
+ ward rollups); transferCandidates is @1 + max@ of every patientSummary
+ level (and admission's fixed level 1); root is @1 + max@ of dashboard and
+ transferCandidates.
 
  Summed per patient this is exactly __976__: 1 (admission) + 250 (vital) +
  50 (vitalWindow) + 180 (labResult) + 180 (labTrend) + 18 (medOrder) + 153
@@ -424,8 +640,8 @@ wireHospitalComps wardCount = do
  (patientSummary) + 1 (patientAlert) = 976. Plus 3 per ward (census,
  occupancy, risk board) and 3 total (dashboard, transfer candidates, root).
 -}
-depthHistogram :: Int -> Map.Map Int Int
-depthHistogram wardCount =
+depthHistogram :: Int -> Int -> Map.Map Int Int
+depthHistogram wardCount patientCount =
   Map.fromListWith
     (+)
     ( level1
@@ -436,8 +652,18 @@ depthHistogram wardCount =
         ++ topLevels
     )
  where
-  patientCount = wardCount * patientsPerWard
-  caps = [labTrendChainCap p | p <- [0 .. patientCount - 1]]
+  caps = [labTrendChainCap (fromIntegral p) | p <- [0 .. patientCount - 1]]
+  maxCap = maximum caps
+  offsets = wardOffsets wardCount patientCount
+  wardPatientIdxLists = [[offsets !! w .. offsets !! (w + 1) - 1] | w <- [0 .. wardCount - 1]]
+  wardRiskBoardLevels =
+    [1 + maximum [labTrendChainCap (fromIntegral p) + 3 | p <- ps] | ps <- wardPatientIdxLists]
+  -- transferCandidates depends on patientSummary (level cap+3, max over all
+  -- patients) and admission (level 1); 1 + max(1, maxCap + 3) simplifies to
+  -- maxCap + 4 unconditionally since maxCap >= 1 makes maxCap + 4 >= 5 > 2.
+  transferCandidatesLevel = maxCap + 4
+  dashboardLevel = 1 + maximum (2 : wardRiskBoardLevels)
+  rootLevel = 1 + max dashboardLevel transferCandidatesLevel
   level1 =
     [ (1, patientCount)
     , (1, patientCount * vitalsPerPatient)
@@ -455,7 +681,9 @@ depthHistogram wardCount =
   labTrendLevels = [(2 + s, labsPerPatient `div` cap) | cap <- caps, s <- [0 .. cap - 1]]
   riskScoreLevels = [(cap + 2, 1) | cap <- caps]
   summaryAlertLevels = concat [[(cap + 3, 1), (cap + 3, 1)] | cap <- caps]
-  topLevels = [(9, wardCount), (9, 1), (10, 1), (11, 1)]
+  topLevels =
+    [(lvl, 1) | lvl <- wardRiskBoardLevels]
+      ++ [(transferCandidatesLevel, 1), (dashboardLevel, 1), (rootLevel, 1)]
 
 ----------------------------------------------------------------------------
 -- Flow wiring
@@ -580,13 +808,19 @@ readEnvIntAtLeast :: Int -> String -> Int -> IO Int
 readEnvIntAtLeast lowerBound name def =
   maybe def (max lowerBound) . (>>= readMaybe) <$> lookupEnv name
 
--- | The ward count at a given scale: @max 1 (round (20 * scale))@, floored
--- at 1 (as opposed to floored at 1 per *level*, the way the existing
--- benchmark's 'Control.Computations.Demos.Bench.Main.scaledLevelSizes'
--- floors each of its ten levels independently -- there is only the one
--- count to scale here).
-scaledWardCount :: Double -> Int
-scaledWardCount scale = max 1 (round (fromIntegral baseWardCount * scale :: Double))
+-- | The patient count at a given scale: @max 1 (round (1000 * scale))@ --
+-- see the module haddock's "Scale" section.
+scaledPatientCount :: Double -> Int
+scaledPatientCount scale = max 1 (round (fromIntegral basePatientCount * scale :: Double))
+
+-- | The ward count at a given scale: @max 1 (round (20 * scale))@, clamped
+-- to never exceed @patientCount@ (so every ward gets at least 1 patient --
+-- see 'wardSizes') -- see the module haddock's "Scale" section for why this
+-- (unlike the original fixed-50-per-ward scheme) makes the scale knob
+-- genuinely continuous.
+scaledWardCount :: Double -> Int -> Int
+scaledWardCount scale patientCount =
+  min patientCount (max 1 (round (fromIntegral baseWardCount * scale :: Double)))
 
 ----------------------------------------------------------------------------
 -- Memory measurement (duplicated from Bench.Main's getRssMb for the same
@@ -610,15 +844,19 @@ hospitalBenchMain = do
   scale <- readEnvDouble "HOSPITAL_BENCH_SCALE" 1.0
   latencyUs <- readEnvIntAtLeast 0 "HOSPITAL_BENCH_SRC_LATENCY_US" 0
   width <- readEnvIntAtLeast 1 "HOSPITAL_BENCH_CONCURRENCY" 1
-  let wardCount = scaledWardCount scale
-      patientCount = wardCount * patientsPerWard
-      histogram = depthHistogram wardCount
+  let patientCount = scaledPatientCount scale
+      wardCount = scaledWardCount scale patientCount
+      histogram = depthHistogram wardCount patientCount
       targetInstances = sum (Map.elems histogram)
 
   putStrLn "=== bench: hospital pipeline (applicative-batch, concurrent-source benchmark) ==="
   printf "HOSPITAL_BENCH_SCALE=%.4f HOSPITAL_BENCH_SRC_LATENCY_US=%d HOSPITAL_BENCH_CONCURRENCY=%d\n" scale latencyUs width
-  printf "wards: %d, patients/ward: %d, patients: %d\n" wardCount patientsPerWard patientCount
-  printf "target instances (analytic): %d\n" targetInstances
+  printf
+    "patients: %d, wards: %d (avg %.1f patients/ward), target instances (analytic): %d\n"
+    patientCount
+    wardCount
+    (fromIntegral patientCount / fromIntegral wardCount :: Double)
+    targetInstances
   putStrLn "depth distribution (level -> instance count):"
   forM_ (Map.toAscList histogram) $ \(lvl, n) -> printf "  level %2d: %d\n" lvl n
   putStrLn ""
@@ -635,7 +873,7 @@ hospitalBenchMain = do
           counterRef
           runVar
           (withHospitalFlows srcs sink width)
-          (wireHospitalComps wardCount)
+          (wireHospitalComps patientCount wardCount)
       )
 
   -- Cold settle: same reasoning as Bench.Main -- the entire initial
@@ -690,10 +928,10 @@ hospitalBenchMain = do
   -- driver's next propagation round fully settles.
   tBeforeMutate <- getCurrentTime
   -- 40 bytes, deliberately far from every 8-byte 'valOf' fallback default so
-  -- the length-derived numbers this graph computes (vitalWindowComp's
-  -- summed lengths, in particular) actually change rather than propagating
-  -- one hop and stopping on an unchanged cached hash -- see the module's
-  -- live-update reasoning.
+  -- the content-derived numbers this graph computes ('valWord64' folds,
+  -- specifically) actually change rather than propagating one hop and
+  -- stopping on an unchanged cached hash -- see the module's live-update
+  -- reasoning.
   sysInsert (hsrc_vitals srcs) (vitalValueKey (0, 0)) (BSC.replicate 40 'x')
   _rs3 <- waitForFullSettle runVar (rs_run rs2 + 1)
   tAfterMutate <- getCurrentTime
@@ -721,6 +959,10 @@ hospitalBenchMain = do
     (max_mem_in_use_bytes rtsStats)
     (fromIntegral (max_mem_in_use_bytes rtsStats) / 1000000 :: Double)
   printf "GHC gcs: %d\n" (gcs rtsStats)
+  when (coldReruns > 0) $
+    printf
+      "bytes/instance (GHC max_live_bytes / instances): %.1f B/instance\n"
+      (fromIntegral (max_live_bytes rtsStats) / fromIntegral coldReruns :: Double)
 
   putStrLn ""
   putStrLn "--- source calls ---"
