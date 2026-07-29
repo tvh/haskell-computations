@@ -127,6 +127,17 @@ instance CompSrc TraceSrc where
   compSrcUnregister _ _ = pure ()
   compSrcWaitChanges _ = retry
 
+  -- Both TraceSrc instances below (b2SrcAId/b2SrcBId) are safe to run
+  -- concurrently -- 'compSrcExecute' only appends to a shared IORef via
+  -- 'atomicModifyIORef''. Declaring this doesn't change
+  -- 'test_goldenOrderingTraceAcrossSrcEvalSink' (that test's registry never
+  -- calls 'setCompFlowConcurrency', so it stays at the default width of 1,
+  -- where a 'FlowConcurrent' declaration is inert -- see
+  -- 'compSrcConcurrency'\'s haddock); it's what lets
+  -- 'test_goldenOrderingTraceEvalSinkSubsequenceUnchangedAtWidth8' below
+  -- actually exercise the job path against the very same trace fixture.
+  compSrcConcurrency _ = FlowConcurrent
+
 data TraceWriteReq a where
   TraceWriteReq :: String -> TraceWriteReq ()
 
@@ -234,6 +245,70 @@ test_goldenOrderingTraceAcrossSrcEvalSink =
       , "sink b2-sink result"
       ]
       trace
+ where
+  compDefs =
+    do
+      inner <- wireComp b2InnerCompDef
+      leaf <- wireComp (b2LeafCompDef inner)
+      wireComp (b2MainCompDef b2SrcAId b2SrcBId leaf b2SinkId)
+
+{- | B.2's companion at width 8: the golden trace literal above is frozen
+ (see the module haddock) and must not be edited, but concurrency is
+ allowed to change *when* a job-eligible source leaf's read lands relative
+ to the batch's other leaves -- see 'prepSrcLeaf's haddock in "Impl". Both
+ 'TraceSrc' instances now declare 'FlowConcurrent' (see above), so at width
+ 8 srcA's and srcB's reads both run during the batch's dispatch-then-drain
+ phase, before any of the batch's engine-thread work (including "eval
+ b2-leaf(1)") even starts -- their relative order to *each other* is
+ whatever the OS scheduler picks, and their position relative to the eval\/
+ sink entries can float. What must NOT move is the eval\/sink entries'
+ order relative to *each other*: filtering the src entries back out of the
+ trace must reproduce the same subsequence as the golden trace above,
+ proving concurrency reordered only what it's allowed to reorder.
+-}
+test_goldenOrderingTraceEvalSinkSubsequenceUnchangedAtWidth8 :: IO ()
+test_goldenOrderingTraceEvalSinkSubsequenceUnchangedAtWidth8 =
+  do
+    traceRef <- newIORef []
+    let srcA = TraceSrc{trs_name = "b2-srcA", trs_traceRef = traceRef}
+        srcB = TraceSrc{trs_name = "b2-srcB", trs_traceRef = traceRef}
+        sink = TraceSink{trk_name = "b2-sink", trk_traceRef = traceRef}
+    reg <- newCompFlowRegistry
+    setCompFlowConcurrency reg (mkCompFlowConcurrency 8)
+    registerCompSrc reg srcA
+    registerCompSrc reg srcB
+    registerCompSink reg sink
+    (rawStateIf, closeSif) <- initStateIf True
+    let stateIf =
+          observingStateIf
+            (\cap -> atomicModifyIORef' traceRef (\xs -> (xs ++ ["eval " ++ show cap], ())))
+            rawStateIf
+    (_compMap, mainComp) <- failInM $ runCompWireM compDefs
+    let ifs = CompEngineIfs{ce_compFlowRegistry = reg, ce_stateIf = stateIf}
+        caps = [wrapCompAp (mkCompAp mainComp ())]
+        rifs =
+          RunCompEngineIf
+            { rcif_shouldStartWithRun = \_ _ _ s -> pure (noNextRun, s)
+            , rcif_emptyChangesMode = DontBlock
+            , rcif_getTime = getCurrentTime
+            , rcif_maxLoopRunTime = seconds 10
+            , rcif_maxRunIterations = CompRunUnlimitedIterations
+            , rcif_reportGarbage = \_ -> pure ()
+            }
+    runCompEngine ifs caps rifs () `finally` closeSif
+    trace <- readIORef traceRef
+    let isSrcEntry entry = "src " `L.isPrefixOf` entry
+        (srcEntries, evalSinkEntries) = L.partition isSrcEntry trace
+    assertEqual
+      [ "eval b2-main(())"
+      , "eval b2-leaf(1)"
+      , "eval b2-inner(1)"
+      , "sink b2-sink result"
+      ]
+      evalSinkEntries
+    assertEqual
+      (HashSet.fromList ["src b2-srcA keyA", "src b2-srcB keyB"])
+      (HashSet.fromList srcEntries)
  where
   compDefs =
     do

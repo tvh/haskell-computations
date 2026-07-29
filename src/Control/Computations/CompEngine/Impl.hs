@@ -28,12 +28,15 @@ import Control.Computations.CompEngine.CompSink
 import Control.Computations.CompEngine.CompSrc
 import Control.Computations.CompEngine.Core
 import Control.Computations.CompEngine.Types
+import Control.Computations.Utils.ConcUtils (dispatchJobs, trySync)
 import Control.Computations.Utils.Logging
 import Control.Computations.Utils.Types
 
 ----------------------------------------
 -- EXTERNAL
 ----------------------------------------
+import Control.Concurrent (rtsSupportsBoundThreads)
+import Control.Exception (SomeException, throwIO)
 import Control.Monad
 import Control.Monad.Reader
 -- Strict, not the mtl default (Control.Monad.State re-exports the Lazy
@@ -137,16 +140,17 @@ instance MonadIO CompEngineM where
   liftIO = CompEngineM . liftIO
   {-# INLINE liftIO #-}
 
-{- | A unit of concurrent source work, queued by a leaf's 'Prep' rather than
- run inline. Nothing constructs one yet -- see 'Prep'\'s haddock. Kept as a
- real (if currently uninhabited-in-practice) type rather than deferred to a
- later commit so 'SrcJobs' and 'Prep'\'s shape can be built, compiled and
- exercised now, ahead of anything actually populating it.
--}
-data SrcJob
-
 {- | The jobs queued by one leaf-traversal, in the order they were queued.
- A plain @[SrcJob]@ built by repeated '<>' would make a left-nested '<*>'
+ Each element is the worker-thread half of a source leaf's job branch (see
+ 'prepSrcLeaf'): run 'compSrcExecute' guarded by
+ 'Control.Computations.Utils.ConcUtils.trySync' (so a genuine asynchronous
+ exception, e.g. from 'Control.Concurrent.Async.cancel', still propagates
+ rather than getting caught), and stash the outcome into that leaf's own
+ slot for the engine phase to read back once every job in the batch has
+ finished -- see 'Control.Computations.Utils.ConcUtils.dispatchJobs' and the
+ 'CompReqCombined' case of 'doSuspended'.
+
+ A plain @[IO ()]@ built by repeated '<>' would make a left-nested '<*>'
  chain (thousands of leaves, e.g. the wide-batch case in
  "Control.Computations.CompEngine.Tests.TestCompReqCombined") quadratic:
  every leaf's singleton list gets re-copied by every append above it. The
@@ -154,13 +158,17 @@ data SrcJob
  composition, with the whole batch's list built (and traversed) exactly
  once, at the end.
 -}
-newtype SrcJobs = SrcJobs ([SrcJob] -> [SrcJob])
+newtype SrcJobs = SrcJobs ([IO ()] -> [IO ()])
 
 instance Semigroup SrcJobs where
   SrcJobs f <> SrcJobs g = SrcJobs (f . g)
 
 instance Monoid SrcJobs where
   mempty = SrcJobs id
+
+-- | The jobs queued in a 'SrcJobs', as a plain list, in queue order.
+srcJobsToList :: SrcJobs -> [IO ()]
+srcJobsToList (SrcJobs f) = f []
 
 {- | The result of preparing one leaf of a 'CompReqCombined' batch (see
  'Control.Computations.CompEngine.Types.traverseCompReq'): what
@@ -173,21 +181,25 @@ instance Monoid SrcJobs where
  a lawful 'Applicative' (that's the whole point of 'Compose'), so 'Prep'\'s
  own laws follow from its four layers' each being exactly what they claim:
 
-  * the outer 'IO' layer is where a later commit's scheduler will decide,
-    per leaf (via 'Control.Computations.CompEngine.CompSrc.compSrcConcurrency'),
-    whether that leaf's work becomes a queued 'SrcJob' or still runs inline;
-    in this commit it never does anything but 'pure' its result, so the two
-    read identically here;
-  * @(,) SrcJobs@ carries the (currently always-'mempty') jobs queued while
-    preparing this leaf, combined across leaves via the 'SrcJobs' monoid;
+  * the outer 'IO' layer is where 'prepSrcLeaf' decides, per source leaf
+    (via 'Control.Computations.CompEngine.CompSrc.compSrcConcurrency' and
+    the width 'doSuspended' read from
+    'Control.Computations.CompEngine.CompFlowRegistry.readCompFlowConcurrency'),
+    whether that leaf's 'compSrcExecute' becomes a queued job or still runs
+    inline. Every other leaf kind never queues anything, so for them the IO
+    layer still just 'pure's its result;
+  * @(,) SrcJobs@ carries the jobs queued while preparing this leaf,
+    combined across leaves via the 'SrcJobs' monoid;
   * 'CompEngineM' is the engine-thread computation that does this leaf's
     actual work -- cache lookups, 'compSrcExecute'\/'compSinkExecute' calls,
-    recursive cap evaluation. Its 'Applicative' sequences effects strictly
-    left to right (see its instance above), which is what keeps leaf order
-    identical to the recursive walk 'doSuspended' used before this type
-    existed -- the golden trace in
+    recursive cap evaluation (or, for a leaf whose work was queued as a job,
+    reading that job's already-finished result back out of its slot). Its
+    'Applicative' sequences effects strictly left to right (see its instance
+    above), which is what keeps leaf order identical to the recursive walk
+    'doSuspended' used before this type existed -- the golden trace in
     "Control.Computations.CompEngine.Tests.TestCompReqCombined" is pinned on
-    exactly that;
+    exactly that, and it is also what gives the leftmost failing job's
+    exception priority over any job to its right (see 'prepSrcLeaf');
   * 'CompM' is the leaf's own deferred result. Combining two leaves'
     'CompM's uses 'CompM'\'s own '<*>' ('compMAp') rather than a hand-rolled
     combinator: reusing it is what preserves 'compMAp'\'s deliberate
@@ -529,15 +541,20 @@ evalCompAp outerCap =
            in pure (return (Fail msg))
     loop env (action >>= contToCompM . cont)
 
-  -- The four "Value" helpers below are the CompReqCombined leaf-preparation
+  -- The "Value" helpers below are the CompReqCombined leaf-preparation
   -- counterparts of doAnyEvalReq/doAnyCacheReq/doCompSinkReq/doCompSrcReq
   -- just above: same bodies, minus the trailing `loop env (... cont)` that
   -- resumes a specific suspended caller, since a leaf being prepared inside
   -- a batch doesn't have one of its own yet -- the whole batch shares a
   -- single continuation, applied once after every leaf's Prep has run (see
   -- prepLeaf and the CompReqCombined case below). None of the original four
-  -- change: this is new code alongside them, not a rewrite of the
-  -- overwhelmingly common single-leaf path.
+  -- doAnyEvalReq/doAnyCacheReq/doCompSinkReq/doCompSrcReq change: this is
+  -- new code alongside them, not a rewrite of the overwhelmingly common
+  -- single-leaf path. The source leaf's counterpart is prepSrcLeaf, not a
+  -- plain "Value" function of this shape: unlike the other three it also
+  -- has to decide, using the registry lookup it needs anyway, whether this
+  -- leaf's compSrcExecute runs inline or as a queued job -- see its own
+  -- haddock.
 
   doAnyEvalReqValue
     :: forall x
@@ -575,50 +592,112 @@ evalCompAp outerCap =
     withCompState (\sif -> trackOutput sif outerCap outputs)
     pure action
 
-  doCompSrcReqValue
-    :: forall a s
+  {- | Build the 'CompM' action for a source leaf, given an already-resolved
+   'CompSrc' instance -- i.e. 'doCompSrcReq'\'s @srcFun@ body, factored out
+   so it has one definition instead of two: 'prepSrcLeaf'\'s inline (the
+   common case: 'FlowSerial', or 'FlowConcurrent' at width 1) branch calls
+   this directly against the instance its own registry lookup already
+   resolved, rather than duplicating the body or looking the instance up a
+   second time.
+  -}
+  runSrcExecuteValue
+    :: forall s a
      . CompSrc s
-    => TypedCompSrcId s
+    => s
     -> CompSrcReq s a
     -> CompEngineM (CompM (Fail a))
-  doCompSrcReqValue srcId req = do
-    let srcFun src = do
-          (inputs, res) <- liftIO $ compSrcExecute src req
-          let retVal =
-                do
-                  mapM_ (dependOn . wrapCompSrcDep src) inputs
-                  return res
-          return retVal
-    reg <- CompEngineM (asks (ce_compFlowRegistry . ce_compEngineIfs))
-    withTypedCompSrcId reg srcId srcFun >>= \case
-      Ok x -> pure x
-      Fail reason ->
-        let msg = "Refusing to run request for data source " ++ show srcId ++ ": " ++ reason
-         in pure (return (Fail msg))
+  runSrcExecuteValue src req = do
+    (inputs, res) <- liftIO $ compSrcExecute src req
+    pure $
+      do
+        mapM_ (dependOn . wrapCompSrcDep src) inputs
+        return res
+
+  {- | The 'CompReqLeaf' counterpart of 'prepLeaf'\'s other three branches,
+   but for 'CompLeafSrc': decides, once, in 'Prep'\'s own 'IO' layer -- using
+   the 'withTypedCompSrcId' lookup this needs anyway, so resolving the
+   instance costs exactly one registry lookup regardless of which branch
+   below is taken, not two (one to read 'compSrcConcurrency', a second to
+   actually call 'compSrcExecute') -- whether this leaf's 'compSrcExecute'
+   call runs inline or gets queued as a job.
+
+   A leaf becomes a job only when BOTH hold: @width@ is more than 1, and
+   this resolved instance declares 'FlowConcurrent'. A 'FlowSerial'
+   instance (regardless of width) or any instance at width 1 takes the
+   inline branch, identical (modulo the already-resolved instance) to what
+   ran here before jobs existed. Also inline whenever
+   'Control.Concurrent.rtsSupportsBoundThreads' is 'False': without real OS-thread
+   concurrency, handing this to 'dispatchJobs'\'s worker pool would only add
+   'Control.Concurrent.Async.replicateConcurrently_'\'s bookkeeping for no
+   actual overlap, so width > 1 is a no-op there rather than a
+   pessimisation.
+  -}
+  prepSrcLeaf
+    :: forall s a
+     . CompSrc s
+    => CompFlowRegistry
+    -> CompFlowConcurrency
+    -> TypedCompSrcId s
+    -> CompSrcReq s a
+    -> Prep (Fail a)
+  prepSrcLeaf reg width sid req =
+    Prep $
+      withTypedCompSrcId reg sid (\src -> pure (src, compSrcConcurrency src)) >>= \case
+        Fail reason ->
+          let msg = "Refusing to run request for data source " ++ show sid ++ ": " ++ reason
+           in pure (mempty, pure (return (Fail msg)))
+        Ok (src, conc)
+          | rtsSupportsBoundThreads
+          , unCompFlowConcurrency width > 1
+          , conc == FlowConcurrent -> do
+              slot <- newIORef Nothing
+              let job = do
+                    res <- trySync (compSrcExecute src req)
+                    writeIORef slot (Just res)
+              pure (SrcJobs (job :), readJobSlot src slot)
+          | otherwise -> pure (mempty, runSrcExecuteValue src req)
+   where
+    -- The engine-thread half of the job branch: read this leaf's own slot
+    -- (written by its worker during the dispatch-then-drain phase that runs
+    -- between Prep's IO layer and this CompEngineM action -- see
+    -- doSuspended's CompReqCombined case) and either re-raise a stored
+    -- exception or finish exactly like the inline path, via 'dependOn'.
+    -- Every leaf's CompEngineM action here is composed leaf-by-leaf through
+    -- CompEngineM's left-to-right Applicative (see Prep's haddock), so an
+    -- exception raised for a leaf earlier in the batch stops any later
+    -- leaf's slot from ever being read -- the leftmost failing leaf is the
+    -- one whose exception escapes, mirroring compMAp's left-error bias at
+    -- the Fail level (Types.hs, compMAp's haddock).
+    readJobSlot
+      :: s
+      -> IORef (Maybe (Either SomeException (CompSrcDeps s, Fail a)))
+      -> CompEngineM (CompM (Fail a))
+    readJobSlot src slot =
+      liftIO (readIORef slot) >>= \case
+        Nothing ->
+          error "prepSrcLeaf: job slot read before dispatchJobs finished -- dispatch-then-drain invariant broken"
+        Just (Left ex) -> liftIO (throwIO ex)
+        Just (Right (inputs, res)) ->
+          pure $
+            do
+              mapM_ (dependOn . wrapCompSrcDep src) inputs
+              return res
 
   isCompReqCombined :: forall r. CompReq r -> Bool
   isCompReqCombined CompReqCombined{} = True
   isCompReqCombined _ = False
 
-  {- | Prepare one leaf of a 'CompReqCombined' batch as a 'Prep' value. In
-   this commit every branch queues no 'SrcJob' (the 'mempty') and just
-   'pure's its own already-built 'CompEngineM' action -- no leaf becomes
-   concurrent work yet, this only isolates leaf preparation from the
-   continuation-passing 'doSuspended' otherwise uses, ahead of a later
-   commit teaching the 'IO' layer to actually queue something.
-
-   Takes the width read from the registry (see 'doSuspended's general path
-   below) as an explicit argument, unused for now, rather than have each
-   branch read it independently: a future commit's per-source-leaf
-   job-or-inline decision needs it, and threading it through here now means
-   that decision won't need a new plumbing path of its own later.
+  {- | Prepare one leaf of a 'CompReqCombined' batch as a 'Prep' value.
+   'CompLeafSrc' is the only leaf kind that can ever queue a job -- see
+   'prepSrcLeaf'; every other kind always runs inline, exactly as before
+   jobs existed.
   -}
-  prepLeaf :: forall r. CompFlowConcurrency -> CompReqLeaf r -> Prep r
-  prepLeaf _width leaf =
+  prepLeaf :: forall r. CompFlowRegistry -> CompFlowConcurrency -> CompReqLeaf r -> Prep r
+  prepLeaf reg width leaf =
     case leaf of
       CompLeafEval cap -> Prep (pure (mempty, pure <$> doAnyEvalReqValue cap))
       CompLeafCache cap -> Prep (pure (mempty, pure <$> doAnyCacheReqValue cap))
-      CompLeafSrc sid req -> Prep (pure (mempty, doCompSrcReqValue sid req))
+      CompLeafSrc sid req -> prepSrcLeaf reg width sid req
       CompLeafSink sid req -> Prep (pure (mempty, doCompSinkReqValue sid req))
 
   doSuspended
@@ -657,22 +736,36 @@ evalCompAp outerCap =
             -- General path, for batches with more than two leaves (deeper
             -- CompReqCombined nesting): flatten the whole thing to its
             -- leaves in one traversal (see traverseCompReq and Prep)
-            -- instead of recursing node by node. Still fully sequential:
-            -- Prep's IO layer never queues a job in this commit, and
-            -- CompEngineM's Applicative sequences every leaf's
-            -- engine-thread effects strictly left to right, so this
-            -- preserves the exact leaf order the recursive walk above has
-            -- (see the golden trace in TestCompReqCombined) -- concurrency
-            -- is future work, not this commit's.
+            -- instead of recursing node by node.
             --
-            -- The width read below is likewise unused for now (see
-            -- prepLeaf's haddock) -- reading it here, once per batch,
-            -- ahead of the traversal is where a later commit needs it to
-            -- already be, so this commit wires that read in without
-            -- changing behaviour.
+            -- Dispatch-then-drain, never overlapping dispatchJobs with the
+            -- engine phase that follows it, for three reasons:
+            --  * allCompSrcChanges (CompFlowRegistry.hs) folds every
+            --    source's compSrcWaitChanges into one STM transaction on
+            --    the engine thread; it must never race a source's
+            --    concurrently-running compSrcExecute, and draining first
+            --    guarantees that;
+            --  * a nested batch (e.g. an eval leaf whose body issues its
+            --    own wide batch) can't starve this pool: by the time
+            --    enginePhase runs (and could recurse into doSuspended
+            --    again), every worker from *this* dispatchJobs call has
+            --    already exited, so no outer worker is still holding a
+            --    pool slot;
+            --  * enginePhase's read of each job leaf's slot (see
+            --    prepSrcLeaf's readJobSlot) can then never block -- the
+            --    job that fills it has unconditionally already finished.
+            -- CompEngineM's Applicative still sequences every (now
+            -- possibly-slot-reading) leaf's engine-thread effects strictly
+            -- left to right (see its instance above), which is what keeps
+            -- leaf order identical to the recursive walk above for
+            -- everything except which source leaves ran concurrently
+            -- during the dispatch phase (see the golden trace in
+            -- TestCompReqCombined, and its width-8 companion assertion
+            -- that only *src* trace entries may float).
             reg <- CompEngineM (asks (ce_compFlowRegistry . ce_compEngineIfs))
             width <- liftIO (readCompFlowConcurrency reg)
-            (_jobs, enginePhase) <- liftIO (unPrep (traverseCompReq (prepLeaf width) req))
+            (jobs, enginePhase) <- liftIO (unPrep (traverseCompReq (prepLeaf reg width) req))
+            liftIO (dispatchJobs (unCompFlowConcurrency width) (srcJobsToList jobs))
             inner <- enginePhase
             loop env (inner >>= contToCompM . cont)
 

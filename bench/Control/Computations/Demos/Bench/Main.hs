@@ -16,7 +16,12 @@
 
  Scale is configurable via the @PERSIST_BENCH_SCALE@ environment variable
  (a float multiplier on every entry of 'baseLevelSizes', each floored at 1;
- defaults to @1.0@, the ~1,000,000-instance configuration).
+ defaults to @1.0@, the ~1,000,000-instance configuration). The
+ 'Control.Computations.CompEngine.CompFlowRegistry.CompFlowConcurrency'
+ width (see 'withCompFlows') is likewise configurable via
+ @PERSIST_BENCH_CONCURRENCY@, defaulting to @1@ -- but this graph never
+ builds a batch wide enough to dispatch a job regardless of width, so
+ changing it is not expected to move any number below.
 
  Rerun counting has no honest way to run from inside a 'CompM' comp body
  (there is no @liftIO@, unlike the Rust benchmark's async bodies which do a
@@ -190,8 +195,27 @@ benchCompDriver counterRef runVar withRegisteredFlows wireComps startVal = do
 -- Flow wiring
 ----------------------------------------
 
+{- | Reads @PERSIST_BENCH_CONCURRENCY@ (defaulting to 1, i.e. today's
+ behaviour: no worker threads) and sets it on @reg@ before registering any
+ flow. Settable here, on the registry @benchCompDriver@ already constructs
+ and hands to this very callback, without forking the driver -- see
+ 'Control.Computations.CompEngine.CompFlowRegistry.CompFlowRegistry's own
+ haddock for why that's exactly the intended way to reach it.
+
+ This exists to let the width knob be exercised end-to-end by this
+ benchmark's own numbers, not because this particular graph has anything to
+ gain from it: every read here is 'HashMapFlow's in-memory
+ 'Control.Computations.FlowImpls.HashMapFlow.hmfLookup' (a 'readTVarIO'),
+ and 'wireAllComps' never combines sibling reads via '<*>' (each level's
+ body sequences its 'evalCompOrFail' calls monadically, one at a time), so
+ no 'CompReqCombined' batch wide enough to dispatch a job is ever built
+ here regardless of width -- see the module haddock's "no speedup at any
+ width" note.
+-}
 withCompFlows :: HashMapFlow -> HashMapFlow -> CompFlowRegistry -> IO () -> IO ()
 withCompFlows kv docSink reg action = do
+  concurrency <- maybe 1 (max 1) . (>>= readMaybe) <$> lookupEnv "PERSIST_BENCH_CONCURRENCY"
+  setCompFlowConcurrency reg (mkCompFlowConcurrency concurrency)
   registerCompSrc reg kv
   registerCompSink reg docSink
   action
