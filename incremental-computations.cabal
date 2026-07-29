@@ -386,7 +386,9 @@ benchmark incremental-computations-bench
   type: exitcode-stdio-1.0
   main-is: Main.hs
   other-modules:
+      Control.Computations.Demos.Bench.Hospital
       Control.Computations.Demos.Bench.Main
+      Control.Computations.Demos.Bench.SystemSrc
       Paths_incremental_computations
   hs-source-dirs:
       bench
