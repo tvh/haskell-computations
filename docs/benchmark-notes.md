@@ -1544,6 +1544,46 @@ own code — `src/` is untouched by this stage.
   no-regression guard; anything else runs the Hospital benchmark). Never
   both in one process.
 
+### Profiling the hospital benchmark — a verified recipe
+
+Two approaches that look reasonable both fail here, and one plain command
+works. All confirmed by actually running them (GHC 9.10.3, this machine),
+not derived from the flags' documented behaviour:
+
+- **`stack bench --profile` does not work.** It installs into the
+  profiling install root but the resulting benchmark binary rejects `-p`
+  outright: `the flag -p requires the program to be built with -prof`.
+- **Adding `--ba "+RTS -p -RTS"` on top of `--profile` is also wrong**,
+  not a fix — `--profile` already appends `+RTS -p -RTS` itself, so the
+  duplicated `-p` makes the RTS print its help text and exit non-zero
+  instead of running the benchmark.
+- **What actually works: build into a separate work directory, then run
+  the profiled binary directly**, bypassing `stack bench`'s runner
+  entirely:
+
+  ```
+  stack build --profile --work-dir .stack-work-profile
+  .stack-work-profile/dist/aarch64-osx/ghc-9.10.3/build/incremental-computations-bench/incremental-computations-bench +RTS -p -A64m -T -RTS
+  ```
+
+  The `aarch64-osx/ghc-9.10.3` path component is this machine's arch/GHC
+  pair, not a portable path — expect it to differ on another machine or
+  toolchain.
+
+- **`+RTS -p` always writes `<program>.prof` into the current working
+  directory, under a fixed name.** Consecutive profiling runs silently
+  overwrite each other's output — this destroyed one run's results during
+  this investigation. `cd` into a scratch directory before running, or
+  rename the `.prof` file immediately after each run, before starting the
+  next.
+- **Profiling slowdown, measured on the hospital benchmark: cold eval
+  20.5 s unprofiled → 211 s profiled, roughly 7–10×.** Budget accordingly
+  before reaching for `+RTS -p`.
+- **To weight a profile toward the rerun path instead of cold
+  evaluation**, use `HOSPITAL_BENCH_RERUN_LOOPS` (see above). At
+  `HOSPITAL_BENCH_RERUN_KEYS=4000 HOSPITAL_BENCH_RERUN_LOOPS=40`, the
+  achieved split was **449 s rerun against 211 s cold — 68% rerun**.
+
 ### Disposition: kept
 
 Width 1 is the default and reproduces every prior stage's numbers exactly
