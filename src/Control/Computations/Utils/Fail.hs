@@ -288,9 +288,8 @@ instance Monad m => MonadPlus (FailT m) where
 failBind :: Fail a -> (a -> Fail b) -> Fail b
 failBind ma f =
   case ma of
-    Ok x -> {-# SCC "Fail/>>=/f" #-} (f x)
-    -- is there a better way to avoid allocations?
-    Fail x -> {-# SCC "Fail/>>=/Fail" #-} (Fail x)
+    Ok x -> f x
+    Fail x -> Fail x
 {-# INLINE failBind #-}
 
 failAp :: Fail (a -> b) -> Fail a -> Fail b

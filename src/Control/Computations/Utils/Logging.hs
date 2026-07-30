@@ -104,6 +104,11 @@ allLogLevels = L.intercalate ", " (map fst logLevelTable)
 logLevel :: IORef LogLevel
 logLevel = unsafePerformIO (newIORef WARN)
 {-# NOINLINE logLevel #-}
+-- NOTE: NOINLINE is load-bearing here, not decorative. Without it GHC may
+-- duplicate this CAF, producing more than one IORef behind the same name --
+-- and setLogLevel would silently write to a different IORef than the one
+-- readers see, so log level changes would just stop working with no error.
+-- Do not remove this in a cleanup.
 
 -- | Set the global log level. Call this once near the start of @main@; the
 -- default is 'WARN' if never called.
