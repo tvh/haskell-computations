@@ -737,6 +737,14 @@ initHospitalSrcs latencyUs =
 totalSystemCallCount :: HospitalSrcs -> IO Int
 totalSystemCallCount srcs = sum <$> traverse (sysCallCount . snd) (namedSrcs srcs)
 
+-- | The bundling counterpart of 'totalSystemCallCount': total
+-- 'compSrcExecuteBatch' round trips across all five sources -- see
+-- 'sysBatchCallCount'. @totalSystemCallCount / totalSystemBatchCallCount@
+-- is the round-trip reduction this feature buys, reportable directly rather
+-- than only inferred from timing.
+totalSystemBatchCallCount :: HospitalSrcs -> IO Int
+totalSystemBatchCallCount srcs = sum <$> traverse (sysBatchCallCount . snd) (namedSrcs srcs)
+
 ----------------------------------------------------------------------------
 -- Rerun-heavy live phase (phase 3): mutate many source keys in one go, so
 -- the incremental engine's rerun path -- otherwise exercised by only 8
@@ -1076,11 +1084,23 @@ hospitalBenchMain = do
   putStrLn ""
   putStrLn "--- source calls ---"
   totalCalls <- totalSystemCallCount srcs
-  printf "total source calls: %d\n" totalCalls
+  totalBatchCalls <- totalSystemBatchCallCount srcs
+  printf "total source requests: %d\n" totalCalls
+  printf "total batch calls: %d\n" totalBatchCalls
+  when (totalBatchCalls > 0) $
+    printf
+      "requests / batch calls: %.2fx\n"
+      (fromIntegral totalCalls / fromIntegral totalBatchCalls :: Double)
   forM_ (namedSrcs srcs) $ \(name, s) -> do
     calls <- sysCallCount s
+    batchCalls <- sysBatchCallCount s
     hw <- sysHighWaterMark s
-    printf "  %-10s calls=%-8d concurrency high-water mark=%d\n" name calls hw
+    printf
+      "  %-10s requests=%-8d batch calls=%-8d concurrency high-water mark=%d\n"
+      name
+      calls
+      batchCalls
+      hw
 
   -- 3. Rerun-heavy live update: mutate many source keys in one go -- spread
   -- across patients and across all five sources via 'rerunMutationTarget' --

@@ -16,10 +16,18 @@
    graph has no latency anywhere to hide, so concurrency can never show up
    in its numbers regardless of width);
  * a __call counter__ and a __concurrency high-water mark__, both plain
-   'IORef'\/'TVar' bookkeeping bumped on every 'compSrcExecute' call, so the
+   'IORef'\/'TVar' bookkeeping bumped on every request served, so the
    benchmark can report how many source calls actually happened and how many
    of them were genuinely observed overlapping (see 'sysCallCount'\/
-   'sysHighWaterMark').
+   'sysHighWaterMark');
+ * a __batch call counter__, separate from the request counter: this type
+   overrides 'compSrcExecuteBatch' (see 'executeBatchImpl') to serve every
+   request the engine has bundled together against this instance with one
+   'readTVarIO' and one simulated-latency 'threadDelay', instead of one of
+   each per request -- 'sysCallCount' still counts every individual request
+   served, so 'sysCallCount' \/ 'sysBatchCallCount' is directly the round-trip
+   reduction this buys, visible in the benchmark's own report rather than
+   only inferred from timing.
 -}
 module Control.Computations.Demos.Bench.SystemSrc (
   SystemSrc,
@@ -30,6 +38,7 @@ module Control.Computations.Demos.Bench.SystemSrc (
   sysInsert,
   sysInsertBatch,
   sysCallCount,
+  sysBatchCallCount,
   sysHighWaterMark,
 ) where
 
@@ -48,6 +57,7 @@ import Control.Concurrent (threadDelay)
 import Control.Concurrent.STM
 import Control.Monad (when)
 import qualified Data.ByteString as BS
+import qualified Data.Foldable as F
 import Data.HashMap.Strict (HashMap)
 import qualified Data.HashMap.Strict as HashMap
 import Data.HashSet (HashSet)
@@ -68,6 +78,7 @@ data SystemSrc = SystemSrc
   , sys_changesVar :: TVar (HashSet SystemDep)
   , sys_latencyUs :: Int
   , sys_callCount :: IORef Int
+  , sys_batchCallCount :: IORef Int
   , sys_inFlight :: TVar Int
   , sys_highWater :: TVar Int
   }
@@ -90,23 +101,33 @@ instance CompSrc SystemSrc where
    backing map -- no write, no lock, nothing here requires calls against this
    instance to be serialized against each other. Declaring 'FlowConcurrent'
    is the entire reason this type exists: with a nonzero 'sys_latencyUs',
-   this is what lets several reads against the same instance overlap their
-   'threadDelay's instead of paying them one after another (see
-   "Control.Computations.CompEngine.Impl"'s @prepSrcLeaf@).
+   this is what lets several reads against *different* instances overlap
+   their 'threadDelay's (see "Control.Computations.CompEngine.Impl"'s
+   @doSuspended@); reads against the *same* instance within one batch don't
+   need that anymore -- see 'compSrcExecuteBatch' below, which collapses
+   them into one delay instead.
   -}
   compSrcConcurrency _ = FlowConcurrent
 
+  -- | The whole reason this type has a per-call latency: a batch of N
+  -- lookups against this instance now pays 'sys_latencyUs' once, not N
+  -- times -- see 'executeBatchImpl'.
+  compSrcExecuteBatch = executeBatchImpl
+
 -- | Build a fresh, empty instance named @ident@ with the given
--- per-'compSrcExecute'-call latency in microseconds (0 disables the delay
--- entirely -- see 'executeImpl').
+-- per-call latency in microseconds (0 disables the delay entirely -- see
+-- 'executeImpl'\/'executeBatchImpl'), paid once per 'compSrcExecute' call
+-- and once per 'compSrcExecuteBatch' call regardless of how many requests
+-- that batch call serves.
 initSystemSrc :: T.Text -> Int -> IO SystemSrc
 initSystemSrc ident latencyUs = do
   dataV <- newTVarIO HashMap.empty
   changesV <- newTVarIO HashSet.empty
   countRef <- newIORef 0
+  batchCountRef <- newIORef 0
   inFlightV <- newTVarIO 0
   highWaterV <- newTVarIO 0
-  pure (SystemSrc ident dataV changesV latencyUs countRef inFlightV highWaterV)
+  pure (SystemSrc ident dataV changesV latencyUs countRef batchCountRef inFlightV highWaterV)
 
 waitChangesImpl :: SystemSrc -> STM (HashSet SystemDep)
 waitChangesImpl sys = do
@@ -116,17 +137,17 @@ waitChangesImpl sys = do
     then retry
     else pure set
 
-{- | Bump the call counter and the in-flight\/high-water pair (both cheap,
- independent of the simulated latency below), optionally sleep
- 'sys_latencyUs' microseconds to stand in for a real service call, then
- answer from the in-memory map. The in-flight bump\/decrement brackets the
- delay specifically so 'sysHighWaterMark' reports how many callers were
- genuinely inside the simulated call at once, not merely how many calls
- happened in total (that's 'sysCallCount').
+{- | Bump the in-flight\/high-water pair, optionally sleep 'sys_latencyUs'
+ microseconds to stand in for a real service call, then decrement -- shared
+ by 'executeImpl' (one request pays this once) and 'executeBatchImpl' (a
+ whole bundled group pays this once total, not once per request -- the
+ collapse this type exists to demonstrate). The in-flight bump\/decrement
+ brackets only the delay, so 'sysHighWaterMark' reports how many *calls*
+ (single or batched) were genuinely inside the simulated wait at once, not
+ how many individual requests were being served -- that's 'sysCallCount'.
 -}
-executeImpl :: SystemSrc -> SystemReq a -> IO (HashSet SystemDep, Fail a)
-executeImpl sys (SystemLookupReq key) = do
-  atomicModifyIORef' (sys_callCount sys) (\n -> (n + 1, ()))
+simulateRoundTrip :: SystemSrc -> IO ()
+simulateRoundTrip sys = do
   atomically $ do
     n <- (+ 1) <$> readTVar (sys_inFlight sys)
     writeTVar (sys_inFlight sys) n
@@ -134,8 +155,47 @@ executeImpl sys (SystemLookupReq key) = do
     when (n > hw) (writeTVar (sys_highWater sys) n)
   when (sys_latencyUs sys > 0) (threadDelay (sys_latencyUs sys))
   atomically (modifyTVar' (sys_inFlight sys) (subtract 1))
+
+-- | Serve exactly one request: bump the request counter by one, pay one
+-- simulated round trip ('simulateRoundTrip'), then answer from the
+-- in-memory map. The engine only ever reaches this for a request that
+-- never joined a batch (see 'Control.Computations.CompEngine.Impl'\'s
+-- @doCompSrcReq@) -- every request inside a 'CompReqCombined' batch is
+-- served by 'executeBatchImpl' instead, however many requests that batch
+-- turns out to hold (including exactly one).
+executeImpl :: SystemSrc -> SystemReq a -> IO (HashSet SystemDep, Fail a)
+executeImpl sys (SystemLookupReq key) = do
+  atomicModifyIORef' (sys_callCount sys) (\n -> (n + 1, ()))
+  simulateRoundTrip sys
   mVal <- HashMap.lookup key <$> readTVarIO (sys_dataVar sys)
   pure (HashSet.singleton (Dep key (fmap largeHash128 mVal)), Ok mVal)
+
+{- | Serve every request the engine bundled together against this instance
+ with __one__ simulated round trip ('simulateRoundTrip', so one
+ 'threadDelay' for the whole group instead of one per request) and __one__
+ 'readTVarIO' snapshot, then answer each request with a pure
+ 'HashMap.lookup' against that shared snapshot. Bumps 'sys_callCount' by
+ the number of requests served (so it keeps meaning \"how many individual
+ lookups happened\" regardless of how they were grouped) and
+ 'sys_batchCallCount' by exactly one (so it means \"how many round trips
+ happened\") -- their ratio is this feature's payoff, directly reportable
+ rather than only inferable from timing.
+-}
+executeBatchImpl :: SystemSrc -> [SrcFetch SystemSrc] -> IO ()
+executeBatchImpl sys fetches = do
+  atomicModifyIORef' (sys_callCount sys) (\n -> (n + length fetches, ()))
+  atomicModifyIORef' (sys_batchCallCount sys) (\n -> (n + 1, ()))
+  simulateRoundTrip sys
+  m <- readTVarIO (sys_dataVar sys)
+  F.for_ fetches (answerFetch m)
+ where
+  -- See "Control.Computations.FlowImpls.HashMapFlow"'s own answerFetch
+  -- helper for why this needs its own top-level-shaped, explicitly-typed
+  -- equation rather than an inline lambda.
+  answerFetch :: HashMap Key Val -> SrcFetch SystemSrc -> IO ()
+  answerFetch m (SrcFetch (SystemLookupReq key) write) =
+    let mVal = HashMap.lookup key m
+     in write (Right (HashSet.singleton (Dep key (fmap largeHash128 mVal)), Ok mVal))
 
 -- | Insert or overwrite @key@, and record the change so a comp body reading
 -- it sees the update -- the source-side mutation hook used for the
@@ -184,9 +244,16 @@ insertOneSTM sys key val = do
     (sys_changesVar sys)
     (HashSet.union (HashSet.singleton (Dep key (Just (largeHash128 val)))))
 
--- | Total number of 'compSrcExecute' calls this instance has served so far.
+-- | Total number of individual requests this instance has served so far,
+-- via either 'executeImpl' or 'executeBatchImpl'.
 sysCallCount :: SystemSrc -> IO Int
 sysCallCount sys = readIORef (sys_callCount sys)
+
+-- | Total number of 'compSrcExecuteBatch' round trips this instance has
+-- served so far -- always <= 'sysCallCount', and 'sysCallCount' \/
+-- 'sysBatchCallCount' is the bundling win as an observed ratio.
+sysBatchCallCount :: SystemSrc -> IO Int
+sysBatchCallCount sys = readIORef (sys_batchCallCount sys)
 
 -- | The largest number of 'compSrcExecute' calls against this instance ever
 -- observed genuinely in flight at once (see 'executeImpl'). 1 means every

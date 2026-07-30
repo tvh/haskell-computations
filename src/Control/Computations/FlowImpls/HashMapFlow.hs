@@ -96,6 +96,12 @@ instance CompSrc HashMapFlow where
   -- 'executeImpl' is a 'readTVarIO' followed by a pure 'HashMap.lookup'.
   compSrcConcurrency _ = FlowConcurrent
 
+  -- | The worked example this type's own module haddock promises: a batch
+  -- of N lookups against this instance becomes one 'readTVarIO' plus N pure
+  -- 'HashMap.lookup's, instead of the default's N separate 'readTVarIO's --
+  -- see 'executeBatchImpl'.
+  compSrcExecuteBatch = executeBatchImpl
+
 initHashMapFlow :: T.Text -> IO HashMapFlow
 initHashMapFlow ident = do
   hmV <- newTVarIO HashMap.empty
@@ -123,6 +129,32 @@ executeImpl hmf (HashMapLookupReq key) =
   do
     mVal <- hmfLookup hmf key
     return (HashSet.singleton (Dep key (fmap largeHash128 mVal)), Ok mVal)
+
+{- | One 'readTVarIO' shared by every request in the batch, then a pure
+ 'HashMap.lookup' per request against that single snapshot -- the same
+ result each request would get on its own (all requests in one batch
+ observe the same map contents; a lookup is read-only, so there's nothing
+ for concurrent writers to race against, no different from N separate
+ 'readTVarIO's each seeing whatever was current when they ran). Every
+ request succeeds or fails independently of its siblings, so there is
+ nothing here for 'Control.Computations.CompEngine.CompSrc.SrcFetch's
+ per-request 'Either' to ever actually carry a 'Left' for.
+-}
+executeBatchImpl :: HashMapFlow -> [SrcFetch HashMapFlow] -> IO ()
+executeBatchImpl hmf fetches = do
+  m <- readTVarIO (hmf_hashMapVar hmf)
+  F.for_ fetches (answerFetch m)
+ where
+  -- Pulled out to its own top-level-shaped equation, with its own type
+  -- signature, rather than an inline lambda matching 'HashMapLookupReq'
+  -- directly inside the 'F.for_' call: GHC's handling of a GADT pattern
+  -- match's type refinement (here, 'HashMapLookupReq'\'s @a ~ Maybe Val@)
+  -- against a still-polymorphic higher-order function's own result type
+  -- otherwise rejects this with an \"untouchable type variable\" error.
+  answerFetch :: HashMap Key Val -> SrcFetch HashMapFlow -> IO ()
+  answerFetch m (SrcFetch (HashMapLookupReq key) write) =
+    let mVal = HashMap.lookup key m
+     in write (Right (HashSet.singleton (Dep key (fmap largeHash128 mVal)), Ok mVal))
 
 {- | Look up the value stored at @key@, if any. Reflects whatever the most
  recent 'hmfInsert' (or a comp body's write through the
