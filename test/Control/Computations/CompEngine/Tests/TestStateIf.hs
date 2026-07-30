@@ -181,13 +181,19 @@ test_srcDepInternTableSharedAcrossManyCapsStaysBoundedAndDrains = do
  'test_srcDepInternTableStaysBoundedAcrossVersionChurn', against
  'Control.Computations.CompEngine.Utils.SrcIndex.KeyIntern': a single cap
  repeatedly re-registers the *same* source key at a new version on every
- run (so the key's dependent set drops to zero and is immediately
- re-populated each time -- see 'SimpleStateIf.removeSrcDependent's haddock
- for why that transient drop-to-zero happens on every version bump even
- though a single row \"holds\" the key throughout). Both the live key count
- and the total ids ever assigned must stay bounded, not grow with the
- number of version bumps -- the id-recycling churn test, on the key side
- rather than the src-dep side.
+ run. Since 'SimpleStateIf.updateEdges' diffs source deps by key (not by
+ the full @(key, version)@ pair), a row that keeps depending on the same
+ key across every rerun never leaves that key's arena at all -- each bump
+ goes through 'SimpleStateIf.updateSrcDependentVersion' in place, so the
+ key's interned id is assigned exactly once and never released\/reassigned
+ for the whole run. (An older version of this engine diffed by the full
+ pair, so every bump *did* transiently drop the key's dependent set to zero
+ and re-add it -- this test predates that fix and its assertions hold more
+ strongly now than when it was written: @assigned@ no longer even
+ approaches the bound below.) Both the live key count and the total ids
+ ever assigned must stay bounded, not grow with the number of version
+ bumps -- the id-recycling churn test, on the key side rather than the
+ src-dep side.
 -}
 test_srcKeyInternTableStaysBoundedAcrossVersionChurn :: IO ()
 test_srcKeyInternTableStaysBoundedAcrossVersionChurn = do
@@ -255,7 +261,7 @@ test_srcIndexInvalidatesOnlyTheMismatchedDependent =
       dequeueGivenCap sif bar2 >>= liftIO . assertEqual True
       dequeueGivenCap sif bar1 >>= liftIO . assertEqual False
 
-{- | 'SimpleStateIf.removeSrcDependent' reports a source key as a garbage
+{- | 'SimpleStateIf.removeSrcDependentKey' reports a source key as a garbage
  dep (for \"Run.hs\" to unregister) exactly when its dependent set drops to
  zero. Checks 'capEvaluationFinished's returned 'Garbage' directly, rather
  than only through an app-level effect (e.g. DirSync's own check that a

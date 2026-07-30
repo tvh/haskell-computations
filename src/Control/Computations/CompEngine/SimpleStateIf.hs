@@ -176,7 +176,7 @@ newtype SimpleStateIf m = SimpleStateIf
  a @HashMap AnyCompSrcKey (HashMap DefRef AnyCompSrcVer)@ (a boxed
  existential key hashed/compared on every access, nested inside a second
  boxed HAMT). A key's arena is created on its first dependent and deleted
- on its last -- see 'addSrcDependent'\/'removeSrcDependent'.
+ on its last -- see 'addSrcDependent'\/'removeSrcDependentKey'.
 -}
 data SifState = SifState
   { sifs_defIndex :: !(IORef (HashMap CompId DT.DefIdx))
@@ -745,7 +745,7 @@ freeRowCascade st defIdx row = do
       writeIORef (sifs_outputs st) $! outs'
       removeFromStale st ref
       compGarbage <- fmap mconcat $ forM (VU.toList myCompDeps) $ \t -> removeRdep st (DT.mkDefRefUnsafe t) ref
-      srcGarbageKeys <- fmap catMaybes $ forM (HashSet.toList mySrcDeps) $ \dep -> removeSrcDependent st dep ref
+      srcGarbageKeys <- fmap catMaybes $ forM (HashSet.toList mySrcDeps) $ \dep -> removeSrcDependentKey st (depKey dep) ref
       -- Only outputs nothing *else* still claims are actually garbage --
       -- e.g. two rows both writing to sink key "output": one dying must
       -- not delete a key the other is still producing. Filtered against
@@ -764,15 +764,20 @@ freeRowCascade st defIdx row = do
             <> outsGarbage
         )
 
--- | Add @ref@ (observed at @dep@'s version) as a dependent of @dep@'s
--- source key, interning the key on first use and creating its arena. A
--- second add for a @ref@ already present in this key's arena is not
--- deduplicated -- see 'SI.skaAppend's haddock for why the real call path
--- never hits that case.
-addSrcDependent :: SifState -> AnyCompSrcDep -> DefRef -> IO ()
-addSrcDependent st dep ref = do
-  let key = depKey dep
-      ver = depVer dep
+-- | Add @ref@ (observed at @ver@) as a dependent of @key@, interning the
+-- key on first use and creating its arena. A second add for a @ref@
+-- already present in this key's arena is not deduplicated -- see
+-- 'SI.skaAppend's haddock for why the real call path never hits that case.
+--
+-- Takes @key@\/@ver@ directly rather than an @AnyCompSrcDep@: its only
+-- caller, 'updateEdges', already has both in hand from its own by-key diff
+-- (which must compute @depKey@ per dependency to do the diff at all), and
+-- re-deriving them here from a passed-in @dep@ would be a second
+-- reconstruction of the same existential-wrapped key\/version for every
+-- dependency, not just a style choice -- see 'updateEdges'\' haddock on why
+-- that reconstruction cost is worth avoiding.
+addSrcDependent :: SifState -> AnyCompSrcKey -> AnyCompSrcVer -> DefRef -> IO ()
+addSrcDependent st key ver ref = do
   keyId <- SI.kiIntern (sifs_srcKeyIntern st) key
   entries <- readIORef (sifs_srcEntries st)
   arena <- case IntMap.lookup (SI.unSrcKeyId keyId) entries of
@@ -786,10 +791,14 @@ addSrcDependent st dep ref = do
 -- | Remove @ref@ from a source key's dependent set; if that empties it,
 -- drop the key's arena and release its interned id, reporting it as a
 -- garbage dep (for 'Control.Computations.CompEngine.Run' to tell the
--- source to unregister it), returning 'Just' that key.
-removeSrcDependent :: SifState -> AnyCompSrcDep -> DefRef -> IO (Maybe AnyCompSrcKey)
-removeSrcDependent st dep ref = do
-  let key = depKey dep
+-- source to unregister it), returning 'Just' that key. Takes the key
+-- directly rather than a full @AnyCompSrcDep@ -- a dep's version was never
+-- used for removal (a row is removed from a key's arena by its @ref@
+-- alone, see 'SI.skaRemove'), and 'updateEdges' (this function's only
+-- caller) only has a bare key on hand for a key a row no longer depends on
+-- at all, not a leftover @AnyCompSrcDep@ to extract one from.
+removeSrcDependentKey :: SifState -> AnyCompSrcKey -> DefRef -> IO (Maybe AnyCompSrcKey)
+removeSrcDependentKey st key ref = do
   mKeyId <- SI.kiLookup (sifs_srcKeyIntern st) key
   case mKeyId of
     Nothing -> pure Nothing
@@ -807,10 +816,72 @@ removeSrcDependent st dep ref = do
               pure (Just key)
             else pure Nothing
 
--- | Update a row's forward edge columns (comp-deps with their observed
--- versions, and src-deps) from old to new, diffing to add/remove the
--- corresponding rdeps/src-index entries, cascading garbage collection for
--- anything that becomes unreferenced as a result.
+-- | Update the version stored for @ref@'s existing dependency on @key@, for
+-- a row that depended on this key both before and after a rerun but
+-- observed a new version of it -- the common case for an ordinary rerun of
+-- a row whose set of depended-on keys didn't change. Locates the row's
+-- entry in the key's arena and overwrites its version in place
+-- ('SI.skaUpdateVer'); never touches 'SI.KeyIntern' or the arena's length.
+-- Caller's responsibility, mirroring 'SI.skaUpdateVer's own: @ref@ must
+-- already be interned against @key@ -- 'updateEdges' only calls this for
+-- keys its own by-key diff found in both the old and new src-dep sets, so
+-- that always holds on the real call path; a miss is a lifecycle bug.
+updateSrcDependentVersion :: SifState -> AnyCompSrcKey -> AnyCompSrcVer -> DefRef -> IO ()
+updateSrcDependentVersion st key ver ref = do
+  mKeyId <- SI.kiLookup (sifs_srcKeyIntern st) key
+  case mKeyId of
+    Nothing ->
+      error "SimpleStateIf.updateSrcDependentVersion: key not interned -- a bug (updateEdges' by-key diff should guarantee this)"
+    Just keyId -> do
+      entries <- readIORef (sifs_srcEntries st)
+      case IntMap.lookup (SI.unSrcKeyId keyId) entries of
+        Nothing ->
+          error "SimpleStateIf.updateSrcDependentVersion: interned key has no arena -- a bug"
+        Just arena -> do
+          found <- SI.skaUpdateVer arena ref ver
+          unless found $
+            error "SimpleStateIf.updateSrcDependentVersion: ref not present in this key's arena -- a bug (updateEdges' by-key diff should guarantee this)"
+
+{- | Update a row's forward edge columns (comp-deps with their observed
+ versions, and src-deps) from old to new, diffing to add/remove the
+ corresponding rdeps/src-index entries, cascading garbage collection for
+ anything that becomes unreferenced as a result.
+
+ The source-dep side is diffed by *key alone*, not by the full
+ @(key, version)@ pair. An ordinary rerun that observes the same source key
+ at a newer version -- the overwhelmingly common case, since most reruns
+ don't change *which* keys a row reads at all -- is exactly a key present
+ in both @oldSrc@ and @newSrc@ at different versions; diffing on the pair
+ would (and, before this comment, did) report that as one removal and one
+ addition against the same reverse-index arena entry, for a row and a key
+ that are both unchanged. Diffing by key turns that into what it actually
+ is: no reverse-index add\/remove at all, just an in-place version update
+ via 'updateSrcDependentVersion'. A genuinely new key still goes through
+ 'addSrcDependent', and a key no longer depended on at all still goes
+ through 'removeSrcDependentKey' -- only the "same key, new version" middle
+ case changed.
+
+ The by-key diff itself is done in a single pass over @newSrc@
+ ('classifySrcDep' below), rather than by first computing @HashSet.map
+ depKey newSrc@ as a standalone set and separately re-deriving each
+ dependency's key again while walking @newSrc@ a second time: 'depKey' does
+ not just read a field off an already-built value, it re-wraps
+ 'AnyCompSrcKey'\'s existential ('CompFlow.hs'\'s 'ForAnyCompFlow', which
+ closes over several typeclass dictionaries alongside the key itself), so
+ calling it more than once per dependency is a real, measured cost, not
+ bookkeeping paranoia -- an earlier draft of this function computed it up to
+ three times per dependency (once building a throwaway key set via
+ @HashSet.map depKey newSrc@, once in the classification loop, once more
+ inside 'addSrcDependent' from a re-passed @dep@) and that alone was enough
+ to raise the Hospital benchmark's @max_live_bytes@ by \~13.6% even on a
+ cold-eval-only run with the rerun-heavy phase disabled -- i.e. purely from
+ the "add" branch every cold-eval dependency already took, not from
+ anything to do with the update-in-place path this function exists to add.
+ 'depVer' is cheap by contrast (a field projection out of an
+ already-existentially-wrapped value), but is threaded the same way for
+ symmetry and because 'addSrcDependent'\/'updateSrcDependentVersion' need it
+ regardless.
+-}
 updateEdges
   :: DefTable p a
   -> SifState
@@ -827,28 +898,42 @@ updateEdges dt st row oldCompVer newCompVerMap oldSrc newSrc = do
       newCompTargets = IntMap.keysSet newCompVerMap
       addedComp = IntSet.difference newCompTargets oldCompTargets
       removedComp = IntSet.difference oldCompTargets newCompTargets
-      addedSrc = HashSet.difference newSrc oldSrc
-      removedSrc = HashSet.difference oldSrc newSrc
+      -- The old keys, computed once (depKey per oldSrc element, unavoidable
+      -- -- this is the only place that ever learns "a key was there before")
+      -- so 'classifySrcDep' below can test each new dependency's key for
+      -- membership without ever looking at oldSrc again.
+      oldSrcKeys = HashSet.map depKey oldSrc
       newEdges =
         VU.fromList
           [DT.CompDepEdge t (encodeVer v) | (t, v) <- IntMap.toList newCompVerMap]
+      -- Classify one newSrc dependency, computing its key exactly once:
+      -- 'Just' when this key was already in oldSrcKeys (kept -- version
+      -- update in place), 'Nothing' when it wasn't (genuinely new -- add).
+      -- Both branches run their IO effect immediately (this is a fold step,
+      -- not a pure classifier) so the caller never needs to re-inspect
+      -- @dep@ or recompute its key.
+      classifySrcDep dep = do
+        let key = depKey dep
+            ver = depVer dep
+        if HashSet.member key oldSrcKeys
+          then updateSrcDependentVersion st key ver row
+          else addSrcDependent st key ver row
+        pure key
 
   DT.writeCompDeps dt (DT.refRow row) newEdges
   DT.writeSrcDeps dt (DT.refRow row) newSrc
 
-  -- Removes before adds, deliberately: removedSrc/addedSrc are diffed on
-  -- the *full* (key, version) pair, so a row observing the same source key
-  -- at a new version produces both a removal (old key@version) and an
-  -- addition (new key@version) for the *same* row against the *same*
-  -- se_dependents entry -- but addSrcDependent/removeSrcDependent both key
-  -- off the row alone (se_dependents doesn't have room for "the same row,
-  -- twice, at two versions"). Adding first and removing second would let
-  -- the stale removal wipe the fresh add right back out.
   compGarbage <- fmap mconcat $ forM (IntSet.toList removedComp) $ \t -> removeRdep st (DT.mkDefRefUnsafe t) row
   forM_ (IntSet.toList addedComp) $ \t -> addRdep st (DT.mkDefRefUnsafe t) row
 
-  srcGarbageKeys <- fmap catMaybes $ forM (HashSet.toList removedSrc) $ \dep -> removeSrcDependent st dep row
-  forM_ (HashSet.toList addedSrc) $ \dep -> addSrcDependent st dep row
+  -- One pass over newSrc: add-or-update each dependency (see
+  -- 'classifySrcDep' above) while accumulating the keys newSrc actually
+  -- has, so that whatever's left in oldSrcKeys afterwards -- keys this row
+  -- depended on before that newSrc never visited -- is exactly the removed
+  -- set, with no second depKey pass over either side needed to find it.
+  newSrcKeysSeen <- foldM (\seen dep -> (`HashSet.insert` seen) <$> classifySrcDep dep) HashSet.empty (HashSet.toList newSrc)
+  let removedSrcKeys = HashSet.difference oldSrcKeys newSrcKeysSeen
+  srcGarbageKeys <- fmap catMaybes $ forM (HashSet.toList removedSrcKeys) $ \key -> removeSrcDependentKey st key row
 
   pure (compGarbage <> mempty{garbage_deps = HashSet.fromList srcGarbageKeys})
 

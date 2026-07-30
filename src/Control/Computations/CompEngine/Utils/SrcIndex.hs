@@ -51,7 +51,7 @@
  recycle-on-last-removal lifecycle is the *correct* match for this shape,
  not a shortcut that happens to avoid refcounting -- there is only ever one
  thing to ask "is anyone still holding this?", and it already exists
- ('SimpleStateIf.removeSrcDependent'\'s own "did this key's dependent set
+ ('SimpleStateIf.removeSrcDependentKey'\'s own "did this key's dependent set
  just become empty?" check). Interning 'AnyCompSrcVer' *would* reopen the
  many:1 sharing problem (the same version value can be the current
  observation of many different rows at once) -- which is exactly why this
@@ -113,9 +113,9 @@
  orphan-old-span, amortize via periodic compaction. The reverse source
  index has a different access pattern: many different rows mutate the
  *same* key's dependent list one entry at a time
- ('SimpleStateIf.addSrcDependent'\/'removeSrcDependent', each handling one
- 'AnyCompSrcDep' at a time, called from a per-dep @forM_@ over a diffed
- edge set), so there is no "whole span" to replace and 'EdgeArena'\'s
+ ('SimpleStateIf.addSrcDependent'\/'removeSrcDependentKey', each handling one
+ key\/ref pair at a time, called from a single fold over a row's newly
+ diffed source deps), so there is no "whole span" to replace and 'EdgeArena'\'s
  machinery does not fit. 'SrcKeyArena' is the structure that /does/ fit
  single-entry mutation: a plain growable unboxed\/boxed column pair per key
  with append at the tail and O(current key size) linear-scan-then-
@@ -140,21 +140,30 @@
    refcounting, because ownership here is 1:1 (see "Why KeyIntern needs no
    refcounting" above), unlike 'DefTable.hs'\'s @SrcDepIntern@.
  * A caller only ever releases a key id after its own bookkeeping
-   ('SimpleStateIf.removeSrcDependent') has confirmed the key's dependent
+   ('SimpleStateIf.removeSrcDependentKey') has confirmed the key's dependent
    arena just became empty -- 'kiRelease' on a key with a live dependent is
    always a lifecycle bug, not a legitimate state.
 
  __Per-key dependent arena ('SrcKeyArena'):__
 
  * 'skaAppend' does not deduplicate -- a second append for a ref already
-   present in the arena adds a second entry. Safe only because every real
-   call path removes the old @(key, version)@ entry before adding the new
-   one on a version change ("SimpleStateIf.hs"'s @updateEdges@, "removes
-   before adds, deliberately").
+   present in the arena adds a second entry. Safe because 'skaAppend' is
+   only ever reached for a source key a row was *not* already depending on:
+   "SimpleStateIf.hs"'s @updateEdges@ diffs old vs. new source deps by key,
+   not by @(key, version)@, so "genuinely new key" and "same key, new
+   version" are distinguished at the call site, and only the former routes
+   here -- the latter goes through 'skaUpdateVer' instead, which overwrites
+   the existing entry's version in place and never appends.
  * 'skaRemove' is swap-with-last, not a stable shift -- order is not part
    of this structure's contract.
- * __Every write through 'skaAppend' must force @ver@ to WHNF.__
-   'skaAppend' does this itself (the @!ver@ bang) precisely because
+ * 'skaUpdateVer' locates the entry by the same linear scan 'skaRemove'
+   uses, then overwrites its version column slot in place -- no length
+   change, no swap, no 'KeyIntern' churn. Caller's responsibility: @ref@
+   must already be present (every real call site's own by-key diff
+   guarantees this -- see above); a miss returns 'False' rather than
+   inserting.
+ * __Every write through 'skaAppend' or 'skaUpdateVer' must force @ver@ to
+   WHNF.__ Both do this themselves (the @!ver@ bang) precisely because
    'Data.Vector.Mutable.write' carries no strictness contract of its own --
    see "A boxed side column needs to force its own writes" above; this is
    the one invariant on this list that is not obvious from the types alone,
@@ -178,6 +187,7 @@ module Control.Computations.CompEngine.Utils.SrcIndex (
   newSrcKeyArena,
   skaAppend,
   skaRemove,
+  skaUpdateVer,
   skaToList,
   skaNull,
   skaLiveCount,
@@ -336,14 +346,15 @@ growBoth ska needed = do
 -- | Append one @(ref, ver)@ entry, forcing @ver@ to WHNF before storing it.
 --
 -- Caller's responsibility: if @ref@ is already present, this appends a
--- *second* entry rather than updating the first. Every call site removes
--- the old entry before adding the new one when a dependent re-registers at
--- a different version (see "SimpleStateIf.hs"'s @updateEdges@, "removes
--- before adds, deliberately"), so a live duplicate never actually occurs on
--- the real call path; a direct 'skaAppend' misuse would silently
--- double-count rather than fail loudly, which is why the module's own
--- tests exercise the ordering this depends on directly rather than
--- trusting the invariant silently.
+-- *second* entry rather than updating the first. Every real call site only
+-- reaches 'skaAppend' for a key the row was not already depending on --
+-- "SimpleStateIf.hs"'s @updateEdges@ diffs old vs. new source deps by key,
+-- so a dependent re-registering the *same* key at a new version is routed
+-- to 'skaUpdateVer' instead (overwrite in place, never append) -- so a live
+-- duplicate never actually occurs on the real call path; a direct
+-- 'skaAppend' misuse would silently double-count rather than fail loudly,
+-- which is why the module's own tests exercise the by-key routing this
+-- depends on directly rather than trusting the invariant silently.
 --
 -- Forcing @ver@ is not optional. @AnyCompSrcVer@'s constructor, like every
 -- constructor in this codebase, has strict fields by default
@@ -375,7 +386,7 @@ skaAppend ska ref !ver = do
 -- 'EdgeArena'\'s append-orphan-compact scheme, which this module
 -- deliberately does not need -- see the module haddock). Returns 'True' iff
 -- an entry was found and removed; a caller that expects @ref@ to be
--- present (there isn't one here -- see 'SimpleStateIf.removeSrcDependent',
+-- present (there isn't one here -- see 'SimpleStateIf.removeSrcDependentKey',
 -- which tolerates a miss deliberately) can check the result.
 skaRemove :: SrcKeyArena -> DefRef -> IO Bool
 skaRemove ska ref = do
@@ -398,6 +409,40 @@ skaRemove ska ref = do
         lastVer <- VM.read vv lastIdx
         VM.write vv i lastVer
       writeIORef (ska_len ska) lastIdx
+      pure True
+
+-- | Overwrite the stored version for @ref@'s existing entry in place,
+-- forcing @ver@ to WHNF before storing it (same strictness requirement as
+-- 'skaAppend' -- see its haddock). Locates the entry via the same linear
+-- scan 'skaRemove' performs, but -- unlike 'skaRemove' followed by
+-- 'skaAppend' -- reuses the slot rather than shrinking then regrowing the
+-- arena: no swap-with-last, no length change, no 'KeyIntern' round trip
+-- even transiently. This is strictly less work than a remove/re-add pair
+-- for the same @(key, row)@: one linear scan instead of two, one boxed
+-- write instead of two (plus, when the removed entry wasn't the arena's
+-- last, 'skaRemove'\'s own swap writes a second time), and zero unboxed
+-- 'ska_refs' writes since @ref@ itself never changes.
+--
+-- Returns 'False' (rather than inserting) if @ref@ is not present. Every
+-- real call site ("SimpleStateIf.hs"'s @updateEdges@, via
+-- @updateSrcDependentVersion@) only reaches this after its own by-key diff
+-- has confirmed @ref@ already depends on this key, so a 'False' result
+-- there is a lifecycle bug, not a legitimate runtime occurrence.
+skaUpdateVer :: SrcKeyArena -> DefRef -> AnyCompSrcVer -> IO Bool
+skaUpdateVer ska ref !ver = do
+  len <- readIORef (ska_len ska)
+  rv <- readIORef (ska_refs ska)
+  let go i
+        | i >= len = pure Nothing
+        | otherwise = do
+            r <- VUM.read rv i
+            if r == ref then pure (Just i) else go (i + 1)
+  found <- go 0
+  case found of
+    Nothing -> pure False
+    Just i -> do
+      vv <- readIORef (ska_vers ska)
+      VM.write vv i ver
       pure True
 
 -- | Every currently-live @(ref, ver)@ pair, in unspecified order: order is
