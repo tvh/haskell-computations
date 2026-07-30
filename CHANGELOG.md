@@ -35,6 +35,18 @@ and this project adheres to the
 - `COMP_ENGINE_LOCK_STATS` env var: when set, instruments the engine's
   single state-lock with acquisition count and total hold time, printed at
   engine shutdown. Off by default; adds no overhead when unset.
+- A third phase on the Hospital pipeline benchmark: a rerun-heavy live
+  update that mutates many source keys in one batch (spread across patients
+  and all five sources) and times the incremental engine's rerun path at a
+  scale the existing single-key live phases (8 reruns each) cannot exercise
+  — 400 keys by default, ~3,069 reruns. Runs on every plain
+  `HOSPITAL_BENCH=1 stack bench` invocation; reports keys mutated, wall
+  time, reruns, and µs/rerun. Env vars: `HOSPITAL_BENCH_RERUN_KEYS` (0
+  disables the phase), `HOSPITAL_BENCH_RERUN_LOOPS` (repeats the round,
+  mirroring the scale benchmark's `PERSIST_BENCH_LIVE_LOOPS`). Also adds
+  `SystemSrc.sysInsertBatch`, an atomic multi-key insert — the naive
+  "many separate `sysInsert` calls, then one `waitForFullSettle`" approach
+  races the driver thread and can silently undercount reruns.
 
 ### Fixed
 

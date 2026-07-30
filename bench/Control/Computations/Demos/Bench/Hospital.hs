@@ -55,6 +55,25 @@
  live-update section) for the full reproduction; it is not repeated here,
  only relied upon.
 
+ __Rerun-heavy live phase__: phases 1-2 (cold eval, then one changed vitals
+ key) leave the incremental engine's rerun path almost unexercised -- one
+ mutated key cascades to only 8 reruns (vitalComp -> vitalWindowComp ->
+ riskScoreComp -> patientSummaryComp\/patientAlertComp -> that patient's ward
+ comps -> the dashboard), nowhere near enough to justify any rerun-path
+ optimisation by measurement. A third phase (see 'hospitalBenchMain's own
+ comment, and 'rerunMutationTarget'\/'defaultRerunKeys') mutates many keys in
+ one batch -- spread across patients (and therefore wards) and across all
+ five sources, via a stride chosen so a batch far smaller than the patient
+ count still touches the full id range -- so the same fan-in that makes 1
+ key worth 8 reruns makes a few hundred keys worth thousands. Configurable
+ via @HOSPITAL_BENCH_RERUN_KEYS@ (keys per round, 0 disables the phase) and
+ @HOSPITAL_BENCH_RERUN_LOOPS@ (repeated rounds, mirroring
+ "Control.Computations.Demos.Bench.Main"'s @PERSIST_BENCH_LIVE_LOOPS@), and
+ reported as keys mutated, wall time, reruns, and microseconds\/rerun -- the
+ last being the number future rerun-path work should be judged against, and
+ comparable round to round regardless of how @HOSPITAL_BENCH_RERUN_KEYS@ is
+ tuned.
+
  = Memory: why the first cut of this benchmark was 13x heavier per instance
 
  The engine's per-def row storage
@@ -718,6 +737,78 @@ initHospitalSrcs latencyUs =
 totalSystemCallCount :: HospitalSrcs -> IO Int
 totalSystemCallCount srcs = sum <$> traverse (sysCallCount . snd) (namedSrcs srcs)
 
+----------------------------------------------------------------------------
+-- Rerun-heavy live phase (phase 3): mutate many source keys in one go, so
+-- the incremental engine's rerun path -- otherwise exercised by only 8
+-- reruns in phase 2 -- gets exercised at a scale worth measuring. See the
+-- module haddock and 'hospitalBenchMain'\'s own phase-3 comment.
+----------------------------------------------------------------------------
+
+-- | Default @HOSPITAL_BENCH_RERUN_KEYS@: keys mutated per phase-3 round.
+-- Chosen empirically at scale 1.0 (1000 patients): 400 keys, spread via
+-- 'rerunMutationTarget' across all five sources and (thanks to the 9973
+-- stride) the full patient\/ward range, reproducibly produced 3,069 reruns
+-- (measured via 'sysInsertBatch', see that function's own haddock for why an
+-- earlier, unbatched version of this phase gave a *nondeterministic* count
+-- here instead) -- roughly 380x phase 2's 8-computation cascade, i.e. a
+-- genuinely \"rerun-heavy\" round -- in under a second (~0.8 s measured),
+-- alongside a ~15-20 s cold eval. Small enough to leave the total benchmark
+-- runtime cold-eval-dominated (this is a rerun-path microbenchmark bolted
+-- onto the existing cold-eval benchmark, not a replacement for it); large
+-- enough that the reruns aren't swamped by fixed per-round overhead (settle
+-- polling, 'getCurrentTime' calls). Reruns scale roughly linearly with key
+-- count in this range (measured: 100 keys -> 807 reruns, 700 -> 5,322,
+-- 1000 -> 7,578 -- all ~7.6-8.1 reruns\/key), so this default is a runtime
+-- choice, not a ceiling. 'HOSPITAL_BENCH_RERUN_LOOPS' exists precisely so a
+-- profiling run can push the balance further towards reruns without
+-- changing this default.
+defaultRerunKeys :: Int
+defaultRerunKeys = 400
+
+-- | Distinct payload written to every phase-3 mutation target, keyed by a
+-- globally unique index @n@ (see 'rerunMutationTarget's caller, which never
+-- reuses an @n@ -- not even across repeated rounds via
+-- @HOSPITAL_BENCH_RERUN_LOOPS@) so no two mutations ever collide on content,
+-- and every mutation is a genuinely fresh value even when it lands on a key
+-- an earlier round already touched. Deliberately far longer than every
+-- 'valOf' fallback's 8 bytes, with genuinely different bytes per @n@, so
+-- both length-derived results ('admissionComp') and content-derived results
+-- (every 'valWord64' fold) actually change -- not merely the version tag the
+-- engine's own dependency matching keys off of. Mirrors the existing
+-- single-key phase's own 40-byte-vs-8-byte trick (see 'hospitalBenchMain'\'s
+-- phase-2 comment).
+rerunMutationVal :: Int -> Val
+rerunMutationVal n = BSC.pack ("rerun-" ++ show n ++ "-") <> BSC.replicate 32 'r'
+
+{- | The @n@-th (0-indexed, globally unique across every phase-3 round)
+ mutation target: cycles through the five sources every 5 steps and picks a
+ patient via a 9973 stride -- prime, and therefore coprime to every
+ 'scaledPatientCount' this module's scale knob can produce (always
+ @round (1000 * scale)@, never a multiple of the prime 9973 at any scale this
+ benchmark is run at) -- rather than @n \`mod\` patientCount@, so a batch far
+ smaller than @patientCount@ still spreads across the /entire/ patient id
+ range, and therefore across every ward, not just a low contiguous prefix.
+
+ Sub-ids (vital\/lab\/med\/note id) advance once per lap through the five
+ sources, so each source's /first/ hit in a batch lands on sub-id 0 -- the
+ same sub-id 'patientSummaryComp' itself reads directly in its cross-system
+ batch (vitals\/labs\/pharmacy\/notes at sub-id 0, see that comp's own
+ definition) -- giving those particular hits a second, independent
+ propagation path on top of the indirect chain the module haddock describes
+ (vitalComp -> vitalWindowComp -> riskScoreComp -> ...).
+-}
+rerunMutationTarget :: HospitalSrcs -> Int -> Int -> (SystemSrc, Key)
+rerunMutationTarget srcs patientCount n =
+  case n `mod` 5 of
+    0 -> (hsrc_adt srcs, adtKey p)
+    1 -> (hsrc_vitals srcs, vitalValueKey (p, subId `mod` fromIntegral vitalsPerPatient))
+    2 -> (hsrc_labs srcs, labResultKey (p, subId `mod` fromIntegral labsPerPatient))
+    3 -> (hsrc_pharmacy srcs, medOrderKey (p, subId `mod` fromIntegral medsPerPatient))
+    _ -> (hsrc_notes srcs, noteTextKey (p, subId `mod` fromIntegral notesPerPatient))
+ where
+  p = fromIntegral ((n * 9973) `mod` patientCount) :: PatId
+  subId = fromIntegral (n `div` 5) :: Word32
+
 {- | Registers all five sources plus the sink, and sets the registry's
  'CompFlowConcurrency' width -- done here, inside the very
  @withRegisteredFlows@ callback 'hospitalBenchDriver' (mirroring
@@ -933,7 +1024,7 @@ hospitalBenchMain = do
   -- stopping on an unchanged cached hash -- see the module's live-update
   -- reasoning.
   sysInsert (hsrc_vitals srcs) (vitalValueKey (0, 0)) (BSC.replicate 40 'x')
-  _rs3 <- waitForFullSettle runVar (rs_run rs2 + 1)
+  rs3 <- waitForFullSettle runVar (rs_run rs2 + 1)
   tAfterMutate <- getCurrentTime
   liveReruns <- readIORef counterRef
   let liveWallTime = realToFrac (diffUTCTime tAfterMutate tBeforeMutate) :: Double
@@ -972,6 +1063,83 @@ hospitalBenchMain = do
     calls <- sysCallCount s
     hw <- sysHighWaterMark s
     printf "  %-10s calls=%-8d concurrency high-water mark=%d\n" name calls hw
+
+  -- 3. Rerun-heavy live update: mutate many source keys in one go -- spread
+  -- across patients and across all five sources via 'rerunMutationTarget' --
+  -- and time until the *entire* resulting cascade fully settles. This is
+  -- something phase 2 above cannot stand in for: one vitals key cascades
+  -- vitalComp -> vitalWindowComp -> riskScoreComp ->
+  -- patientSummaryComp\/patientAlertComp -> that patient's ward comps -> the
+  -- dashboard (8 reruns total, see the module haddock's "Why" motivation),
+  -- so a few hundred keys spread the same way produces a rerun count two to
+  -- three orders of magnitude larger -- enough to actually measure the
+  -- incremental engine's rerun path rather than gesture at it.
+  --
+  -- Runs unconditionally at a nonzero default, unlike
+  -- "Control.Computations.Demos.Bench.Main"'s off-by-default
+  -- @PERSIST_BENCH_LIVE_LOOPS@ diagnostic: this phase (not phase 2) is what
+  -- future rerun-path optimisation work is meant to be judged against, so it
+  -- has to run -- and be reported -- on every plain @HOSPITAL_BENCH=1 stack
+  -- bench@ invocation. Set @HOSPITAL_BENCH_RERUN_KEYS=0@ to disable it
+  -- entirely, e.g. to isolate phases 1-2's own state-lock cost under
+  -- @COMP_ENGINE_LOCK_STATS@ by differencing two whole-process runs (see
+  -- docs/benchmark-notes.md) -- the accumulate-to-close-only nature of that
+  -- instrumentation is exactly why this phase must exist as an on/off
+  -- switch, not just a "does it exist" question.
+  --
+  -- @HOSPITAL_BENCH_RERUN_LOOPS@ (default 1, i.e. one round) repeats the
+  -- whole mutate-and-settle round, mirroring @PERSIST_BENCH_LIVE_LOOPS@, so
+  -- a profile taken over the whole process can be made to skew arbitrarily
+  -- far towards rerun cost rather than cold eval.
+  --
+  -- Settle discipline: starting from @rs_run rs3 + 1@ needs no timeout
+  -- fallback, unlike the cold-drain wait after phase 1 -- 'rs3' is itself
+  -- 'waitForFullSettle's postcondition (genuinely 0 leftover stale caps)
+  -- from phase 2's *real* mutation, so with 'rcif_emptyChangesMode' = 'Block'
+  -- the engine is provably parked at run 'rs_run rs3' by the time we get
+  -- here, exactly the situation phase 2's own mutation relied on relative to
+  -- 'rs2' (see that comment above).
+  rerunKeysPerRound <- readEnvIntAtLeast 0 "HOSPITAL_BENCH_RERUN_KEYS" defaultRerunKeys
+  rerunRounds <- readEnvIntAtLeast 1 "HOSPITAL_BENCH_RERUN_LOOPS" 1
+  when (rerunKeysPerRound > 0) $ do
+    nextRunRef <- newIORef (rs_run rs3 + 1)
+    roundRerunsRef <- newIORef (0 :: Int)
+    tRerunStart <- getCurrentTime
+    forM_ [0 .. rerunRounds - 1] $ \round_ -> do
+      before <- readIORef counterRef
+      let batch =
+            [ (src, key, rerunMutationVal globalIdx)
+            | i <- [0 .. rerunKeysPerRound - 1]
+            , let globalIdx = round_ * rerunKeysPerRound + i
+                  (src, key) = rerunMutationTarget srcs patientCount globalIdx
+            ]
+      -- One 'sysInsertBatch' call, not @rerunKeysPerRound@ separate
+      -- 'sysInsert' calls -- see that function's own haddock for why a
+      -- multi-key "in one go" mutation *must* land in a single STM
+      -- transaction to avoid the engine's driver thread observing (and
+      -- fully settling on) a partial batch before the rest of this round's
+      -- writes have even happened.
+      sysInsertBatch batch
+      nextRun <- readIORef nextRunRef
+      rsN <- waitForFullSettle runVar nextRun
+      writeIORef nextRunRef (rs_run rsN + 1)
+      after <- readIORef counterRef
+      modifyIORef' roundRerunsRef (+ (after - before))
+    tRerunEnd <- getCurrentTime
+    rerunReruns <- readIORef roundRerunsRef
+    let rerunWall = realToFrac (diffUTCTime tRerunEnd tRerunStart) :: Double
+        totalKeysMutated = rerunKeysPerRound * rerunRounds
+    putStrLn ""
+    putStrLn "--- 3. rerun-heavy live update (multi-key, HOSPITAL_BENCH_RERUN_KEYS/_LOOPS) ---"
+    printf
+      "keys mutated per round: %d, rounds: %d, total keys mutated: %d\n"
+      rerunKeysPerRound
+      rerunRounds
+      totalKeysMutated
+    printf "wall time: %.4f s\n" rerunWall
+    printf "reruns: %d\n" rerunReruns
+    when (rerunReruns > 0) $
+      printf "us/rerun: %.3f\n" (rerunWall * 1e6 / fromIntegral rerunReruns :: Double)
 
   cancel engineHandle
  where

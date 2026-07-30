@@ -28,6 +28,7 @@ module Control.Computations.Demos.Bench.SystemSrc (
   Val,
   initSystemSrc,
   sysInsert,
+  sysInsertBatch,
   sysCallCount,
   sysHighWaterMark,
 ) where
@@ -141,7 +142,43 @@ executeImpl sys (SystemLookupReq key) = do
 -- benchmark's live-update phase (mirrors
 -- 'Control.Computations.FlowImpls.HashMapFlow.hmfInsert').
 sysInsert :: SystemSrc -> Key -> Val -> IO ()
-sysInsert sys key val = atomically $ do
+sysInsert sys key val = atomically (insertOneSTM sys key val)
+
+-- | Insert or overwrite many @(source, key, value)@ triples -- possibly
+-- against several different 'SystemSrc' instances -- in one single STM
+-- transaction, so they become visible to the engine as one indivisible unit.
+--
+-- This is not just a convenience: it is load-bearing for any caller that
+-- wants to mutate more than one key \"in one go\" and then wait for the
+-- engine to settle. 'compSrcWaitChanges' (see 'waitChangesImpl') is an STM
+-- @retry@ loop, and STM wakes a blocked transaction \-\- and lets it commit
+-- \-\- as soon as *any* single 'TVar' it reads changes, not once every write
+-- a caller /intends/ as one batch has landed. A caller that instead issues
+-- @N@ separate 'sysInsert' calls races its own remaining writes against the
+-- driver thread: the driver's blocked
+-- "Control.Computations.CompEngine.CompFlowRegistry".@allCompSrcChanges@
+-- transaction can wake on the *first* write, process only that one change,
+-- and report a run with zero leftover stale caps while the other @N-1@
+-- writes are still pending -- which is indistinguishable, from
+-- 'Control.Computations.CompEngine.Driver.waitForFullSettle's own
+-- perspective, from \"genuinely fully drained\" (see that function's
+-- haddock and the callers' own settle-discipline comments). The result is a
+-- silent undercount, not a crash: confirmed by hand, a batch of 1,000
+-- separate 'sysInsert' calls followed by one 'waitForFullSettle' produced
+-- 1,981 reruns on one process run and 7,578 on another, for the identical
+-- mutation set. Committing every write in the batch inside one 'atomically'
+-- block removes the race outright: STM guarantees the whole transaction is
+-- either invisible to every other transaction or fully visible, so the
+-- driver can never observe a partial batch.
+sysInsertBatch :: [(SystemSrc, Key, Val)] -> IO ()
+sysInsertBatch = atomically . mapM_ (\(sys, key, val) -> insertOneSTM sys key val)
+
+-- | Shared by 'sysInsert' and 'sysInsertBatch': record @val@ at @key@ in
+-- @sys@'s data map and its change set. Not itself wrapped in 'atomically' --
+-- callers compose it into whatever transaction they need (a single-key one
+-- for 'sysInsert', an arbitrarily-sized one for 'sysInsertBatch').
+insertOneSTM :: SystemSrc -> Key -> Val -> STM ()
+insertOneSTM sys key val = do
   modifyTVar' (sys_dataVar sys) (HashMap.insert key val)
   modifyTVar'
     (sys_changesVar sys)

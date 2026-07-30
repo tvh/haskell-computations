@@ -278,6 +278,19 @@ source latency, in microseconds, to stand in for a real service call;
 `HOSPITAL_BENCH_CONCURRENCY` (default `1`) sets the concurrent flow
 execution width (see below).
 
+After its cold eval and single-key live update, the Hospital benchmark also
+runs a rerun-heavy live phase: it mutates many source keys in one batch
+(spread across patients and all five sources) and reports keys mutated,
+wall time, reruns, and µs/rerun -- the number future rerun-path work should
+be judged against. `HOSPITAL_BENCH_RERUN_KEYS` (default `400`, ~3,069
+reruns at scale 1.0; `0` disables the phase) sets keys mutated per round;
+`HOSPITAL_BENCH_RERUN_LOOPS` (default `1`) repeats the round, mirroring the
+scale benchmark's `PERSIST_BENCH_LIVE_LOOPS` diagnostic (see
+`bench/Control/Computations/Demos/Bench/Main.hs`).
+
+For measured numbers, what the optimization work found, and the two bugs that
+came out of it, seeand `docs/benchmark-notes.md`.
+
 [`docs/benchmark-notes.md`](docs/benchmark-notes.md) has measured numbers
 from prior runs, stage by stage, with what was kept and what was reverted.
 
