@@ -958,6 +958,7 @@ hospitalBenchMain = do
   runVar <- newTVarIO None
   counterRef <- newIORef 0
   t0 <- getCurrentTime
+  allocated0 <- allocated_bytes <$> getRTSStats
   engineHandle <-
     async
       ( hospitalBenchDriver
@@ -974,7 +975,16 @@ hospitalBenchMain = do
   tCold <- getCurrentTime
   coldReruns <- readIORef counterRef
   rssCold <- getRssMb
+  allocatedCold <- allocated_bytes <$> getRTSStats
   let coldWallTime = realToFrac (diffUTCTime tCold t0) :: Double
+      -- 'allocated_bytes' is GHC's own running total of bytes allocated
+      -- since process start -- program-driven, not GC-driven, so for a fixed
+      -- program and input it should be stable run to run, in a way wall time
+      -- on this machine has proven not to be (same-session, same-code wall
+      -- time has been observed to vary roughly 2x run to run, well above the
+      -- 5-15% effect sizes this benchmark exists to detect). The delta
+      -- across a phase boundary is that phase's own allocation.
+      coldAllocated = allocatedCold - allocated0
 
   putStrLn "--- 1. cold eval ---"
   printf
@@ -984,6 +994,10 @@ hospitalBenchMain = do
     (100 * (fromIntegral coldReruns - fromIntegral targetInstances) / fromIntegral targetInstances :: Double)
   printf "wall time: %.3f s\n" coldWallTime
   printf "RSS after cold settle: %.1f MB\n" rssCold
+  printf
+    "allocated_bytes (cold eval): %d (%.1f MB)\n"
+    coldAllocated
+    (fromIntegral coldAllocated / 1000000 :: Double)
 
   docsAfterCold <- getHashMap sink
   let expectedDocs = patientCount
@@ -1018,6 +1032,7 @@ hospitalBenchMain = do
   -- 2. Live incremental update: mutate one vitals key and time until the
   -- driver's next propagation round fully settles.
   tBeforeMutate <- getCurrentTime
+  allocatedPreLive <- allocated_bytes <$> getRTSStats
   -- 40 bytes, deliberately far from every 8-byte 'valOf' fallback default so
   -- the content-derived numbers this graph computes ('valWord64' folds,
   -- specifically) actually change rather than propagating one hop and
@@ -1026,14 +1041,17 @@ hospitalBenchMain = do
   sysInsert (hsrc_vitals srcs) (vitalValueKey (0, 0)) (BSC.replicate 40 'x')
   rs3 <- waitForFullSettle runVar (rs_run rs2 + 1)
   tAfterMutate <- getCurrentTime
+  allocatedPostLive <- allocated_bytes <$> getRTSStats
   liveReruns <- readIORef counterRef
   let liveWallTime = realToFrac (diffUTCTime tAfterMutate tBeforeMutate) :: Double
       liveRerunCount = liveReruns - preLiveReruns
+      liveAllocated = allocatedPostLive - allocatedPreLive
 
   putStrLn ""
   putStrLn "--- 2. live incremental, 1 changed vitals key ---"
   printf "wall time: %.4f s\n" liveWallTime
   printf "reruns: %d\n" liveRerunCount
+  printf "allocated_bytes (live update): %d\n" liveAllocated
 
   rssFinal <- getRssMb
   rtsStats <- getRTSStats
@@ -1105,6 +1123,7 @@ hospitalBenchMain = do
     nextRunRef <- newIORef (rs_run rs3 + 1)
     roundRerunsRef <- newIORef (0 :: Int)
     tRerunStart <- getCurrentTime
+    allocatedRerunStart <- allocated_bytes <$> getRTSStats
     forM_ [0 .. rerunRounds - 1] $ \round_ -> do
       before <- readIORef counterRef
       let batch =
@@ -1126,9 +1145,11 @@ hospitalBenchMain = do
       after <- readIORef counterRef
       modifyIORef' roundRerunsRef (+ (after - before))
     tRerunEnd <- getCurrentTime
+    allocatedRerunEnd <- allocated_bytes <$> getRTSStats
     rerunReruns <- readIORef roundRerunsRef
     let rerunWall = realToFrac (diffUTCTime tRerunEnd tRerunStart) :: Double
         totalKeysMutated = rerunKeysPerRound * rerunRounds
+        rerunAllocated = allocatedRerunEnd - allocatedRerunStart
     putStrLn ""
     putStrLn "--- 3. rerun-heavy live update (multi-key, HOSPITAL_BENCH_RERUN_KEYS/_LOOPS) ---"
     printf
@@ -1138,8 +1159,20 @@ hospitalBenchMain = do
       totalKeysMutated
     printf "wall time: %.4f s\n" rerunWall
     printf "reruns: %d\n" rerunReruns
-    when (rerunReruns > 0) $
+    printf
+      "allocated_bytes: %d (%.1f MB)\n"
+      rerunAllocated
+      (fromIntegral rerunAllocated / 1000000 :: Double)
+    when (rerunReruns > 0) $ do
       printf "us/rerun: %.3f\n" (rerunWall * 1e6 / fromIntegral rerunReruns :: Double)
+      -- The comparable-across-machines number: 'allocated_bytes' is
+      -- program-driven (GHC's own running allocation counter), unlike
+      -- us\/rerun above, which is wall-clock-derived and therefore inherits
+      -- whatever noise this machine's scheduler, other processes, and GC
+      -- pause timing contribute on top of the work actually done.
+      printf
+        "allocated_bytes/rerun: %.1f B/rerun\n"
+        (fromIntegral rerunAllocated / fromIntegral rerunReruns :: Double)
 
   cancel engineHandle
  where

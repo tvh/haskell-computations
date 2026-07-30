@@ -357,6 +357,7 @@ benchMain = do
   runVar <- newTVarIO None
   counterRef <- newIORef 0
   t0 <- getCurrentTime
+  allocated0 <- allocated_bytes <$> getRTSStats
   engineHandle <-
     async
       ( benchCompDriver
@@ -376,8 +377,20 @@ benchMain = do
   tCold <- getCurrentTime
   coldReruns <- readIORef counterRef
   rssCold <- getRssMb
+  allocatedCold <- allocated_bytes <$> getRTSStats
 
   let coldWallTime = realToFrac (diffUTCTime tCold t0) :: Double
+      -- 'allocated_bytes' is GHC's own running total of bytes allocated
+      -- since process start -- program-driven, not GC-driven, so for a fixed
+      -- program and input it should be stable run to run, in a way wall time
+      -- on this machine has proven not to be (see
+      -- "Control.Computations.Demos.Bench.Hospital"'s equivalent note for the
+      -- measured magnitude). The delta across a phase boundary is that
+      -- phase's own allocation, independent of when GC happens to run.
+      -- Deliberately *not* folded into the wall-time printf above -- these
+      -- are two independently useful numbers, and burying one inside the
+      -- other's format string would make either harder to grep out of a log.
+      coldAllocated = allocatedCold - allocated0
   putStrLn "--- 1. cold eval (no persistence) ---"
   printf
     "achieved instance count: %d (target ~%.0f, %+.1f%%)\n"
@@ -386,6 +399,10 @@ benchMain = do
     (100 * (fromIntegral coldReruns - targetInstances) / targetInstances)
   printf "wall time: %.3f s\n" coldWallTime
   printf "RSS after cold settle: %.1f MB\n" rssCold
+  printf
+    "allocated_bytes (cold eval): %d (%.1f MB)\n"
+    coldAllocated
+    (fromIntegral coldAllocated / 1000000 :: Double)
 
   -- Assert every top-level doc was written, mirroring the Rust benchmark's
   -- own assertion.
@@ -468,17 +485,21 @@ benchMain = do
   -- 'RunStats' the driver posts is therefore guaranteed to report the
   -- outcome of processing *this* mutation.
   tBeforeMutate <- getCurrentTime
+  allocatedPreLive <- allocated_bytes <$> getRTSStats
   hmfInsert kv "0" "13371337"
   _rs3 <- waitForFullSettle runVar (rs_run rs2 + 1)
   tAfterMutate <- getCurrentTime
+  allocatedPostLive <- allocated_bytes <$> getRTSStats
   liveReruns <- readIORef counterRef
   let liveWallTime = realToFrac (diffUTCTime tAfterMutate tBeforeMutate) :: Double
       liveRerunCount = liveReruns - preLiveReruns
+      liveAllocated = allocatedPostLive - allocatedPreLive
 
   putStrLn ""
   putStrLn "--- 2. live incremental, 1 changed input (no persistence) ---"
   printf "wall time: %.4f s\n" liveWallTime
   printf "reruns: %d\n" liveRerunCount
+  printf "allocated_bytes (live update): %d\n" liveAllocated
 
   rssFinal <- getRssMb
   rtsStats <- getRTSStats
@@ -517,6 +538,7 @@ benchMain = do
     nextRunRef <- newIORef (rs_run rs2 + 1)
     loopRerunsRef <- newIORef (0 :: Int)
     tLoopStart <- getCurrentTime
+    allocatedLoopStart <- allocated_bytes <$> getRTSStats
     forM_ [1 .. liveLoops - 1] $ \n -> do
       let key = BSC.pack (show (n `mod` fromIntegral srcKeys :: Int))
           val = BSC.pack (show (1000000 + n :: Int))
@@ -528,14 +550,28 @@ benchMain = do
       after <- readIORef counterRef
       modifyIORef' loopRerunsRef (+ (after - before))
     tLoopEnd <- getCurrentTime
+    allocatedLoopEnd <- allocated_bytes <$> getRTSStats
     loopReruns <- readIORef loopRerunsRef
     let loopWall = realToFrac (diffUTCTime tLoopEnd tLoopStart) :: Double
+        loopAllocated = allocatedLoopEnd - allocatedLoopStart
     putStrLn ""
     putStrLn "--- 2b. live incremental loop (diagnostic, PERSIST_BENCH_LIVE_LOOPS) ---"
     printf "loop iterations: %d\n" (liveLoops - 1)
     printf "loop wall time: %.4f s\n" loopWall
     printf "loop reruns: %d\n" loopReruns
-    when (loopReruns > 0) $
+    printf
+      "loop allocated_bytes: %d (%.1f MB)\n"
+      loopAllocated
+      (fromIntegral loopAllocated / 1000000 :: Double)
+    when (loopReruns > 0) $ do
       printf "loop us/rerun: %.3f\n" (loopWall * 1e6 / fromIntegral loopReruns :: Double)
+      -- A program-driven, GC-timing-independent proxy for work done per
+      -- rerun, comparable across runs and across machines in a way
+      -- wall-clock us/rerun above is not: 'allocated_bytes' counts what GHC
+      -- allocated, not how long the OS scheduler and GC pauses happened to
+      -- take to get there.
+      printf
+        "loop allocated_bytes/rerun: %.1f B/rerun\n"
+        (fromIntegral loopAllocated / fromIntegral loopReruns :: Double)
 
   cancel engineHandle
