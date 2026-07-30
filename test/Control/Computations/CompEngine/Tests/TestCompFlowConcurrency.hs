@@ -3,12 +3,25 @@
 
 {- | Exercises the bounded worker pool a wide 'CompReqCombined' batch (see
  "Control.Computations.CompEngine.Types") may dispatch 'FlowConcurrent'
- source leaves to once 'Control.Computations.CompEngine.CompFlowRegistry.setCompFlowConcurrency'
+ source *groups* to once 'Control.Computations.CompEngine.CompFlowRegistry.setCompFlowConcurrency'
  raises a registry's width above 1 -- see "Control.Computations.CompEngine.Impl"'s
- @prepSrcLeaf@\/@Prep@\/@SrcJobs@ for the implementation these tests pin
- down. "Control.Computations.CompEngine.Tests.TestCompReqCombined" keeps the
- width-1 (default, unchanged-behaviour) regression guards; this module is
- specifically about width > 1.
+ @prepSrcLeaf@\/@Prep@\/@SrcGroup@\/@runGroupOnce@ for the implementation
+ these tests pin down. "Control.Computations.CompEngine.Tests.TestCompReqCombined"
+ keeps the width-1 (default, unchanged-behaviour) regression guards; this
+ module is specifically about width > 1.
+
+ Since every 'CompLeafSrc' leaf resolving to the same instance within one
+ batch is now bundled into a single
+ 'Control.Computations.CompEngine.CompSrc.compSrcExecuteBatch' call (see
+ that method's haddock), "several requests against the same instance
+ overlap at width > 1" is no longer something the engine's job dispatch
+ provides by itself -- a batch against one instance is one call regardless
+ of width. It is still achievable, but now it is the instance's own
+ responsibility, via its 'compSrcExecuteBatch' override (see
+ 'ConcurrentBatchSrc' below) -- exactly like a real batched backend that can
+ issue several sub-requests of one round trip concurrently would do it
+ itself, rather than relying on the engine to schedule its point lookups on
+ separate threads.
 
  Every test here builds its own 'Control.Computations.CompEngine.CompFlowRegistry.CompFlowRegistry'
  by hand (rather than going through "Control.Computations.CompEngine.Tests.TestHelper"'s
@@ -32,7 +45,7 @@ import Control.Computations.CompEngine.Core
 import Control.Computations.CompEngine.Run
 import Control.Computations.CompEngine.Tests.ObservingStateIf
 import Control.Computations.CompEngine.Types
-import Control.Computations.Utils.ConcUtils (timeout)
+import Control.Computations.Utils.ConcUtils (timeout, trySync)
 import Control.Computations.Utils.Fail
 import Control.Computations.Utils.TimeSpan
 
@@ -154,11 +167,67 @@ runMutualExclusionCase conc =
     runOnce reg (mutexMainCompDef (typedCompSrcIdOf src))
     readTVarIO highWater
 
+-- | All eight requests above land in one batch against one instance, so the
+-- engine bundles them into a single 'compSrcExecuteBatch' call regardless
+-- of 'FlowConcurrency' or width (see the module haddock) -- 'ScriptedSrc'
+-- never overrides that method, so its default (sequential) implementation
+-- serves all eight itself, one at a time, whether the instance declares
+-- 'FlowSerial' or 'FlowConcurrent'. This is the width-1-style "no overlap"
+-- case for *both* declarations now; 'FlowConcurrent's own overlap guarantee
+-- moves to 'test_flowConcurrentSourceGenuinelyOverlapsAtWidth8' below, via
+-- an instance that actually implements it.
 test_flowSerialSourceNeverOverlapsAtWidth8 :: IO ()
 test_flowSerialSourceNeverOverlapsAtWidth8 =
   do
     hw <- runMutualExclusionCase FlowSerial
     assertEqual 1 hw
+
+test_flowConcurrentSourceWithDefaultBatchExecNeverOverlapsAtWidth8 :: IO ()
+test_flowConcurrentSourceWithDefaultBatchExecNeverOverlapsAtWidth8 =
+  do
+    hw <- runMutualExclusionCase FlowConcurrent
+    assertEqual 1 hw
+
+----------------------------------------------------------------------------
+-- 1a: a source whose 'compSrcExecuteBatch' override actually parallelizes
+-- its own sub-requests -- what "several requests against one instance
+-- overlap" now requires, since bundling means the engine itself only ever
+-- makes one call per instance per batch (see the module haddock).
+----------------------------------------------------------------------------
+
+-- | Like 'ScriptedSrc', but overrides 'compSrcExecuteBatch' to run every
+-- request in the group concurrently via 'Async.mapConcurrently_', the shape
+-- a real batched backend capable of overlapping its own sub-requests within
+-- one round trip (e.g. several concurrent socket reads multiplexed over one
+-- connection) would use. 'compSrcExecute' itself is never called here
+-- (nothing in these tests issues a genuinely unbatched request), so it is
+-- left undefined-but-never-forced\'s cousin: a body that would only run if
+-- something regressed and started bypassing the batch override.
+data ConcurrentBatchSrc = ConcurrentBatchSrc
+  { cbs_name :: T.Text
+  , cbs_action :: IO Int
+  }
+  deriving (Typeable)
+
+instance CompSrc ConcurrentBatchSrc where
+  type CompSrcReq ConcurrentBatchSrc = ScriptedReq
+  type CompSrcKey ConcurrentBatchSrc = Int
+  type CompSrcVer ConcurrentBatchSrc = Int
+  compSrcInstanceId = CompSrcInstanceId . cbs_name
+  compSrcExecute src ScriptedReq =
+    do
+      v <- cbs_action src
+      pure (HashSet.singleton (Dep 0 v), Ok v)
+  compSrcUnregister _ _ = pure ()
+  compSrcWaitChanges _ = retry
+  compSrcConcurrency _ = FlowConcurrent
+  compSrcExecuteBatch src fs =
+    Async.mapConcurrently_ (\(SrcFetch req write) -> trySync (compSrcExecute src req) >>= write) fs
+
+mutexConcurrentMainCompDef :: TypedCompSrcId ConcurrentBatchSrc -> CompDef () ()
+mutexConcurrentMainCompDef srcId =
+  defineComp "mutex-concurrent-main" inMemoryShowCaching $ \() ->
+    void (traverse (\_ -> compSrcReq srcId ScriptedReq) [1 .. 8 :: Int])
 
 -- | Guarded on 'rtsSupportsBoundThreads' so this can't go flaky on a
 -- non-threaded RTS, where width > 1 is deliberately a no-op (see
@@ -168,7 +237,14 @@ test_flowConcurrentSourceGenuinelyOverlapsAtWidth8 :: IO ()
 test_flowConcurrentSourceGenuinelyOverlapsAtWidth8 =
   when rtsSupportsBoundThreads $
     do
-      hw <- runMutualExclusionCase FlowConcurrent
+      inFlight <- newTVarIO 0
+      highWater <- newTVarIO 0
+      let src = ConcurrentBatchSrc "mutex-concurrent-src" (mkOverlapAction inFlight highWater)
+      reg <- newCompFlowRegistry
+      setCompFlowConcurrency reg (mkCompFlowConcurrency 8)
+      registerCompSrc reg src
+      runOnce reg (mutexConcurrentMainCompDef (typedCompSrcIdOf src))
+      hw <- readTVarIO highWater
       assertBool (hw > 1)
 
 ----------------------------------------------------------------------------

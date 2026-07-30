@@ -14,6 +14,7 @@ module Control.Computations.CompEngine.CompSrc (
   CompSrcDep,
   CompSrcDeps,
   CompSrc (..),
+  SrcFetch (..),
   FlowConcurrency (..),
   CompSrcId,
   TypedCompSrcId,
@@ -39,12 +40,15 @@ module Control.Computations.CompEngine.CompSrc (
 ---------------------------------------
 
 import Control.Computations.CompEngine.CompFlow
+import Control.Computations.Utils.ConcUtils (trySync)
 import Control.Computations.Utils.Types
 
 ----------------------------------------
 -- EXTERNAL
 ---------------------------------------
 import Control.Concurrent.STM
+import Control.Exception (SomeException)
+import Control.Monad (forM_)
 import Data.Data
 import Data.HashSet
 import Data.Hashable
@@ -117,6 +121,24 @@ instance IsString CompSrcInstanceId where
 data FlowConcurrency = FlowSerial | FlowConcurrent
   deriving (Eq, Show)
 
+{- | One request queued as part of a same-instance batch (see
+ 'compSrcExecuteBatch'), paired with the callback that must receive its own
+ result. A batch mixes together requests with different result types --
+ 'CompSrcReq s a' is indexed by @a@, so a plain @['CompSrcReq' s a]@ would not
+ typecheck for a batch spanning more than one @a@ -- so, following Haxl's
+ @BlockedFetch@ (Marlow et al, "There is no Fork", ICFP'14), each request's
+ own @a@ is hidden behind this existential, alongside the callback that
+ already knows how to consume that same @a@. The callback takes an
+ 'Either' 'SomeException' rather than a bare result so a batched
+ implementation can report one request's failure without having to fail
+ (or fake a result for) every other request sharing the call -- see
+ 'compSrcExecuteBatch's default for the base case, and
+ "Control.Computations.CompEngine.Impl" for how the engine uses this to
+ keep its leftmost-failing-leaf-wins guarantee across a bundled group.
+-}
+data SrcFetch s
+  = forall a. SrcFetch (CompSrcReq s a) (Either SomeException (CompSrcDeps s, Fail a) -> IO ())
+
 class (Typeable s, IsCompFlowData (CompSrcKey s), IsCompFlowData (CompSrcVer s)) => CompSrc s where
   type CompSrcReq s :: Type -> Type
   type CompSrcKey s :: Type
@@ -131,6 +153,38 @@ class (Typeable s, IsCompFlowData (CompSrcKey s), IsCompFlowData (CompSrcVer s))
   -- engine runs this source's requests on its own thread, one at a time.
   compSrcConcurrency :: s -> FlowConcurrency
   compSrcConcurrency _ = FlowSerial
+
+  {- | Execute every request the engine has bundled together against this
+   one instance -- everything a comp body's applicative batch asked of this
+   source, gathered into a single round trip -- rather than one
+   'compSrcExecute' call per request. Defaults to running each request in
+   turn via 'compSrcExecute', catching its own synchronous exception into
+   its own callback (so a request's failure never prevents its siblings in
+   the same batch from reporting their own results -- see 'SrcFetch'):
+   exactly the pre-batching behaviour, so an existing 'CompSrc' instance
+   defined outside this repo keeps compiling, and keeps behaving exactly as
+   it always has, without ever needing to know this method exists.
+
+   Override this when a genuinely cheaper batched round trip is available --
+   one @IN (...)@ query instead of N point lookups against a real database,
+   one lock acquisition instead of N against an in-memory store, one
+   simulated service call instead of N -- see
+   "Control.Computations.FlowImpls.HashMapFlow" for a worked (in-memory)
+   example, and "Control.Computations.Demos.Bench.SystemSrc" for one with
+   simulated latency, where collapsing N delays into one is the entire
+   point.
+
+   The engine bundles every 'CompLeafSrc' leaf that resolves to the same
+   instance within one applicative batch and calls this exactly once for
+   the whole group -- see "Control.Computations.CompEngine.Impl"'s
+   @SrcGroup@\/@runGroupOnce@ -- regardless of concurrency width: bundling
+   needs no worker thread, so it applies even at width 1, and even to a
+   'FlowSerial' instance (which still only ever sees one caller of this
+   method at a time, exactly as it does for 'compSrcExecute').
+  -}
+  compSrcExecuteBatch :: s -> [SrcFetch s] -> IO ()
+  compSrcExecuteBatch s fs =
+    forM_ fs $ \(SrcFetch req write) -> trySync (compSrcExecute s req) >>= write
 
 data CompSrcId = CompSrcId
   { csi_type :: TypeId
