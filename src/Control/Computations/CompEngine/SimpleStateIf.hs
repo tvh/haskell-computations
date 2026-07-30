@@ -84,6 +84,8 @@ module Control.Computations.CompEngine.SimpleStateIf (
   debugTotalSrcDepInternLiveCount,
   debugSrcKeyInternLiveCount,
   debugSrcKeyInternAssignedCount,
+  CompactionReportRow (..),
+  debugCompactionStats,
 )
 where
 
@@ -269,6 +271,48 @@ debugSrcKeyInternLiveCount st = SI.kiLiveCount (sifs_srcKeyIntern st)
 -}
 debugSrcKeyInternAssignedCount :: SifState -> IO Int
 debugSrcKeyInternAssignedCount st = SI.kiAssignedCount (sifs_srcKeyIntern st)
+
+-- | One row of 'debugCompactionStats'''s report: a def paired with one of
+-- its three edge arenas' lifetime compaction stats. A named record, not a
+-- bare tuple -- 'crDefLabel' and 'crArenaKind' are both 'String', and this
+-- codebase's established practice around same-typed tuple slots (see
+-- "Utils/DefTable.hs"'s 'DT.CompDepEdge' haddock, and its own
+-- 'DT.ArenaCompactionStats' just below this) is to close the positional-
+-- swap hazard by naming the fields rather than leaving them positional.
+data CompactionReportRow = CompactionReportRow
+  { crDefLabel :: !String
+  -- ^ the owning def's 'CompId', rendered via 'show', wherever its entry
+  -- in 'sifs_defs' is resolvable -- which is always, in practice, since
+  -- every 'DT.DefIdx' 'withDefFor' hands out immediately gets a
+  -- 'sifs_defs' entry alongside it; there is no code path that reaches
+  -- 'debugCompactionStats' with a 'DT.DefIdx' that lacks one. Kept
+  -- reachable-vs-not in the phrasing (not hardcoded to "always the name")
+  -- because 'debugCompactionStats' walks 'sifs_defs' by construction, so a
+  -- future caller resolving a stray 'DT.DefIdx' some other way would need
+  -- the same fallback this haddock describes, even though today's only
+  -- caller never exercises it.
+  , crArenaKind :: !String
+  -- ^ @"compDeps"@ \/ @"rdeps"@ \/ @"srcDeps"@ -- see
+  -- 'DT.defArenaCompactionStats'.
+  , crStats :: !DT.ArenaCompactionStats
+  }
+
+{- | Debug/report-only: every def's per-arena-kind edge-arena compaction
+ stats, tagged with the def's name -- see 'CompactionReportRow'. Walks
+ every def the same "IntMap.toList, one DT call per entry" shape
+ 'debugTotalSrcDepInternLiveCount' already uses. Exists purely to feed
+ "Run.hs"'s @COMP_ENGINE_LOCK_STATS@ close-time report (the hypothesis
+ being tested there is whether CSR arena compaction, not per-rerun
+ recomputation, is what a live-update round actually pays for); not part
+ of 'CompEngineStateIf', never called by "Impl.hs".
+-}
+debugCompactionStats :: SifState -> IO [CompactionReportRow]
+debugCompactionStats st = do
+  defs <- readIORef (sifs_defs st)
+  fmap concat $ forM (IntMap.elems defs) $ \(SomeDefEntry comp dt) -> do
+    let label = show (comp_name comp)
+    arenaStats <- DT.defArenaCompactionStats dt
+    pure [CompactionReportRow label kind stats | (kind, stats) <- arenaStats]
 
 mkSimpleCompEngineStateIf
   :: (MonadIO m)

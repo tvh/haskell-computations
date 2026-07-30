@@ -31,6 +31,7 @@ import Control.Computations.CompEngine.Core
 import qualified Control.Computations.CompEngine.Impl as Impl
 import Control.Computations.CompEngine.SimpleStateIf
 import Control.Computations.CompEngine.Types
+import Control.Computations.CompEngine.Utils.DefTable (ArenaCompactionStats (..))
 import Control.Computations.Utils.Logging
 import qualified Control.Computations.Utils.MultiMap as MM
 import Control.Computations.Utils.TimeSpan
@@ -198,6 +199,54 @@ printMethodStatsTable methods = do
     totalCalls
     (fromIntegral totalNs / (1e9 :: Double))
 
+-- | Print the edge-arena compaction breakdown: one row per (def, arena
+-- kind) pair that has compacted at least once (see 'debugCompactionStats'),
+-- sorted by total compaction time descending, plus a grand total. This is
+-- the report the hospital-benchmark investigation in
+-- @docs\/benchmark-notes.md@ reads by differencing two runs' worth of it
+-- (one with the rerun phase disabled, one with it enabled) to isolate how
+-- much of a live-update round's cost 'DT.eaCompact' actually accounts for
+-- -- see that doc's "CSR compaction" section for the methodology and the
+-- 'DT.eaCompact' haddock in "Utils/DefTable.hs" for what each column
+-- means.
+printCompactionStatsTable :: [CompactionReportRow] -> IO ()
+printCompactionStatsTable rows = do
+  let compacted = [r | r <- rows, acs_compactions (crStats r) > 0]
+      totalNs = sum [acs_totalNs (crStats r) | r <- compacted]
+      totalCompactions = sum [acs_compactions (crStats r) | r <- compacted]
+      totalRowsWalked = sum [acs_rowsWalked (crStats r) | r <- compacted]
+      sorted = sortOn (\r -> Down (acs_totalNs (crStats r))) compacted
+  putStrLn "=== COMP_ENGINE_LOCK_STATS: edge-arena compaction breakdown ==="
+  putStrLn
+    ( "NOTE: (def, arena) pairs that never compacted are omitted. "
+        ++ "'rows walked' sums, across every compaction, the def's row "
+        ++ "count at compaction time -- eaCompact's O(rowCount) scan, the "
+        ++ "natural 'how much work' measure, independent of how many rows "
+        ++ "were actually alive or how many edges got copied."
+    )
+  printf
+    "%-28s %-9s %12s %14s %12s\n"
+    ("def" :: String)
+    ("arena" :: String)
+    ("compactions" :: String)
+    ("rows walked" :: String)
+    ("total (s)" :: String)
+  forM_ sorted $ \r ->
+    printf
+      "%-28s %-9s %12d %14d %12.6f\n"
+      (crDefLabel r)
+      (crArenaKind r)
+      (acs_compactions (crStats r))
+      (acs_rowsWalked (crStats r))
+      (fromIntegral (acs_totalNs (crStats r)) / (1e9 :: Double))
+  printf
+    "%-28s %-9s %12d %14d %12.6f\n"
+    ("TOTAL" :: String)
+    ("" :: String)
+    totalCompactions
+    totalRowsWalked
+    (fromIntegral totalNs / (1e9 :: Double))
+
 {- | 'SifState' is genuinely, internally mutable (growable unboxed/boxed
  vectors behind 'Data.IORef.IORef's) rather than an immutable value swapped
  through a 'TVar' -- running arbitrary in-place vector mutation inside an
@@ -321,6 +370,7 @@ setupSimpleStateIf shouldValidate =
               putStrLn "=== COMP_ENGINE_LOCK_STATS ==="
               printf "engine-state lock: %d calls, %d ns total hold time (%.6f s)\n" calls holdNs holdS
               printMethodStatsTable methodStatsTable
+              debugCompactionStats st >>= printCompactionStatsTable
         return (instrumentedCeif, reportLockStats)
       else do
         let stateIf =

@@ -218,6 +218,22 @@
  across N writes is O(N) amortized, tied to the write path itself rather
  than a separately scheduled sweep.
 
+ __Compaction is instrumented, unconditionally.__ 'eaCompact' walks every
+ row of a def's arena (@rowCount@ words of scan, not @dead@ or @used@ words
+ -- see 'eaCompact' itself), so its amortized-O(1)-per-write argument above
+ is a statement about /how often/ it runs, not about what one run costs;
+ whether that per-run cost is actually small next to a round's rerun count
+ is an empirical question, not one this haddock can settle by itself. Each
+ 'EdgeArena' therefore carries a compaction counter, a rows-walked counter,
+ and a nanosecond timer (@ea_compactions@\/@ea_rowsWalked@\/@ea_compactNs@),
+ bumped inside 'eaCompact' itself on every call, unconditionally -- cheap to
+ do unconditionally precisely because compaction is the rare side of
+ 'maybeCompact''s threshold, unlike per-write instrumentation, which would
+ need to be opt-in. 'defArenaCompactionStats' reads them back per def per
+ arena kind; only the resulting *report* (built by "SimpleStateIf.hs"'s
+ @debugCompactionStats@, printed by "Run.hs" under @COMP_ENGINE_LOCK_STATS@)
+ is opt-in.
+
  __Small defs.__ A def with few rows (or few edges per row) never
  accumulates enough words to reach GHC's large-object threshold (currently
  a few kB), so its arena is a small nursery-resident array like everything
@@ -535,6 +551,12 @@ module Control.Computations.CompEngine.Utils.DefTable (
   writeSrcDeps,
   srcDepInternLiveCount,
 
+  -- * Edge-arena compaction stats (debug\/report-only -- see
+  -- "SimpleStateIf.hs"'s @debugCompactionStats@ and "Run.hs"'s
+  -- COMP_ENGINE_LOCK_STATS report)
+  ArenaCompactionStats (..),
+  defArenaCompactionStats,
+
   -- * Hash index (exposed for this module's own moved-out tests; see
   -- test\/.\/DefTableTest.hs)
   HashIndex,
@@ -589,6 +611,7 @@ import qualified Data.Vector.Primitive as VP
 import qualified Data.Vector.Unboxed as VU
 import qualified Data.Vector.Unboxed.Mutable as VUM
 import Data.Word (Word32, Word64, Word8)
+import GHC.Clock (getMonotonicTimeNSec)
 
 --
 -- Row identity: DefRef = packed (DefIdx, RowIdx). Three Int-shaped
@@ -1015,6 +1038,22 @@ data EdgeArena (s :: StrideKind) = EdgeArena
   -- ^ arena append point, in words
   , ea_dead :: !(IORef Int)
   -- ^ words within [0, ea_used) known to belong to an orphaned span
+  , ea_compactions :: !(IORef Int)
+  -- ^ number of times 'eaCompact' has run against this arena, ever. Bumped
+  -- unconditionally inside 'eaCompact' itself, not gated by
+  -- @COMP_ENGINE_LOCK_STATS@ -- see 'eaCompact''s haddock for why that's
+  -- cheap: compaction is already the rare side of 'maybeCompact''s
+  -- threshold check, so a counter bump here costs nothing on the actual
+  -- hot path (every write goes through 'eaWrite', not this).
+  , ea_rowsWalked :: !(IORef Int)
+  -- ^ total rows scanned across every compaction this arena has ever run.
+  -- Each compaction walks every row @0..rowCount-1@ once regardless of how
+  -- many turn out to be alive (see 'eaCompact'), so this -- not e.g. words
+  -- copied, which varies with liveness -- is the size measure that
+  -- actually bounds one compaction's cost.
+  , ea_compactNs :: !(IORef Word64)
+  -- ^ total wall time spent inside 'eaCompact' for this arena, in
+  -- nanoseconds via 'GHC.Clock.getMonotonicTimeNSec'.
   }
 
 newEdgeArena :: IO (EdgeArena s)
@@ -1023,6 +1062,9 @@ newEdgeArena =
     <$> (newIORef =<< VUM.new 0)
     <*> (newIORef =<< VUM.new 0)
     <*> (newIORef =<< VUM.new 0)
+    <*> newIORef 0
+    <*> newIORef 0
+    <*> newIORef 0
     <*> newIORef 0
     <*> newIORef 0
 
@@ -1059,8 +1101,18 @@ maybeCompact ea isRowAlive rows = do
 -- regardless of whether it was ever given an explicit new write after
 -- going dead -- see the module haddock for why that's the key property
 -- that makes tying this to the write path (rather than row-free) correct.
+--
+-- NOTE: instrumentation below (t0/t1 and the three counter bumps at the
+-- end) is unconditional, not gated by COMP_ENGINE_LOCK_STATS -- see
+-- 'ea_compactions''s haddock for why that's safe: compaction is already
+-- the rare branch of 'maybeCompact', so a timer pair and three IORef bumps
+-- here are invisible next to the O(rowCount) scan they wrap, unlike the
+-- per-write instrumentation "Run.hs" deliberately keeps opt-in. Only the
+-- *reporting* of these counters (SimpleStateIf.hs's @debugCompactionStats@,
+-- printed from Run.hs) is gated.
 eaCompact :: forall s. KnownStride s => EdgeArena s -> IsRowAlive -> RowCount -> IO ()
 eaCompact ea isRowAlive rows = do
+  t0 <- getMonotonicTimeNSec
   let Stride stride = strideOf @s
   used <- readIORef (ea_used ea)
   srcV <- readIORef (ea_data ea)
@@ -1087,7 +1139,37 @@ eaCompact ea isRowAlive rows = do
   writeIORef (ea_data ea) dstV
   writeIORef (ea_used ea) finalUsed
   writeIORef (ea_dead ea) 0
+  t1 <- getMonotonicTimeNSec
+  modifyIORef' (ea_compactions ea) (+ 1)
+  modifyIORef' (ea_rowsWalked ea) (+ unRowCount rows)
+  modifyIORef' (ea_compactNs ea) (+ (t1 - t0))
 {-# INLINE eaCompact #-}
+
+-- | One arena's lifetime compaction stats, as read back by
+-- 'defArenaCompactionStats'. A named record, not a bare triple: this
+-- module already argues (see 'CompDepEdge''s haddock) that a tuple of
+-- same-shaped positional fields invites exactly the kind of transposition
+-- ("rowsWalked where compactions was meant") that naming the fields closes
+-- off.
+data ArenaCompactionStats = ArenaCompactionStats
+  { acs_compactions :: !Int
+  -- ^ see 'ea_compactions'
+  , acs_rowsWalked :: !Int
+  -- ^ see 'ea_rowsWalked'
+  , acs_totalNs :: !Word64
+  -- ^ see 'ea_compactNs'
+  }
+  deriving (Eq, Show)
+
+-- | Snapshot one arena's compaction counters (see 'ArenaCompactionStats').
+-- Debug/report-only, same status as 'srcDepInternLiveCount' -- never read
+-- on the engine's hot path.
+eaCompactStats :: EdgeArena s -> IO ArenaCompactionStats
+eaCompactStats ea =
+  ArenaCompactionStats
+    <$> readIORef (ea_compactions ea)
+    <*> readIORef (ea_rowsWalked ea)
+    <*> readIORef (ea_compactNs ea)
 
 -- | Read a row's edge span as a flat, stride-major 'VU.Vector Word64' (a
 -- safe copy -- the arena keeps mutating after this call returns). Empty
@@ -1854,4 +1936,17 @@ writeSrcDeps dt row s = do
 -- unit tests.
 srcDepInternLiveCount :: DefTable p a -> IO Int
 srcDepInternLiveCount = sdiLiveCount . dt_srcDepIntern
+
+-- | This def's compaction stats for each of its three edge arenas, tagged
+-- with the arena kind's name. Debug/report-only, mirroring
+-- 'srcDepInternLiveCount''s "one per-def accessor, summed/tabulated by the
+-- caller" shape -- exists purely to feed "SimpleStateIf.hs"'s
+-- @debugCompactionStats@ (which adds the owning def's name) and, from
+-- there, "Run.hs"'s @COMP_ENGINE_LOCK_STATS@ close-time report.
+defArenaCompactionStats :: DefTable p a -> IO [(String, ArenaCompactionStats)]
+defArenaCompactionStats dt = do
+  cd <- eaCompactStats (dt_compDeps dt)
+  rd <- eaCompactStats (dt_rdeps dt)
+  sd <- eaCompactStats (dt_srcDeps dt)
+  pure [("compDeps", cd), ("rdeps", rd), ("srcDeps", sd)]
 
