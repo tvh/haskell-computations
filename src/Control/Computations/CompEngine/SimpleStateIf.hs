@@ -847,6 +847,40 @@ updateSrcDependentVersion st key ver ref = do
  corresponding rdeps/src-index entries, cascading garbage collection for
  anything that becomes unreferenced as a result.
 
+ The comp-dep side gets an in-place update for its own overwhelmingly
+ common case, the mirror image of the source-dep treatment described just
+ below but at the whole-span level rather than per-key: when a rerun
+ observes the same *set* of comp-dep targets it depended on before
+ (@addedComp@ and @removedComp@ both empty -- true whenever a rerun changes
+ what a row *computed to* without changing *what it read*, which is most
+ reruns), the new span is spliced into the row's existing arena span in
+ place ('DT.overwriteCompDepsInPlace') instead of being appended as a fresh,
+ byte-identical-length span that just orphans the old one -- see
+ "DefTable.hs"'s module haddock ("Mutation strategy") for why that's safe
+ at the arena level.
+
+ That splice is only correct if the old and new spans agree,
+ position-by-position, on which target sits where: an in-place overwrite
+ can't notice a transposition after the fact, since by the time it runs the
+ "old" word at each position has already become the "new" one meant to
+ replace it. Two facts together make that hold on the real call path: (1)
+ @newEdges@ below always comes from @IntMap.toList newCompVerMap@, which
+ 'Data.IntMap.Strict' always returns in ascending-key order, so every span
+ this function ever writes is target-sorted; and (2) this function is the
+ *only* writer of a non-empty comp-dep span anywhere in the codebase --
+ "DefTable.hs"'s other 'DT.writeCompDeps' call site ('DT.lookupOrInsertRow')
+ only ever writes an empty span, for a freshly allocated row. So by
+ induction, whatever span is already in the arena when this function runs
+ was itself written target-sorted the last time the target set was this
+ same set -- "same target set" and "same positional order" are one fact
+ here, not two that happen to coincide. @targetsAligned@ below still checks
+ this directly (@oldCompVer@\'s targets against @newEdges@\'s, position by
+ position) rather than trusting the induction argument blindly, and falls
+ back to the always-correct append path ('DT.writeCompDeps') on any
+ mismatch -- belt-and-braces in case this argument (or some future caller)
+ breaks in a way this haddock didn't anticipate, for the cost of one more
+ pass over data the write is about to touch anyway.
+
  The source-dep side is diffed by *key alone*, not by the full
  @(key, version)@ pair. An ordinary rerun that observes the same source key
  at a newer version -- the overwhelmingly common case, since most reruns
@@ -906,6 +940,17 @@ updateEdges dt st row oldCompVer newCompVerMap oldSrc newSrc = do
       newEdges =
         VU.fromList
           [DT.CompDepEdge t (encodeVer v) | (t, v) <- IntMap.toList newCompVerMap]
+      -- See this function's haddock: 'addedComp'/'removedComp' both empty
+      -- means the target *set* is unchanged, which -- given every non-empty
+      -- comp-dep span is written target-sorted, and this function is the
+      -- only writer of one -- also means 'oldCompVer' and 'newEdges' agree
+      -- position-by-position. Checked directly rather than assumed; a
+      -- mismatch falls back to the always-correct append path.
+      targetsAligned =
+        IntSet.null addedComp
+          && IntSet.null removedComp
+          && VU.length oldCompVer == VU.length newEdges
+          && VU.and (VU.zipWith (\o n -> DT.cdeTarget o == DT.cdeTarget n) oldCompVer newEdges)
       -- Classify one newSrc dependency, computing its key exactly once:
       -- 'Just' when this key was already in oldSrcKeys (kept -- version
       -- update in place), 'Nothing' when it wasn't (genuinely new -- add).
@@ -920,7 +965,9 @@ updateEdges dt st row oldCompVer newCompVerMap oldSrc newSrc = do
           else addSrcDependent st key ver row
         pure key
 
-  DT.writeCompDeps dt (DT.refRow row) newEdges
+  if targetsAligned
+    then DT.overwriteCompDepsInPlace dt (DT.refRow row) newEdges
+    else DT.writeCompDeps dt (DT.refRow row) newEdges
   DT.writeSrcDeps dt (DT.refRow row) newSrc
 
   compGarbage <- fmap mconcat $ forM (IntSet.toList removedComp) $ \t -> removeRdep st (DT.mkDefRefUnsafe t) row

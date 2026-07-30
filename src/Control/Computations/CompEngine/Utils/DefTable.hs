@@ -149,9 +149,9 @@
 
  __'EdgeArena''s stride is a phantom type.__ 'EdgeArena' is not part of this
  module's public API, so every call to 'eaWrite'\/'eaRead'\/'eaCompact'\/
- 'eaTakeRow' lives in exactly one place each, pairing one specific
- 'EdgeArena' field with one hardcoded 'Stride' constant a few lines below
- its own definition -- a transposition there would show up as an
+ 'eaTakeRow'\/'eaOverwriteInPlace' lives in exactly one place each, pairing
+ one specific 'EdgeArena' field with one hardcoded 'Stride' constant a few
+ lines below its own definition -- a transposition there would show up as an
  immediate, glaring test failure, not a silent-corruption risk, so an
  argument from encapsulation alone would say a phantom tag isn't needed.
  What tips it the other way is that the phantom tag is not a net addition:
@@ -160,11 +160,11 @@
  'newtype' only wraps one; the phantom parameter is erased identically
  either way, see below) plus a 'KnownStride' class recovering the numeric
  'Stride' from the tag does not make
- 'eaWrite'\/'eaRead'\/'eaCompact'\/'eaTakeRow'\/'maybeCompact' /gain/ a type
- parameter alongside their existing 'Stride' argument -- it makes the
- explicit 'Stride' argument disappear from all five entirely, recovered
- instead from @s@ via 'strideOf'. The net line count at each call site goes
- down, not up: 'readCompDeps' passes no 'compDepsStride' argument,
+ 'eaWrite'\/'eaRead'\/'eaCompact'\/'eaTakeRow'\/'eaOverwriteInPlace'\/'maybeCompact'
+ /gain/ a type parameter alongside their existing 'Stride' argument -- it
+ makes the explicit 'Stride' argument disappear from all six entirely,
+ recovered instead from @s@ via 'strideOf'. The net line count at each call
+ site goes down, not up: 'readCompDeps' passes no 'compDepsStride' argument,
  'readRdeps' passes no 'singleStride' argument, and so on. A change that is
  a net simplification at every call site, not a net addition, is worth
  having even where the runtime risk it closes was already low. 'dt_compDeps'
@@ -182,12 +182,12 @@
  compile time.
 
  __Mutation strategy: append-new-span, mark-old-span-dead, compact on a
- dead-fraction threshold.__ Chosen over "CSR with per-row slack" because
- every write here (@writeCompDeps@/@writeRdeps@, both called from
- "SimpleStateIf.hs") replaces a row's /entire/ edge set at once -- there is
- no in-place single-edge splice anywhere on the hot path for slack to help
- with, only whole-row replacement, so append-only is both simpler and no
- less dense. A write appends the new span at the arena's current end and
+ dead-fraction threshold -- except for one in-place case.__ Chosen over
+ "CSR with per-row slack" because most writes here still replace a row's
+ /entire/ edge set at once with no guarantee the new set is even the same
+ shape as the old one, so a slack scheme (reserve some headroom per row,
+ splice within it, only reallocate on overflow) would pay for headroom most
+ rows never use. A write appends the new span at the arena's current end and
  bumps a per-def dead-word counter by the row's /previous/ span length (if
  any); nothing is physically overwritten in place, so a stale span is
  simply orphaned -- exactly like 'freeRow' already leaves a freed row's
@@ -197,6 +197,37 @@
  persistence benchmark's live-update phase does, tens of thousands of times
  over a graph of roughly a million rows -- would otherwise make the arena
  grow without bound, one orphaned span per rerun, forever.
+
+ @writeRdeps@\/@writeSrcDeps@ (both called from "SimpleStateIf.hs", the
+ latter via @writeSrcDeps@'s own retain\/release bookkeeping) still go
+ through 'eaWrite' unconditionally, append-or-clear only -- for those two
+ columns "replaces the whole edge set every time" remains exactly true, so
+ the argument above is still the whole story for them. @writeCompDeps@ is
+ the one exception, via 'eaOverwriteInPlace' (called as
+ 'overwriteCompDepsInPlace'): an ordinary rerun of a row whose set of
+ comp-dep /targets/ didn't change -- the overwhelmingly common case, since
+ most reruns observe new versions of the same dependencies rather than
+ depending on a different set of them -- doesn't change the span's length
+ or contents at any word except the two version words per edge, so
+ "SimpleStateIf.hs"'s @updateEdges@ splices the new versions into the row's
+ existing span at its existing offset instead of appending a byte-identical-
+ length span next to it just to orphan the old one. This is safe precisely
+ because it is narrower than "whole-row replacement": it never changes a
+ span's length, offset, or which row owns it, so every invariant compaction
+ depends on (a live row's current span is exactly
+ @[offset, offset+len*stride)@, and a span's word count is fixed once
+ written) holds exactly as before -- there is nothing for 'eaCompact' to
+ special-case, since from its perspective an in-place-overwritten span looks
+ identical to a freshly-appended one of the same length. What it does /not/
+ relax is the correctness obligation on the caller: overwriting in place is
+ only correct if the old and new spans agree, edge-for-edge, on which
+ targets sit at which position, and 'eaOverwriteInPlace' itself only checks
+ that the lengths match -- it has no way to check positional identity from
+ inside the arena, since by the time it runs the "old" content at each
+ position has already been overwritten by the "new" content meant to
+ replace it. "SimpleStateIf.hs"'s @updateEdges@ (this arena's only caller
+ for this path) is responsible for that guarantee and documents how it
+ holds -- see its own haddock.
 
  Compaction ('eaCompact') rebuilds a def's arena from scratch, walking every
  row 0..rowCount-1 and keeping only the /current/ span of every row that is
@@ -541,6 +572,7 @@ module Control.Computations.CompEngine.Utils.DefTable (
   CompDepEdge (..),
   readCompDeps,
   writeCompDeps,
+  overwriteCompDepsInPlace,
   compDepTargets,
   hashToPair,
   pairToHash,
@@ -1243,6 +1275,45 @@ eaWrite ea row isRowAlive rows flat = do
   maybeCompact ea isRowAlive rows
 {-# INLINE eaWrite #-}
 
+-- | Overwrite a row's /existing/ span word-for-word, at its current
+-- offset, without appending anything: no new span, no bump to @ea_used@,
+-- no bump to @ea_dead@, no touch to the row's own @offset@\/@len@ columns
+-- (they're unchanged by construction, since the span's length isn't
+-- changing). This is the one exception to the module haddock's
+-- "Mutation strategy" section -- see there for why a real in-place splice
+-- exists now and why it's still safe next to append-only's dead-word
+-- accounting: because this path never creates or orphans a span, it has
+-- nothing to report to @ea_dead@, and the invariant compaction relies on
+-- (every live row's current span is exactly @[offset, offset+len*stride)@)
+-- holds precisely as before.
+--
+-- __Precondition, enforced rather than assumed:__ @flat@'s length must
+-- equal the row's /current/ span length in words (@len * stride@) --
+-- calling this to grow or shrink a row's edge set would silently corrupt
+-- a neighboring row's span (the arena has no slack between spans to grow
+-- into) or leave stale words trailing a shrunk one, so a mismatch is
+-- treated as a bug in the caller, not a shape this function adapts to.
+-- The sole caller ("SimpleStateIf.hs"'s @updateEdges@, via
+-- 'overwriteCompDepsInPlace') only reaches this after its own by-key diff
+-- has confirmed the row's target set -- and therefore the span's length
+-- -- is unchanged from the previous write; see that module's haddock for
+-- the further position-by-position check it does on top of the length
+-- match this function itself enforces.
+eaOverwriteInPlace :: forall s. KnownStride s => EdgeArena s -> RowIdx -> VU.Vector Word64 -> IO ()
+eaOverwriteInPlace ea row flat = do
+  let Stride strideN = strideOf @s
+      numWords = VU.length flat
+  lenV <- readIORef (ea_len ea)
+  oldLen <- VUM.read lenV (unRowIdx row)
+  when (numWords /= fromIntegral oldLen * strideN) $
+    error "DefTable.eaOverwriteInPlace: new span length does not match the row's existing span -- a bug (caller must guarantee equal length)"
+  when (numWords > 0) $ do
+    offV <- readIORef (ea_off ea)
+    off <- VUM.read offV (unRowIdx row)
+    dataV <- readIORef (ea_data ea)
+    VU.unsafeCopy (VUM.slice (fromIntegral off) numWords dataV) flat
+{-# INLINE eaOverwriteInPlace #-}
+
 --
 -- Open-addressing hash->row index -- see the module haddock's "Hash index"
 -- section for the full design rationale. Deliberately generic over how a
@@ -1876,6 +1947,21 @@ writeCompDeps :: DefTable p a -> RowIdx -> VU.Vector CompDepEdge -> IO ()
 writeCompDeps dt row xs = do
   n <- rowCount dt
   eaWrite (dt_compDeps dt) row (isAlive dt) n (flattenCompDeps xs)
+
+-- | In-place counterpart to 'writeCompDeps', for the common "same target
+-- set, new observed versions" case a rerun hits when a row's set of
+-- comp-deps didn't change -- see 'eaOverwriteInPlace' for the arena-level
+-- mechanics and 'eaOverwriteInPlace''s precondition, which this function
+-- inherits verbatim: @xs@ must have the same length as the row's current
+-- comp-dep span (in edges, i.e. in words once flattened, since
+-- 'flattenCompDeps' is a fixed stride-3 expansion). This function does not
+-- itself check that @xs@'s /targets/ line up position-by-position with the
+-- existing span -- only that the lengths match, which 'eaOverwriteInPlace'
+-- enforces -- so it is only correct to call when the caller has already
+-- established that positional alignment. "SimpleStateIf.hs"'s @updateEdges@
+-- is the one caller and does establish it; see that module's haddock.
+overwriteCompDepsInPlace :: DefTable p a -> RowIdx -> VU.Vector CompDepEdge -> IO ()
+overwriteCompDepsInPlace dt row xs = eaOverwriteInPlace (dt_compDeps dt) row (flattenCompDeps xs)
 
 -- | Just the target refs (raw, packed 'DefRef' 'Int's -- see
 -- 'flattenCompDeps''s haddock) of a comp-dep edge set, discarding the
