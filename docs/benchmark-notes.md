@@ -1597,3 +1597,145 @@ visibility that does not exist yet, sinks need their own safety contract,
 and parallel cap evaluation needs the engine's single state lock to stop
 being single first, which is exactly what the lock measurement in this
 stage quantifies the ceiling for.
+
+## Stage 6 — source-request bundling's +10% peak, measured (commits `86733b0`,
+`1b4dbee`, `51e78a7`) — investigated, not fixed
+
+Bundling (dedup same-instance source requests within one applicative batch
+via `compSrcExecuteBatch`, `SrcGroup`/`getOrCreateGroup`) raised the hospital
+benchmark's `max_live_bytes` at full scale, latency 0, `-A64m`: **3,918.3 MB
+→ 4,310.3 MB, +392,051,080 bytes (+10.01%)**, bit-identical across repeated
+runs. This session's job was to confirm or refute a prior conclusion — that
+the peak is structural to bundling because it materialises the whole `Prep`
+tree, one closure per leaf, before any leaf runs — using `+RTS -hT` on a
+normal (non-`-fprof-auto`) build instead of the `-hc`/reduced-scale profile
+the prior conclusion rested on. Measurement only; nothing in `src/` or
+`bench/` changed.
+
+### `-hT` works on the production binary — no `-prof` build needed
+
+The benchmark's `ghc-options` already carries `-rtsopts
+"-with-rtsopts=-A64m -T"` (added for `getRTSStats`, Stage 5's tooling
+fixes). That's sufficient for `-hT` (heap census by closure type): it needs
+`-rtsopts`, not `-prof`, unlike `-p` or `-hc`/`-hb`. Recipe:
+
+```
+stack build incremental-computations:bench:incremental-computations-bench
+cd <scratch dir>   # .hp lands in cwd under a fixed name, same trap as .prof
+HOSPITAL_BENCH=1 <path-to>/incremental-computations-bench +RTS -hT -A64m -T -s -RTS
+mv incremental-computations-bench.hp <renamed>.hp   # immediately
+```
+
+Full-scale cold eval: ~25 s unprofiled → ~113 s with `-hT` (**~4.5×**,
+against `-fprof-auto`'s measured ~7–10×). Budget for it but it is far more
+usable than a profiling build, and it profiles the actual binary being
+shipped rather than a `-fprof-auto` distortion.
+
+### Hypothesis 1 — sampling artifact: refuted
+
+`max_live_bytes`/"maximum residency" is a running max updated only at
+**major** GCs (`stat_endGC`'s `residency_samples` counter, confirmed
+empirically: `+RTS -s`'s own `(N sample(s))` count only ever moves with
+`Gen 1` collections, never `Gen 0`). Bundling's reported GC-count increase
+(544→584, mostly minor `Gen 0` collections) does not by itself imply more
+*residency* samples, and that turned out to be exactly right:
+
+| build | `-A` | major-GC (residency) samples | `max_live_bytes` |
+|---|---|---|---|
+| pre-bundling (`71f9756`) | 64m | 11 | 3,918,275,064 |
+| pre-bundling (`71f9756`) | 256m | 9 | 3,918,275,064 |
+| post-bundling (`51e78a7`) | 8m | 16 | 4,310,326,152 |
+| post-bundling (`51e78a7`) | 64m | 11 | 4,310,326,144 |
+| post-bundling (`51e78a7`) | 256m | 9 | 4,310,326,144 |
+
+Sample count varies 9→11→16 (a 78% swing) on the post-bundling side alone;
+the reported peak moves by **8 bytes** — noise, not signal. On the
+pre-bundling side, 9 vs. 11 samples: **bit-identical to the byte**. The peak
+is a real, stable value the GC hits regardless of how densely it's sampled,
+on both sides of the change. Hypothesis 1 does not survive.
+
+### Where the +392 MB actually is (and isn't)
+
+`GHC max_live_bytes` is read via `getRTSStats` *before* the benchmark's
+phase 3 (rerun-heavy live update) ever runs, so it can only reflect phases 1
+(cold eval) and 2 (single-key live update) by construction — not evidence
+that phase 3 is irrelevant on its own. Cross-checked against the process's
+*own* end-of-run `+RTS -s` dump (which does include phase 3): identical to
+the byte in both builds, so phase 3's ~1 GB of further allocation never sets
+a new peak either way. The peak belongs to cold eval.
+
+More surprising: **the extra 392 MB is not a bigger steady state.** RSS
+after cold settle is *lower* on the post-bundling build (4,926.1 MB vs.
+5,058.2 MB, −132 MB), and RSS at the very end is lower too (7,048.5 MB vs.
+7,065.6 MB). Bundling's dedup does what it's supposed to once everything
+has settled. The +392 MB is a **transient peak reached and released during
+cold eval**, not a larger resting footprint.
+
+### Does the "materialised `Prep` tree" explanation survive? No — and the
+depth-bound argument is what the data supports
+
+`SrcGroup`/`SomeSrcGroup` (`Impl.hs`, new in `86733b0`, confirmed absent
+from `71f9756`'s closure-type list entirely) are exactly the closures that
+would hold per-batch bookkeeping if a whole tree were being materialised.
+Their observed size, `-hT` envelope max across every sample of the entire
+run: **`SrcGroup` 40 bytes, `SomeSrcGroup` 24 bytes.** The shared
+`CompReq*` batch/tree types top out at `CompReqEval` 144 bytes,
+`CompReqCombined`/`CompReqCache` 24 bytes, `CompReqFlow` 32 bytes — in
+*both* builds, never growing past double digits to low hundreds of bytes at
+any sampled instant. Nothing here is remotely close to hundreds of
+megabytes. This is consistent with, and supports, the ~11-level nested-batch
+depth bound: batch-tree bookkeeping genuinely never accumulates to a
+material size in this benchmark. The literal "one closure per leaf of the
+whole tree, materialised before any leaf runs" mechanism is not what's
+retaining the extra memory.
+
+### What the data cannot settle: which closure type actually holds it
+
+This is the honest gap. `-hT`'s own closure-type census systematically
+**undercounts** the RTS-tracked true peak for this workload, in both
+builds, by a large and roughly similar margin:
+
+| build | `-hT` census peak (single sample) | `-hT` envelope (per-type max, not simultaneous) | true `max_live_bytes` | census / true |
+|---|---|---|---|---|
+| pre-bundling | 3,435.1 MB | 3,453.2 MB | 3,918.3 MB | 88% |
+| post-bundling | 3,441.3 MB | 3,455.3 MB | 4,310.3 MB | 80% |
+
+The envelope-max diff across *every* closure type bucket is only **+2.1 MB**
+— nowhere near the real +392 MB gap. Whatever holds the extra memory is
+either (a) something the per-closure census structurally doesn't attribute
+to a Haskell closure type (GC/block-level bookkeeping is the leading
+suspect, unconfirmed), or (b) a spike brief enough that `-hT`'s own sampling
+misses it in both builds alike. Two attempts to tighten this: `-i100`
+(disable interval-based forcing, to piggyback purely on naturally-occurring
+major GCs) produced only 2 samples, both empty — heap census is **purely
+timer-driven**, it does not additionally census every natural major GC, so
+this doesn't help. `-i0.02` (20× finer than the 0.1 s default) was tried and
+aborted after 8 minutes without finishing — forcing a major GC on a
+multi-GB heap dozens of times per second is not tractable. **Retainer
+profiling (`-hr`) would attribute this precisely but requires a `-prof`
+build**, reintroducing the exact distortion this investigation exists to
+avoid; not attempted for that reason.
+
+### Report
+
+- **Real, not a sampling artifact** — confirmed by varying `-A` over 9/11/16
+  major-GC samples on both sides of the change; the peak moves by ≤8 bytes.
+- **Transient, not a permanent regression** — post-bundling's settled RSS is
+  *lower* than pre-bundling's, both mid-run and at exit. The +392 MB is
+  reached and released during cold eval.
+- **Not the "materialised `Prep` tree"** — `SrcGroup`/`SomeSrcGroup`/`CompReq*`
+  bookkeeping never exceeds a few hundred bytes at any sampled instant in
+  either build. The ~11-level nested-batch depth-bound argument is what
+  survives; the tree-materialisation explanation does not.
+- **Not attributable to a specific closure type from available data** —
+  `-hT`'s census undercounts the true peak by ~12–20% in both builds and its
+  own per-type deltas (+2.1 MB) don't remotely explain the real +392 MB gap.
+  Finer sampling was tried and is computationally infeasible here; retainer
+  profiling would need `-prof` and was avoided for that reason. This is a
+  genuine measurement dead end, not a hedge.
+- **Removability: unknown.** It looks structurally unlike the previously
+  suspected mechanism, and it disappears on its own by end of run — but
+  without knowing what's retained, no removal path can be assessed
+  responsibly. Next step, if pursued, is a `-prof`/`-hr` retainer census
+  accepting the profiling distortion for this one question, or manual
+  instrumentation around cold eval's tail.
