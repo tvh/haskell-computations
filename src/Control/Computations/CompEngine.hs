@@ -6,7 +6,17 @@ import Control.Computations.CompEngine.CacheBehaviors as X
 import Control.Computations.CompEngine.CompDef as X
 import Control.Computations.CompEngine.CompEval as X
 import Control.Computations.CompEngine.CompFlow as X
-import Control.Computations.CompEngine.CompFlowRegistry as X
+
+-- 'CompSrcInstIx'\/'withTypedCompSrcIdIndexed' are hidden here: they're
+-- "Control.Computations.CompEngine.Impl"'s own interning plumbing for
+-- keying a 'CompReqCombined' batch's per-instance source-group table
+-- cheaply (see 'CompSrcInstIx'\'s haddock), not something a comp body or a
+-- 'CompSrc' instance ever needs to see. Everything else
+-- "CompFlowRegistry" exports is passed through unchanged.
+import Control.Computations.CompEngine.CompFlowRegistry as X hiding (
+  CompSrcInstIx,
+  withTypedCompSrcIdIndexed,
+ )
 
 -- 'compSinkId'\/'compSrcId' are hidden here: they collapse a live instance
 -- straight to its untyped id, which is exactly the kind of unchecked

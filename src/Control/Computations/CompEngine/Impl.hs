@@ -216,39 +216,46 @@ data SrcGroup s = SrcGroup
 
 -- | A 'SrcGroup' with its instance type hidden -- what
 -- 'Control.Computations.CompEngine.Impl.doSuspended' actually stores one of
--- per distinct 'CompSrcId' seen while preparing a batch, since different
+-- per distinct source instance seen while preparing a batch, since different
 -- leaves resolve their (possibly different) source types independently (see
 -- 'getOrCreateGroup').
 data SomeSrcGroup = forall s. CompSrc s => SomeSrcGroup (SrcGroup s)
 
 {- | Find this leaf's 'SrcGroup' in @groupsRef@, creating an empty one keyed
- by @'compSrcId' src@ if this is the first leaf of the batch to resolve to
- this instance. 'CompSrcId' carries no type parameter, so two leaves
- resolving the same id independently (through their own, syntactically
- distinct existential @s@ -- see 'CompLeafSrc') need a runtime check before
- either can be treated as the other's @s@: the registry maps one id to
- exactly one concrete type, so the 'cast' below can only fail if that
- invariant has been broken elsewhere, not from anything a caller here can
- cause.
+ by @ix@ if this is the first leaf of the batch to resolve to this instance.
+ @groupsRef@ is a plain association list, not a 'HashMap.HashMap': a batch
+ sees only 1 to 5 distinct source instances in practice, however many
+ thousand leaves, so a handful of 'Eq' comparisons against a dense
+ 'CompSrcInstIx' (assigned once per instance at registration -- see its
+ haddock) beats hashing a 'CompSrcId' (two 'Data.Text.Text' values) on every
+ single leaf, which is what keying on 'CompSrcId' itself would cost here.
+
+ The index alone doesn't prove @g@'s hidden type matches @s@: two leaves
+ resolving the same instance independently (through their own, syntactically
+ distinct existential @s@ -- see 'CompLeafSrc') still need a runtime check
+ before either can be treated as the other's @s@. The registry maps one
+ index to exactly one concrete type, so the 'cast' below can only fail if
+ that invariant has been broken elsewhere, not from anything a caller here
+ can cause.
 -}
 getOrCreateGroup
   :: forall s
    . CompSrc s
-  => IORef (HashMap.HashMap CompSrcId SomeSrcGroup)
+  => IORef [(CompSrcInstIx, SomeSrcGroup)]
+  -> CompSrcInstIx
   -> s
   -> FlowConcurrency
   -> IO (SrcGroup s)
-getOrCreateGroup groupsRef src conc = do
-  let csid = compSrcId src
+getOrCreateGroup groupsRef ix src conc = do
   groups <- readIORef groupsRef
-  case HashMap.lookup csid groups of
+  case lookup ix groups of
     Just (SomeSrcGroup g) ->
       case cast g of
         Just g' -> pure g'
         Nothing ->
           error
             ( "getOrCreateGroup: "
-                ++ show csid
+                ++ show (compSrcId src)
                 ++ " resolved to two different CompSrc types within one batch "
                 ++ "-- should be impossible, the registry maps each id to exactly one type"
             )
@@ -256,7 +263,7 @@ getOrCreateGroup groupsRef src conc = do
       fetchesRef <- newIORef id
       triggeredRef <- newIORef False
       let g = SrcGroup src conc fetchesRef triggeredRef
-      writeIORef groupsRef (HashMap.insert csid (SomeSrcGroup g) groups)
+      writeIORef groupsRef ((ix, SomeSrcGroup g) : groups)
       pure g
 
 {- | Run @g@\'s bundled 'compSrcExecuteBatch' call exactly once, however many
@@ -691,19 +698,19 @@ evalCompAp outerCap =
     :: forall s a
      . CompSrc s
     => CompFlowRegistry
-    -> IORef (HashMap.HashMap CompSrcId SomeSrcGroup)
+    -> IORef [(CompSrcInstIx, SomeSrcGroup)]
     -> TypedCompSrcId s
     -> CompSrcReq s a
     -> Prep (Fail a)
   prepSrcLeaf reg groupsRef sid req =
     Prep $
-      withTypedCompSrcId reg sid (\src -> pure (src, compSrcConcurrency src)) >>= \case
+      withTypedCompSrcIdIndexed reg sid (\ix src -> pure (ix, src, compSrcConcurrency src)) >>= \case
         Fail reason ->
           let msg = "Refusing to run request for data source " ++ show sid ++ ": " ++ reason
            in pure (pure (return (Fail msg)))
-        Ok (src, conc) -> do
+        Ok (ix, src, conc) -> do
           slot <- newIORef Nothing
-          g <- getOrCreateGroup groupsRef src conc
+          g <- getOrCreateGroup groupsRef ix src conc
           modifyIORef' (sg_fetches g) (\fs -> fs . (SrcFetch req (writeIORef slot . Just) :))
           pure (readMySlot g slot)
    where
@@ -757,7 +764,7 @@ evalCompAp outerCap =
   prepLeaf
     :: forall r
      . CompFlowRegistry
-    -> IORef (HashMap.HashMap CompSrcId SomeSrcGroup)
+    -> IORef [(CompSrcInstIx, SomeSrcGroup)]
     -> CompReqLeaf r
     -> Prep r
   prepLeaf reg groupsRef leaf =
@@ -828,9 +835,9 @@ evalCompAp outerCap =
             -- 'SrcGroup' in it, keyed by resolved instance (see
             -- prepSrcLeaf/getOrCreateGroup); by the time the traversal's IO
             -- layer finishes, every group holds its full, final fetch list.
-            groupsRef <- liftIO (newIORef HashMap.empty)
+            groupsRef <- liftIO (newIORef [])
             enginePhase <- liftIO (unPrep (traverseCompReq (prepLeaf reg groupsRef) req))
-            groups <- liftIO (HashMap.elems <$> readIORef groupsRef)
+            groups <- liftIO (map snd <$> readIORef groupsRef)
             -- Proactively dispatch only the groups that can genuinely
             -- overlap something: FlowConcurrent instances, width > 1, and
             -- (as ever) only when the RTS can actually run threads

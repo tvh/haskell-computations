@@ -12,6 +12,8 @@ module Control.Computations.CompEngine.CompFlowRegistry (
   withCompSinkId,
   withTypedCompSinkId,
   withTypedCompSrcId,
+  CompSrcInstIx,
+  withTypedCompSrcIdIndexed,
   forAllSrcs_,
   forAllSinks_,
   registerCompSrc,
@@ -47,9 +49,34 @@ import qualified Data.HashSet as HashSet
 import Data.Proxy
 import Data.Typeable
 
+{- | A dense index assigned to a 'CompSrc' instance the moment it's
+ registered (see 'registerCompSrc'), monotonically increasing and never
+ reused, even across an unregister\/re-register cycle. Exists purely so
+ "Control.Computations.CompEngine.Impl"'s 'CompReqCombined' batch
+ preparation -- which buckets a batch's source leaves by the instance they
+ resolve to, and in practice sees only 1 to 5 distinct instances per batch,
+ however many thousand leaves -- can key its per-batch lookup table on a
+ cheap 'Int' comparison instead of hashing a 'CompSrcId' (two
+ 'Data.Text.Text' values, hashed through its Generic-derived instance) on
+ every source leaf. Never exported from the public
+ "Control.Computations.CompEngine" facade (see that module's import of this
+ one) -- interning stays an implementation detail of this module and
+ "Control.Computations.CompEngine.Impl", not something a 'CompSrc' instance
+ or its caller ever needs to know exists.
+-}
+newtype CompSrcInstIx = CompSrcInstIx Int
+  deriving (Eq)
+
+firstCompSrcInstIx :: CompSrcInstIx
+firstCompSrcInstIx = CompSrcInstIx 0
+
+nextCompSrcInstIx :: CompSrcInstIx -> CompSrcInstIx
+nextCompSrcInstIx (CompSrcInstIx n) = CompSrcInstIx (n + 1)
+
 data RegState = RegState
-  { rs_srcs :: HashMap CompSrcId AnyCompSrc
+  { rs_srcs :: HashMap CompSrcId (CompSrcInstIx, AnyCompSrc)
   , rs_sinks :: HashMap CompSinkId AnyCompSink
+  , rs_nextSrcIx :: CompSrcInstIx
   }
 
 {- | Width of the fixed worker pool a wide 'CompReqCombined' batch (see
@@ -109,7 +136,7 @@ data CompFlowRegistry = CompFlowRegistry
 
 newCompFlowRegistry :: IO CompFlowRegistry
 newCompFlowRegistry = do
-  let state = RegState HashMap.empty HashMap.empty
+  let state = RegState HashMap.empty HashMap.empty firstCompSrcInstIx
   v <- newTVarIO state
   concVar <- newTVarIO (mkCompFlowConcurrency 1)
   pure (CompFlowRegistry v concVar)
@@ -149,21 +176,39 @@ withTypedCompSrcId
   -> (s -> m a)
   -> m (Fail a)
 withTypedCompSrcId reg typedKey fun =
-  withCompSrcId reg (unTypedCompSrcId typedKey) fun
+  withTypedCompSrcIdIndexed reg typedKey (const fun)
 
-withCompSrcId
+{- | Like 'withTypedCompSrcId', but also hands @fun@ this instance's dense
+ 'CompSrcInstIx' (see its haddock) alongside the live instance, both read
+ from the very same registry lookup -- for
+ "Control.Computations.CompEngine.Impl"'s 'CompReqCombined' batch
+ preparation only, which needs the index to key its per-batch source-group
+ table without hashing a 'CompSrcId' a second time. Every other caller wants
+ plain 'withTypedCompSrcId'.
+-}
+withTypedCompSrcIdIndexed
+  :: forall m a s
+   . (MonadIO m, CompSrc s)
+  => CompFlowRegistry
+  -> TypedCompSrcId s
+  -> (CompSrcInstIx -> s -> m a)
+  -> m (Fail a)
+withTypedCompSrcIdIndexed reg typedKey fun =
+  withCompSrcIdIndexed reg (unTypedCompSrcId typedKey) fun
+
+withCompSrcIdIndexed
   :: forall m a s
    . (MonadIO m, CompSrc s)
   => CompFlowRegistry
   -> CompSrcId
-  -> (s -> m a)
+  -> (CompSrcInstIx -> s -> m a)
   -> m (Fail a)
-withCompSrcId reg key fun = do
+withCompSrcIdIndexed reg key fun = do
   regState <- liftIO $ readTVarIO (cfr_state reg)
   case Map.lookup key (rs_srcs regState) of
-    Just (AnyCompSrc src) ->
+    Just (ix, AnyCompSrc src) ->
       case cast src of
-        Just src' -> Ok <$> fun src'
+        Just src' -> Ok <$> fun ix src'
         Nothing ->
           pure $
             Fail
@@ -223,7 +268,7 @@ forAllSrcs_
 forAllSrcs_ reg srcFun =
   do
     regState <- liftIO $ readTVarIO (cfr_state reg)
-    F.forM_ (rs_srcs regState) $ \(AnyCompSrc src) -> srcFun src
+    F.forM_ (rs_srcs regState) $ \(_, AnyCompSrc src) -> srcFun src
 
 forAllSinks_
   :: MonadIO m
@@ -240,7 +285,10 @@ registerCompSrc reg src =
   do
     logInfo ("Registering " ++ show (compSrcId src))
     atomically $ modifyTVar' (cfr_state reg) $ \state ->
-      state{rs_srcs = HashMap.insert (compSrcId src) (AnyCompSrc src) (rs_srcs state)}
+      state
+        { rs_srcs = HashMap.insert (compSrcId src) (rs_nextSrcIx state, AnyCompSrc src) (rs_srcs state)
+        , rs_nextSrcIx = nextCompSrcInstIx (rs_nextSrcIx state)
+        }
 
 unregisterCompSrc :: CompSrc s => CompFlowRegistry -> s -> IO ()
 unregisterCompSrc reg src =
@@ -274,7 +322,7 @@ allCompSrcChanges reg b =
     let srcs = rs_srcs regState
     logTraceSTM ("Waiting for changes on " ++ show (Map.size srcs) ++ " sources")
     let changesActions :: [STM (HashSet AnyCompSrcDep)]
-        changesActions = map (\(AnyCompSrc src) -> getChanges src) (HashMap.elems srcs)
+        changesActions = map (\(_, AnyCompSrc src) -> getChanges src) (HashMap.elems srcs)
     -- wait for at least one change
     set1 <-
       case b of
