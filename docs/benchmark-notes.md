@@ -1739,3 +1739,99 @@ avoid; not attempted for that reason.
   responsibly. Next step, if pursued, is a `-prof`/`-hr` retainer census
   accepting the profiling distortion for this one question, or manual
   instrumentation around cold eval's tail.
+
+## Stage 7 — `SrcKeyArena` small-size optimisation, measured — kept
+
+The source-key-interning finding from Stage 5 ("~2,500 bytes per distinct
+source key... a real, identified optimisation opportunity") pointed at two
+tables: `DefTable.hs`'s forward-side `SrcDepIntern` and `SrcIndex.hs`'s
+reverse-side `KeyIntern`/`SrcKeyArena` pair. This stage attacks the second
+half — `SrcKeyArena` itself, not the interning table it hangs off of.
+
+Before this change, every `SrcKeyArena` — one per distinct source key
+currently depended on by at least one row — was unconditionally three
+`IORef`s wrapping two growable vectors, regardless of how many dependents
+that key actually had. That is an excellent trade for the existing
+persistence benchmark's shape (300 keys sharing ~683 dependents each) and a
+bad one for the Hospital benchmark's (~1.6M keys, ~1 dependent each — every
+vitals/lab/pharmacy/note field is read by exactly one computation). The fix:
+`SrcKeyArena` becomes a small-size optimisation over three states —
+`SrcKeyZero` (no dependents), `SrcKeyOne` (a single `(DefRef, AnyCompSrcVer)`
+pair held inline, no vector at all), and `SrcKeyMany` (the old
+always-allocated structure, renamed `ManyArena` but otherwise unchanged).
+Promotion is one-way: a key that reaches `SrcKeyMany` never demotes back to
+`SrcKeyOne`\/`SrcKeyZero` on shrink (only tried and rejected — see
+`Utils/SrcIndex.hs`'s own haddock for why), even though `SrcKeyOne` ->
+`SrcKeyZero` on removal is free and always taken. No public API changed —
+`SrcIndex.hs` is internal, not in `exposed-modules` — and all 153 existing
+tests (including the per-dependent version-tracking test and the intern-table
+churn regression tests) pass unmodified.
+
+Both benchmarks, same machine, same session, stashed/popped for a true
+before/after (not cross-session numbers):
+
+| metric | existing bench (control) — before | after | hospital — before | after |
+|---|---|---|---|---|
+| `max_live_bytes` | 365.4 MB | 365.5 MB | 4,310.3 MB | **4,012.4 MB** |
+| bytes/instance (`max_live_bytes` basis) | 365.5 B | 365.5 B | 4,416.0 B | **4,110.8 B** |
+| `allocated_bytes` (cold eval) | 24,250.1 MB | 24,250.1 MB | 38,135.9 MB | 37,625.3 MB |
+| `allocated_bytes` (live update, 1 key) | 3,043.4 MB | 3,043.5 MB | 0 | 0 |
+| `allocated_bytes` (rerun-heavy, 400 keys) | — | — | 1,071.0 MB | 1,071.0 MB |
+| `allocated_bytes` (rerun-heavy, 4000 keys) | — | — | 3,085.9 MB | 3,086.1 MB |
+| cold wall (range, n=2–3) | 6.6–6.7 s | 6.7 s | 22.5–22.6 s | 17.2–18.0 s |
+| live wall, 1 key | 0.81 s | 0.81 s | ~0.01 s (8 reruns) | ~0.01 s (8 reruns) |
+
+**Existing benchmark (the control): no regression.** `max_live_bytes` moved
+by +14,400 bytes (+0.004%) — one extra `IORef` indirection and pattern match
+per operation on a workload that hits the `SrcKeyMany` path from each key's
+second dependent onward, same as the old code from there on. `allocated_bytes`
+for both phases is unchanged to within a few thousand bytes. This is exactly
+the "must not regress" shape the control was chosen for.
+
+**Hospital: `max_live_bytes` down 297.9 MB, −6.91%** (4,310.3 → 4,012.4 MB;
+4,416.0 → 4,110.8 B/instance), reproduced bit-identically (`4,012,390,144`
+bytes) across three separate runs, including with `HOSPITAL_BENCH_RERUN_KEYS
+=4000`. Cold-eval `allocated_bytes` also drops, 38,135.9 → 37,625.3 MB
+(−1.34%) — fewer bytes ever allocated, not just a lower peak. The
+rerun-heavy phase's `allocated_bytes` is unchanged (as expected: re-triggering
+an existing dependent only calls `skaUpdateVer`, never a representation
+transition, on either version of the code). Wall time dropped more than the
+15% noise floor this machine's timing can resolve (cold: 22.5–22.6 s →
+17.2–18.0 s) but per this doc's own methodology note, that is reported, not
+relied on — `max_live_bytes` and `allocated_bytes`, both deterministic here,
+are the metrics this stage's conclusion rests on.
+
+**A win, but smaller than the naive per-key arithmetic suggests.** Removing
+two vectors' worth of allocation (each grown to an initial capacity of 4 on
+first use) from ~1.6M single-dependent keys is a real, measured ~300 MB, not
+the ~1.6M × (three-`IORef`-plus-two-4-slot-vectors) figure a back-of-envelope
+calculation would suggest — most of a `SrcKeyArena`'s old footprint was the
+per-key overhead (three separately-allocated `IORef` boxes plus two vector
+wrapper records), which the `SrcKeyOne` case still pays *some* of (one
+`IORef`, one constructor cell) even though it drops the vectors entirely; the
+saving is the two vectors and two of the three `IORef`s, not the whole
+structure. The remaining ~3.7 GB of Hospital's live set is unaccounted for by
+this stage and was not investigated further here — Stage 5's other named
+half of the same finding (deduplicating `SrcIndex`'s `KeyIntern` against
+`DefTable`'s own `SrcDepIntern`, so a genuinely-unshared key isn't interned
+twice) remains open, as does whatever `-hT` couldn't attribute in Stage 6.
+
+**Demotion:** not implemented. `SrcKeyMany` never shrinks back down once
+promoted, even to zero-then-rebuilt — the whole arena is discarded and a
+fresh one created from `SrcKeyZero` in that case, but a key that drains from
+many down to one (without hitting zero) keeps its `ManyArena` forever. This
+was a deliberate choice, not an oversight: this codebase's own workloads
+never exercise an oscillating-dependent-count key, so the added complexity
+and repeated promote/demote allocation churn such a case would risk have no
+demonstrated payoff here. If a future workload shows this pattern,
+`Utils/SrcIndex.hs`'s own haddock documents exactly where a demotion path
+would need to slot in.
+
+### Disposition: kept
+
+The control regressed by noise only, the target workload's `max_live_bytes`
+dropped by a real, reproducible 6.9%, and the module's own test suite —
+including the version-tracking and intern-churn tests this area's own
+haddock calls out by name — passes unmodified. Smaller than hoped, given
+where the remaining ~3.7 GB actually is, but a clean, low-risk win with no
+observed downside.

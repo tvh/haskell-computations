@@ -18,9 +18,13 @@
  = Two tables, one per existential
 
  'KeyIntern' interns 'AnyCompSrcKey' (which source key) to a dense
- 'SrcKeyId'; 'SrcKeyArena' stores, per interned key id, the flat
- @(DefRef, AnyCompSrcVer)@ list of that key's current dependents -- unboxed
- 'DefRef' column, boxed (parallel, index-aligned) 'AnyCompSrcVer' column.
+ 'SrcKeyId'; 'SrcKeyArena' stores, per interned key id, that key's current
+ set of @(DefRef, AnyCompSrcVer)@ dependents. Above one dependent, that set
+ is a flat pair of columns -- unboxed 'DefRef', boxed (parallel,
+ index-aligned) 'AnyCompSrcVer'; at zero or one dependents (the common case
+ for one of this module's two target workloads -- see "One dependent is the
+ common case" below) it is nothing more than an inline pair, no vector
+ allocated at all.
 
  ASCII sketch: source key @"k"@ interned to id 3, currently depended on by
  two rows (packed refs @r7@ and @r12@), each having last observed a
@@ -116,20 +120,89 @@
  ('SimpleStateIf.addSrcDependent'\/'removeSrcDependentKey', each handling one
  key\/ref pair at a time, called from a single fold over a row's newly
  diffed source deps), so there is no "whole span" to replace and 'EdgeArena'\'s
- machinery does not fit. 'SrcKeyArena' is the structure that /does/ fit
- single-entry mutation: a plain growable unboxed\/boxed column pair per key
- with append at the tail and O(current key size) linear-scan-then-
- swap-with-last removal -- no tombstones, no compaction pass, because a
- swap-remove leaves no dead space to reclaim in the first place. The
- O(current key size) scan is the one deliberate complexity tradeoff here
- (a hand-rolled per-key secondary index mapping 'DefRef' to slot would make
- removal O(1) at the cost of a second boxed structure per key, undoing much
- of the point) -- accepted because the persistence benchmark shipped with
- this library (see @bench\/.../Bench\/Main.hs@) exercises roughly 683
- dependents per key averaged across 300 keys, which keeps a linear scan
- cheap in practice, and because the scan operates on an unboxed 'Int'
- column, not a boxed structure -- see the module's own churn tests for the
- bound this actually achieves.
+ machinery does not fit. 'SrcKeyArena'\'s many-dependents representation
+ ('ManyArena', below) is the structure that /does/ fit single-entry
+ mutation: a plain growable unboxed\/boxed column pair per key with append
+ at the tail and O(current key size) linear-scan-then-swap-with-last
+ removal -- no tombstones, no compaction pass, because a swap-remove leaves
+ no dead space to reclaim in the first place. The O(current key size) scan
+ is the one deliberate complexity tradeoff here (a hand-rolled per-key
+ secondary index mapping 'DefRef' to slot would make removal O(1) at the
+ cost of a second boxed structure per key, undoing much of the point) --
+ accepted because the persistence benchmark shipped with this library (see
+ @bench\/.../Bench\/Main.hs@) exercises roughly 683 dependents per key
+ averaged across 300 keys, which keeps a linear scan cheap in practice, and
+ because the scan operates on an unboxed 'Int' column, not a boxed
+ structure -- see the module's own churn tests for the bound this actually
+ achieves.
+
+ = One dependent is the common case, not the exception
+
+ The 683-dependents-per-key shape above is the workload 'ManyArena' was
+ designed against, and it is not the only shape this module has to serve.
+ A second benchmark (the "hospital" variant) creates roughly 1.6M distinct
+ source keys -- one per (patient, observation, field) triple, since vitals
+ split value\/unit\/reference-range into three separate keys, labs split
+ result\/range\/specimen into three more, and so on -- each read by exactly
+ one computation. That workload never touches the many-dependents path at
+ all, yet before this section's optimisation it paid for one unconditionally
+ whether it needed it or not: every 'SrcKeyArena', regardless of how many
+ dependents its key ever actually had, was three 'IORef's wrapping two
+ growable vectors. At ~1.6M keys averaging ~1 dependent, that structure
+ dominates the reverse index's live memory -- by a wide margin the largest
+ identified item in a benchmark suite built specifically to surface exactly
+ this kind of thing.
+
+ 'SrcKeyArena' is therefore a small-size optimisation over three states, not
+ the vector-backed structure directly:
+
+ > data SrcKeyRep
+ >   = SrcKeyZero
+ >   | SrcKeyOne !DefRef !AnyCompSrcVer
+ >   | SrcKeyMany !ManyArena
+ >
+ > newtype SrcKeyArena = SrcKeyArena (IORef SrcKeyRep)
+
+ 'SrcKeyZero' is the state 'newSrcKeyArena' creates, and the state
+ 'skaRemove' returns a key to once its lone dependent is removed. It exists
+ as a real representable state -- rather than, say, 'sifs_srcEntries' simply
+ not holding an entry for the key yet -- because "SimpleStateIf.hs" keeps
+ one stable 'SrcKeyArena' handle per interned key across that key's whole
+ create-populate-drain lifecycle (see 'addSrcDependent'\/
+ 'removeSrcDependentKey'\/'updateSrcDependentVersion'): the handle is
+ created and stored in @sifs_srcEntries@ once, on the key's first
+ dependent, and every subsequent add\/remove\/update on that key reads the
+ same handle back out and mutates it in place, with no further @IntMap@
+ write -- deliberately, since @sifs_srcEntries@ can hold on the order of a
+ million entries on the hospital workload, and an @IntMap.insert@ on every
+ dependent add\/remove would be a ~20-node path copy each time instead of
+ one @IORef@ write. A handle that already exists (interned, stored) but
+ whose dependent set is momentarily empty is therefore a state this design
+ has to represent, not an edge case it can avoid by construction.
+
+ 'SrcKeyOne' holds a single dependent inline -- no vector, no extra
+ 'IORef', just the @(DefRef, AnyCompSrcVer)@ pair itself, which is exactly
+ what the hospital workload's typical key never needs more than one of.
+ 'SrcKeyMany' is the old always-allocated structure, renamed to 'ManyArena'
+ but otherwise unchanged, reached only once a *second* distinct dependent
+ arrives for the same key -- the shape the 683-dependents-per-key benchmark
+ above exercises from its second dependent onward, at the cost of one extra
+ 'IORef' dereference and pattern match per operation versus the old
+ unconditional-vector design, and nothing else.
+
+ Promotion ('SrcKeyZero' -> 'SrcKeyOne' -> 'SrcKeyMany') is one-way in this
+ version: once a key reaches 'SrcKeyMany' it stays there even if it later
+ drains back down to one or zero live dependents, until the *whole* arena
+ is discarded (see 'skaRemove' and 'removeSrcDependentKey'). Demoting
+ 'SrcKeyMany' back to 'SrcKeyOne' on shrink was considered and deliberately
+ not done: a workload whose keys oscillate between one and two dependents
+ would pay a repeated promote\/demote allocation for no lasting benefit,
+ and there is no evidence of such a workload among this module's own
+ benchmarks or tests -- so the complexity (and allocation churn) of
+ tracking that transition is left undone rather than spent on a shape
+ nothing here exercises. 'SrcKeyOne' -> 'SrcKeyZero' on removal costs
+ nothing to do, by contrast (no vector to keep or discard either way), so
+ 'skaRemove' always performs that one.
 
  = Invariants (summary)
 
@@ -146,6 +219,12 @@
 
  __Per-key dependent arena ('SrcKeyArena'):__
 
+ * A freshly created arena ('newSrcKeyArena') starts as 'SrcKeyZero'. The
+   first 'skaAppend' promotes it to 'SrcKeyOne'; a second 'skaAppend' for a
+   different ref promotes it to 'SrcKeyMany' -- see "One dependent is the
+   common case" above. Every operation dispatches on the current state and
+   is observably equivalent to the single-representation version of this
+   module in every case except which branch runs and what it allocates.
  * 'skaAppend' does not deduplicate -- a second append for a ref already
    present in the arena adds a second entry. Safe because 'skaAppend' is
    only ever reached for a source key a row was *not* already depending on:
@@ -154,12 +233,20 @@
    version" are distinguished at the call site, and only the former routes
    here -- the latter goes through 'skaUpdateVer' instead, which overwrites
    the existing entry's version in place and never appends.
- * 'skaRemove' is swap-with-last, not a stable shift -- order is not part
-   of this structure's contract.
- * 'skaUpdateVer' locates the entry by the same linear scan 'skaRemove'
-   uses, then overwrites its version column slot in place -- no length
-   change, no swap, no 'KeyIntern' churn. Caller's responsibility: @ref@
-   must already be present (every real call site's own by-key diff
+ * 'skaRemove' on 'SrcKeyMany' locates the entry by linear scan
+   ('ManyArena''s own, unchanged) and removes it swap-with-last -- order is
+   not part of this structure's contract. It never demotes 'SrcKeyMany'
+   back to 'SrcKeyOne' or 'SrcKeyZero', even when the removal drains it to
+   one or zero live entries -- see "One dependent is the common case"
+   above for why not. 'skaRemove' on 'SrcKeyOne' does demote, straight to
+   'SrcKeyZero', because unlike the 'SrcKeyMany' case there is no vector to
+   either keep or discard either way -- the demotion is free, and it is
+   what lets 'skaNull' report the arena empty so its caller can discard it.
+ * 'skaUpdateVer' locates the entry (a direct match against 'SrcKeyOne''s
+   single ref, or the same linear scan 'skaRemove' uses for 'SrcKeyMany'),
+   then overwrites its version in place -- no length change, no swap, no
+   'KeyIntern' churn, no representation transition. Caller's responsibility:
+   @ref@ must already be present (every real call site's own by-key diff
    guarantees this -- see above); a miss returns 'False' rather than
    inserting.
  * __Every write through 'skaAppend' or 'skaUpdateVer' must force @ver@ to
@@ -305,24 +392,24 @@ kiAssignedCount ki = readIORef (ki_count ki)
 -- another EdgeArena" section.
 --
 
--- | @ska_refs@ stores each dependent's 'DefRef' directly: 'DefRef' has a
--- real 'Data.Vector.Unboxed.Unbox' instance (via vector's
--- 'Data.Vector.Unboxed.UnboxViaPrim' -- see "DefTable.hs"'s
+-- | The vector-backed "two or more dependents" representation -- what every
+-- 'SrcKeyArena' used to be, unconditionally, before the small-size
+-- optimisation described in the module haddock's "One dependent is the
+-- common case" section. @ma_refs@ stores each dependent's 'DefRef'
+-- directly: 'DefRef' has a real 'Data.Vector.Unboxed.Unbox' instance (via
+-- vector's 'Data.Vector.Unboxed.UnboxViaPrim' -- see "DefTable.hs"'s
 -- 'Control.Computations.CompEngine.Utils.DefTable.unDefRef' haddock for the
 -- recipe), so this column stores 'DefRef' values directly rather than a raw
 -- 'Int' that would need coercing at every read\/write.
--- 'skaAppend'\/'skaRemove'\/'skaToList' -- this module's actual API
--- boundary -- take\/return 'DefRef' exactly as this column stores it, with
--- no representation seam between them.
-data SrcKeyArena = SrcKeyArena
-  { ska_refs :: !(IORef (VUM.IOVector DefRef))
-  , ska_vers :: !(IORef (VM.IOVector AnyCompSrcVer))
-  , ska_len :: !(IORef Int)
+data ManyArena = ManyArena
+  { ma_refs :: !(IORef (VUM.IOVector DefRef))
+  , ma_vers :: !(IORef (VM.IOVector AnyCompSrcVer))
+  , ma_len :: !(IORef Int)
   }
 
-newSrcKeyArena :: IO SrcKeyArena
-newSrcKeyArena =
-  SrcKeyArena
+newManyArena :: IO ManyArena
+newManyArena =
+  ManyArena
     <$> (newIORef =<< VUM.new 0)
     <*> (newIORef =<< VM.new 0)
     <*> newIORef 0
@@ -330,18 +417,136 @@ newSrcKeyArena =
 -- | Grow both columns in lockstep to at least @needed@ slots. Freshly grown
 -- capacity in the boxed column is the @vector@ package's own
 -- uninitialised-element error thunk; safe because every slot below
--- 'ska_len' is written by 'skaAppend' before it is ever read.
-growBoth :: SrcKeyArena -> Int -> IO ()
-growBoth ska needed = do
-  rv <- readIORef (ska_refs ska)
+-- 'ma_len' is written by 'maAppend' before it is ever read.
+maGrowBoth :: ManyArena -> Int -> IO ()
+maGrowBoth ma needed = do
+  rv <- readIORef (ma_refs ma)
   let cap = GM.length rv
   when (needed > cap) $ do
     let extra = max (needed - cap) (max 4 cap)
     rv' <- GM.unsafeGrow rv extra
-    writeIORef (ska_refs ska) rv'
-    vv <- readIORef (ska_vers ska)
+    writeIORef (ma_refs ma) rv'
+    vv <- readIORef (ma_vers ma)
     vv' <- GM.unsafeGrow vv extra
-    writeIORef (ska_vers ska) vv'
+    writeIORef (ma_vers ma) vv'
+
+-- | Append one @(ref, ver)@ entry. Caller's responsibility: if @ref@ is
+-- already present, this appends a *second* entry rather than updating the
+-- first -- see 'skaAppend's haddock, which this is the 'SrcKeyMany' half
+-- of. @ver@ must already be forced to WHNF by the caller (both 'maAppend'
+-- call sites, inside 'skaAppend', pass a @ver@ that 'skaAppend' itself
+-- already forced via its own @!ver@ bang, per the module haddock's "A boxed
+-- side column needs to force its own writes" section).
+maAppend :: ManyArena -> DefRef -> AnyCompSrcVer -> IO ()
+maAppend ma ref ver = do
+  len <- readIORef (ma_len ma)
+  maGrowBoth ma (len + 1)
+  rv <- readIORef (ma_refs ma)
+  vv <- readIORef (ma_vers ma)
+  VUM.write rv len ref
+  VM.write vv len ver
+  writeIORef (ma_len ma) (len + 1)
+
+-- | Remove the entry for @ref@ via linear scan, then swap-with-last (no
+-- tombstone -- a swap-remove leaves no gap to reclaim later, unlike
+-- 'EdgeArena'\'s append-orphan-compact scheme, which this module
+-- deliberately does not need -- see the module haddock). Returns 'True' iff
+-- an entry was found and removed. Does not, and cannot on its own, shrink
+-- @ma@ back to a 'SrcKeyOne'\/'SrcKeyZero' representation even if this
+-- removal drains it to one or zero entries -- that is 'skaRemove's call to
+-- make (it doesn't -- see the module haddock's "One dependent is the common
+-- case" section for why).
+maRemove :: ManyArena -> DefRef -> IO Bool
+maRemove ma ref = do
+  len <- readIORef (ma_len ma)
+  rv <- readIORef (ma_refs ma)
+  let go i
+        | i >= len = pure Nothing
+        | otherwise = do
+            r <- VUM.read rv i
+            if r == ref then pure (Just i) else go (i + 1)
+  found <- go 0
+  case found of
+    Nothing -> pure False
+    Just i -> do
+      let lastIdx = len - 1
+      when (i /= lastIdx) $ do
+        lastRef <- VUM.read rv lastIdx
+        VUM.write rv i lastRef
+        vv <- readIORef (ma_vers ma)
+        lastVer <- VM.read vv lastIdx
+        VM.write vv i lastVer
+      writeIORef (ma_len ma) lastIdx
+      pure True
+
+-- | Overwrite the stored version for @ref@'s existing entry in place.
+-- Locates the entry via the same linear scan 'maRemove' performs, but --
+-- unlike 'maRemove' followed by 'maAppend' -- reuses the slot rather than
+-- shrinking then regrowing the arena: no swap-with-last, no length change.
+-- This is strictly less work than a remove/re-add pair for the same
+-- @(key, row)@: one linear scan instead of two, one boxed write instead of
+-- two (plus, when the removed entry wasn't the arena's last, 'maRemove'\'s
+-- own swap writes a second time), and zero unboxed 'ma_refs' writes since
+-- @ref@ itself never changes. Returns 'False' (rather than inserting) if
+-- @ref@ is not present -- see 'skaUpdateVer's haddock, which this is the
+-- 'SrcKeyMany' half of.
+maUpdateVer :: ManyArena -> DefRef -> AnyCompSrcVer -> IO Bool
+maUpdateVer ma ref ver = do
+  len <- readIORef (ma_len ma)
+  rv <- readIORef (ma_refs ma)
+  let go i
+        | i >= len = pure Nothing
+        | otherwise = do
+            r <- VUM.read rv i
+            if r == ref then pure (Just i) else go (i + 1)
+  found <- go 0
+  case found of
+    Nothing -> pure False
+    Just i -> do
+      vv <- readIORef (ma_vers ma)
+      VM.write vv i ver
+      pure True
+
+-- | Every currently-live @(ref, ver)@ pair, in unspecified order: order is
+-- not part of this structure's contract, and 'maRemove'\'s swap-with-last
+-- deliberately does not preserve insertion order.
+maToList :: ManyArena -> IO [(DefRef, AnyCompSrcVer)]
+maToList ma = do
+  len <- readIORef (ma_len ma)
+  rv <- readIORef (ma_refs ma)
+  vv <- readIORef (ma_vers ma)
+  mapM (\i -> (,) <$> VUM.read rv i <*> VM.read vv i) [0 .. len - 1]
+
+maNull :: ManyArena -> IO Bool
+maNull ma = (== 0) <$> readIORef (ma_len ma)
+
+maLiveCount :: ManyArena -> IO Int
+maLiveCount ma = readIORef (ma_len ma)
+
+--
+-- The public arena API -- a small-size optimisation switching between the
+-- three 'SrcKeyRep' states over the 'ManyArena' machinery above. See the
+-- module haddock's "One dependent is the common case" section for the two
+-- workload shapes this exists to serve and why promotion is one-way.
+--
+
+-- | The state a 'SrcKeyArena' is in: no dependents yet (or drained back to
+-- none), exactly one (held inline, no vector), or two-or-more (the
+-- vector-backed 'ManyArena').
+data SrcKeyRep
+  = SrcKeyZero
+  | SrcKeyOne !DefRef !AnyCompSrcVer
+  | SrcKeyMany !ManyArena
+
+-- | One stable mutable handle per interned source key, held by
+-- "SimpleStateIf.hs"'s @sifs_srcEntries@ for that key's whole
+-- create-populate-drain lifecycle -- see the module haddock. The
+-- representation behind the handle changes as the key's dependent count
+-- crosses zero and one; the handle itself never does.
+newtype SrcKeyArena = SrcKeyArena (IORef SrcKeyRep)
+
+newSrcKeyArena :: IO SrcKeyArena
+newSrcKeyArena = SrcKeyArena <$> newIORef SrcKeyZero
 
 -- | Append one @(ref, ver)@ entry, forcing @ver@ to WHNF before storing it.
 --
@@ -362,66 +567,59 @@ growBoth ska needed = do
 -- forces @ver@ to WHNF in the first place unless the write site does it:
 -- @Data.Vector.Mutable.write@ carries no strictness contract of its own
 -- and will happily store an unevaluated thunk (unlike a
--- @Data.HashMap.Strict@, which forces its value on every insert). Left
--- lazy, that thunk would close over its caller's whole @AnyCompSrcDep@
--- (and, transitively, the 'DepSet'\/'HashSet' it came from) and never get
--- forced during cold eval at all, since nothing reads a version back out
--- until the live phase's 'SimpleStateIf.notifyDepChange' compares it --
--- meaning every dependent's evaluation closure would stay reachable for
--- the entire cold-eval run for no reason. That is exactly the shape of
--- space leak no type signature can catch: semantics stay correct (the
--- same instance\/rerun counts either way), only retention is wrong.
+-- @Data.HashMap.Strict@, which forces its value on every insert), and a
+-- bare 'writeIORef' of an 'SrcKeyOne' built from an unforced @ver@ is no
+-- better. Left lazy, that thunk would close over its caller's whole
+-- @AnyCompSrcDep@ (and, transitively, the 'DepSet'\/'HashSet' it came
+-- from) and never get forced during cold eval at all, since nothing reads
+-- a version back out until the live phase's
+-- 'SimpleStateIf.notifyDepChange' compares it -- meaning every dependent's
+-- evaluation closure would stay reachable for the entire cold-eval run for
+-- no reason. That is exactly the shape of space leak no type signature can
+-- catch: semantics stay correct (the same instance\/rerun counts either
+-- way), only retention is wrong.
 skaAppend :: SrcKeyArena -> DefRef -> AnyCompSrcVer -> IO ()
-skaAppend ska ref !ver = do
-  len <- readIORef (ska_len ska)
-  growBoth ska (len + 1)
-  rv <- readIORef (ska_refs ska)
-  vv <- readIORef (ska_vers ska)
-  VUM.write rv len ref
-  VM.write vv len ver
-  writeIORef (ska_len ska) (len + 1)
+skaAppend (SrcKeyArena rep) ref !ver = do
+  r <- readIORef rep
+  case r of
+    SrcKeyZero -> writeIORef rep (SrcKeyOne ref ver)
+    SrcKeyOne ref0 ver0 -> do
+      -- Second dependent for this key -- promote. ver0 was already forced
+      -- to WHNF when it was stored (this same function, on the previous
+      -- call), so re-passing it to maAppend needs no further forcing.
+      ma <- newManyArena
+      maAppend ma ref0 ver0
+      maAppend ma ref ver
+      writeIORef rep (SrcKeyMany ma)
+    SrcKeyMany ma -> maAppend ma ref ver
 
--- | Remove the entry for @ref@ via linear scan, then swap-with-last (no
--- tombstone -- a swap-remove leaves no gap to reclaim later, unlike
--- 'EdgeArena'\'s append-orphan-compact scheme, which this module
--- deliberately does not need -- see the module haddock). Returns 'True' iff
--- an entry was found and removed; a caller that expects @ref@ to be
--- present (there isn't one here -- see 'SimpleStateIf.removeSrcDependentKey',
--- which tolerates a miss deliberately) can check the result.
+-- | Remove the entry for @ref@. Returns 'True' iff an entry was found and
+-- removed; a caller that expects @ref@ to be present (there isn't one here
+-- -- see 'SimpleStateIf.removeSrcDependentKey', which tolerates a miss
+-- deliberately) can check the result.
+--
+-- On 'SrcKeyOne', a match demotes straight to 'SrcKeyZero' -- free to do,
+-- since there is no vector to keep or discard either way, and it's what
+-- lets 'skaNull' report the arena empty afterwards. On 'SrcKeyMany', this
+-- delegates to 'maRemove' (linear-scan-then-swap-with-last) and
+-- deliberately does *not* demote back to 'SrcKeyOne' or 'SrcKeyZero' even
+-- when the removal drains it to one or zero live entries -- see the module
+-- haddock's "One dependent is the common case" section for why not.
 skaRemove :: SrcKeyArena -> DefRef -> IO Bool
-skaRemove ska ref = do
-  len <- readIORef (ska_len ska)
-  rv <- readIORef (ska_refs ska)
-  let go i
-        | i >= len = pure Nothing
-        | otherwise = do
-            r <- VUM.read rv i
-            if r == ref then pure (Just i) else go (i + 1)
-  found <- go 0
-  case found of
-    Nothing -> pure False
-    Just i -> do
-      let lastIdx = len - 1
-      when (i /= lastIdx) $ do
-        lastRef <- VUM.read rv lastIdx
-        VUM.write rv i lastRef
-        vv <- readIORef (ska_vers ska)
-        lastVer <- VM.read vv lastIdx
-        VM.write vv i lastVer
-      writeIORef (ska_len ska) lastIdx
-      pure True
+skaRemove (SrcKeyArena rep) target = do
+  r <- readIORef rep
+  case r of
+    SrcKeyZero -> pure False
+    SrcKeyOne ref0 _
+      | ref0 == target -> writeIORef rep SrcKeyZero >> pure True
+      | otherwise -> pure False
+    SrcKeyMany ma -> maRemove ma target
 
 -- | Overwrite the stored version for @ref@'s existing entry in place,
 -- forcing @ver@ to WHNF before storing it (same strictness requirement as
--- 'skaAppend' -- see its haddock). Locates the entry via the same linear
--- scan 'skaRemove' performs, but -- unlike 'skaRemove' followed by
--- 'skaAppend' -- reuses the slot rather than shrinking then regrowing the
--- arena: no swap-with-last, no length change, no 'KeyIntern' round trip
--- even transiently. This is strictly less work than a remove/re-add pair
--- for the same @(key, row)@: one linear scan instead of two, one boxed
--- write instead of two (plus, when the removed entry wasn't the arena's
--- last, 'skaRemove'\'s own swap writes a second time), and zero unboxed
--- 'ska_refs' writes since @ref@ itself never changes.
+-- 'skaAppend' -- see its haddock). No length change, no swap, no
+-- 'KeyIntern' round trip, no representation transition, regardless of
+-- which state the arena is in.
 --
 -- Returns 'False' (rather than inserting) if @ref@ is not present. Every
 -- real call site ("SimpleStateIf.hs"'s @updateEdges@, via
@@ -429,35 +627,39 @@ skaRemove ska ref = do
 -- has confirmed @ref@ already depends on this key, so a 'False' result
 -- there is a lifecycle bug, not a legitimate runtime occurrence.
 skaUpdateVer :: SrcKeyArena -> DefRef -> AnyCompSrcVer -> IO Bool
-skaUpdateVer ska ref !ver = do
-  len <- readIORef (ska_len ska)
-  rv <- readIORef (ska_refs ska)
-  let go i
-        | i >= len = pure Nothing
-        | otherwise = do
-            r <- VUM.read rv i
-            if r == ref then pure (Just i) else go (i + 1)
-  found <- go 0
-  case found of
-    Nothing -> pure False
-    Just i -> do
-      vv <- readIORef (ska_vers ska)
-      VM.write vv i ver
-      pure True
+skaUpdateVer (SrcKeyArena rep) target !ver = do
+  r <- readIORef rep
+  case r of
+    SrcKeyZero -> pure False
+    SrcKeyOne ref0 _
+      | ref0 == target -> writeIORef rep (SrcKeyOne ref0 ver) >> pure True
+      | otherwise -> pure False
+    SrcKeyMany ma -> maUpdateVer ma target ver
 
 -- | Every currently-live @(ref, ver)@ pair, in unspecified order: order is
--- not part of this structure's contract, and 'skaRemove'\'s swap-with-last
--- deliberately does not preserve insertion order.
+-- not part of this structure's contract, and 'SrcKeyMany's swap-with-last
+-- removal deliberately does not preserve insertion order.
 skaToList :: SrcKeyArena -> IO [(DefRef, AnyCompSrcVer)]
-skaToList ska = do
-  len <- readIORef (ska_len ska)
-  rv <- readIORef (ska_refs ska)
-  vv <- readIORef (ska_vers ska)
-  mapM (\i -> (,) <$> VUM.read rv i <*> VM.read vv i) [0 .. len - 1]
+skaToList (SrcKeyArena rep) = do
+  r <- readIORef rep
+  case r of
+    SrcKeyZero -> pure []
+    SrcKeyOne ref0 ver0 -> pure [(ref0, ver0)]
+    SrcKeyMany ma -> maToList ma
 
 skaNull :: SrcKeyArena -> IO Bool
-skaNull ska = (== 0) <$> readIORef (ska_len ska)
+skaNull (SrcKeyArena rep) = do
+  r <- readIORef rep
+  case r of
+    SrcKeyZero -> pure True
+    SrcKeyOne _ _ -> pure False
+    SrcKeyMany ma -> maNull ma
 
 -- | Test/debug-only: current live entry count.
 skaLiveCount :: SrcKeyArena -> IO Int
-skaLiveCount ska = readIORef (ska_len ska)
+skaLiveCount (SrcKeyArena rep) = do
+  r <- readIORef rep
+  case r of
+    SrcKeyZero -> pure 0
+    SrcKeyOne _ _ -> pure 1
+    SrcKeyMany ma -> maLiveCount ma

@@ -171,12 +171,18 @@ newtype SimpleStateIf m = SimpleStateIf
  design rationale, mirroring "Utils/DefTable.hs"'s forward-side src-dep
  interning): 'sifs_srcKeyIntern' interns each 'AnyCompSrcKey' to a dense
  'Int', and 'sifs_srcEntries' maps that id to a 'SI.SrcKeyArena' holding the
- key's current @(DefRef, AnyCompSrcVer)@ dependent list as an unboxed
- 'DefRef' column plus a parallel boxed 'AnyCompSrcVer' column, rather than
- a @HashMap AnyCompSrcKey (HashMap DefRef AnyCompSrcVer)@ (a boxed
+ key's current @(DefRef, AnyCompSrcVer)@ dependent set, rather than a
+ @HashMap AnyCompSrcKey (HashMap DefRef AnyCompSrcVer)@ (a boxed
  existential key hashed/compared on every access, nested inside a second
- boxed HAMT). A key's arena is created on its first dependent and deleted
- on its last -- see 'addSrcDependent'\/'removeSrcDependentKey'.
+ boxed HAMT). 'SI.SrcKeyArena' is itself a small-size optimisation -- a
+ single dependent is held inline with no vector at all, and only a second
+ dependent promotes the key to an unboxed 'DefRef' column plus a parallel
+ boxed 'AnyCompSrcVer' column -- see "Utils/SrcIndex.hs"'s "One dependent is
+ the common case" section for why: this codebase's two benchmarks exercise
+ the two ends of that shape, one with ~683 dependents per key, the other
+ (hospital) with ~1.6M keys averaging ~1 dependent each. A key's arena is
+ created on its first dependent and deleted on its last -- see
+ 'addSrcDependent'\/'removeSrcDependentKey'.
 -}
 data SifState = SifState
   { sifs_defIndex :: !(IORef (HashMap CompId DT.DefIdx))

@@ -727,8 +727,9 @@ refRow = snd . unpackRef
 -- its key type, so 'DefRef' flows through them unwrapped.
 --
 -- __Not needed by "Utils/SrcIndex.hs"'s @SrcKeyArena@ either.__ Its
--- @ska_refs@ column stores 'DefRef' directly rather than a raw 'Int'
--- coerced at the edge, because 'DefRef' has a real 'VU.Unbox' instance
+-- many-dependents representation's (@ManyArena@'s) @ma_refs@ column stores
+-- 'DefRef' directly rather than a raw 'Int' coerced at the edge, because
+-- 'DefRef' has a real 'VU.Unbox' instance
 -- (see the instance a few lines below). That instance doesn't need a
 -- hand-written 'Data.Vector.Unboxed.Unbox' definition, even though
 -- 'GeneralizedNewtypeDeriving' cannot derive 'VU.Unbox' directly (it \/is\/
