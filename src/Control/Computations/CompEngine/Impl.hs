@@ -50,7 +50,7 @@ import qualified Data.HashSet as HashSet
 import Data.IORef
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import Data.Typeable (cast)
+import Data.Typeable (Proxy (..), cast)
 
 newtype CompEngine = CompEngine
   { ce_compEngineIfs :: CompEngineIfs
@@ -611,11 +611,18 @@ evalCompAp outerCap =
     -> CompCont (Fail a) x
     -> CompEngineM (CompResult x)
   doCompSrcReq env srcId req cont = do
+    -- NOTE: computed once, outside srcFun's per-dependency mapM_ below,
+    -- rather than via `wrapCompSrcDep src` inside it -- srcId is already
+    -- this instance's id (it's exactly what the withTypedCompSrcId lookup
+    -- just below keyed on), so re-deriving it from `src` per dependency via
+    -- compSrcId would just re-render the same TypeRep to Text every time
+    -- (see wrapCompSrcDep's haddock).
+    let cid = unTypedCompSrcId srcId
     let srcFun src = do
           (inputs, res) <- liftIO $ compSrcExecute src req
           let retVal =
                 do
-                  mapM_ (dependOn . wrapCompSrcDep src) inputs
+                  mapM_ (dependOn . wrapCompSrcDepWithId (Proxy @s) cid) inputs
                   return res
           return retVal
     reg <- CompEngineM (asks (ce_compFlowRegistry . ce_compEngineIfs))
@@ -714,6 +721,13 @@ evalCompAp outerCap =
           modifyIORef' (sg_fetches g) (\fs -> fs . (SrcFetch req (writeIORef slot . Just) :))
           pure (readMySlot g slot)
    where
+    -- NOTE: sid is this leaf's own id, already resolved via the registry
+    -- lookup above -- every leaf that lands in the same group (same ix)
+    -- necessarily resolved through the same key (see getOrCreateGroup's
+    -- haddock on the ix<->CompSrcId correspondence), so this is exactly
+    -- sg_src g's own compSrcId, computed once here instead of once per
+    -- dependency inside readMySlot below (see wrapCompSrcDep's haddock).
+    cid = unTypedCompSrcId sid
     -- The engine-thread half of every source leaf, job or not: make sure
     -- this leaf's group has actually run (a no-op if some other leaf's
     -- CompEngineM action, or a dispatched job, already triggered it -- see
@@ -739,7 +753,7 @@ evalCompAp outerCap =
         Just (Right (inputs, res)) ->
           pure $
             do
-              mapM_ (dependOn . wrapCompSrcDep (sg_src g)) inputs
+              mapM_ (dependOn . wrapCompSrcDepWithId (Proxy @s) cid) inputs
               return res
 
   isCompReqCombined :: forall r. CompReq r -> Bool

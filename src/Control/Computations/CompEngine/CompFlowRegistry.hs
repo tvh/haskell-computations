@@ -321,8 +321,13 @@ allCompSrcChanges reg b =
     regState <- readTVar (cfr_state reg)
     let srcs = rs_srcs regState
     logTraceSTM ("Waiting for changes on " ++ show (Map.size srcs) ++ " sources")
+    -- NOTE: toList (not elems), so each instance's own registry key --
+    -- already computed once at 'registerCompSrc' time -- comes along for
+    -- 'getChanges' to reuse via 'wrapCompSrcDepWithId', instead of every
+    -- changed dep re-deriving it from the instance via 'wrapCompSrcDep' (see
+    -- that function's haddock).
     let changesActions :: [STM (HashSet AnyCompSrcDep)]
-        changesActions = map (\(_, AnyCompSrc src) -> getChanges src) (HashMap.elems srcs)
+        changesActions = map (\(cid, (_, AnyCompSrc src)) -> getChanges cid src) (HashMap.toList srcs)
     -- wait for at least one change
     set1 <-
       case b of
@@ -332,10 +337,10 @@ allCompSrcChanges reg b =
     sets <- mapM (`orElse` pure HashSet.empty) changesActions
     pure (HashSet.unions (set1 : sets))
  where
-  getChanges :: CompSrc s => s -> STM (HashSet AnyCompSrcDep)
-  getChanges s =
+  getChanges :: forall s. CompSrc s => CompSrcId -> s -> STM (HashSet AnyCompSrcDep)
+  getChanges cid s =
     do
       deps <- compSrcWaitChanges s
       when (HashSet.null deps) $
-        logDebugSTM (show (compSrcId s) ++ " returned no results, it should have blocked in STM.")
-      pure (HashSet.map (wrapCompSrcDep s) deps)
+        logDebugSTM (show cid ++ " returned no results, it should have blocked in STM.")
+      pure (HashSet.map (wrapCompSrcDepWithId (Proxy @s) cid) deps)

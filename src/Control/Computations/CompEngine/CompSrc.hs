@@ -33,6 +33,7 @@ module Control.Computations.CompEngine.CompSrc (
   SomeCompSrcVer (..),
   AnyCompSrc (..),
   wrapCompSrcDep,
+  wrapCompSrcDepWithId,
 ) where
 
 ----------------------------------------
@@ -286,8 +287,43 @@ instance IsDep AnyCompSrcDep where
   depKey (ForAnyCompFlow i p d) = ForAnyCompFlow i p (depKey d)
   depVer (ForAnyCompFlow i p d) = ForAnyCompFlow i p (depVer d)
 
+{- | Tag a dependency with the id of the source it came from, recomputing
+ that id from @s@ via 'compSrcId' every time.
+
+ Fine for a one-off caller, but 'compSrcId' renders a 'TypeRep' to 'Text'
+ on every call (see 'identifyProxy') and can't be floated to a CAF here:
+ 'wrapCompSrcDep' is reached through the existential 'AnyCompSrc', so GHC
+ has no dictionary to specialise the call away with. A caller that already
+ knows this source's id -- e.g. because it just resolved the instance via
+ a 'TypedCompSrcId' lookup -- should call 'wrapCompSrcDepWithId' with that
+ id instead of going through here once per dependency; see its haddock.
+-}
 wrapCompSrcDep :: forall s. CompSrc s => s -> CompSrcDep s -> AnyCompSrcDep
-wrapCompSrcDep s d =
-  ForAnyCompFlow (compSrcId s) (Proxy @s) (SomeCompSrcDep d)
+wrapCompSrcDep s = wrapCompSrcDepWithId (Proxy @s) (compSrcId s)
+
+{- | Like 'wrapCompSrcDep', but takes an already-computed 'CompSrcId' instead
+ of re-deriving one from a live instance. Takes a 'Proxy' rather than an
+ @s@ purely to fix the existential type variable (the same role
+ 'unsafeMkTypedCompSrcId's own 'Proxy' argument plays) -- unlike
+ 'wrapCompSrcDep', nothing here ever needs a live instance in hand.
+
+ A comp source request typically depends on many keys from the same
+ instance in one go (@mapM_ (dependOn . wrapCompSrcDep src) inputs@ at each
+ call site), and the instance's id is the same for every one of them.
+ Callers that already have that id in hand -- from the very
+ 'TypedCompSrcId' \/ registry lookup that produced the instance in the
+ first place -- should compute it once and reuse it here across the whole
+ batch of dependencies, rather than paying 'compSrcId'\'s 'TypeRep'-to-'Text'
+ render (see 'wrapCompSrcDep'\'s haddock) once per dependency.
+
+ __Callers must pass @s@'s actual 'compSrcId'__: nothing here checks that
+ @sid@ actually matches @s@, since the whole point is to skip recomputing
+ it. Every dependency this tags becomes a registry lookup key and shows up
+ verbatim in 'Show' output and error messages, so a caller that gets this
+ wrong produces a silent correctness bug, not just a slower one.
+-}
+wrapCompSrcDepWithId :: forall s. CompSrc s => Proxy s -> CompSrcId -> CompSrcDep s -> AnyCompSrcDep
+wrapCompSrcDepWithId _ sid d =
+  ForAnyCompFlow sid (Proxy @s) (SomeCompSrcDep d)
 
 data AnyCompSrc = forall s. CompSrc s => AnyCompSrc s

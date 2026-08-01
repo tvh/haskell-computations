@@ -26,8 +26,18 @@ import Control.Computations.CompEngine.CompFlowRegistry as X hiding (
 -- should reach for 'typedCompSinkIdOf'\/'typedCompSrcIdOf' and keep the
 -- typed id, or apply 'unTypedCompSinkId'\/'unTypedCompSrcId' itself if the
 -- untyped form is genuinely what's needed.
+--
+-- 'wrapCompSrcDepWithId' is hidden for the same reason: it trusts its
+-- caller to pass exactly the given instance's own 'CompSrcId', with no
+-- check that the two actually match (that's the whole point -- see its
+-- haddock). It exists purely for "Control.Computations.CompEngine.Impl"'s
+-- hot paths, which already have that id in hand from a registry lookup;
+-- external code should keep using 'wrapCompSrcDep'.
 import Control.Computations.CompEngine.CompSink as X hiding (compSinkId)
-import Control.Computations.CompEngine.CompSrc as X hiding (compSrcId)
+import Control.Computations.CompEngine.CompSrc as X hiding (
+  compSrcId,
+  wrapCompSrcDepWithId,
+ )
 import Control.Computations.CompEngine.Core as X
 import Control.Computations.CompEngine.Driver as X
 import Control.Computations.CompEngine.Run as X
