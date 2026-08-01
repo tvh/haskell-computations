@@ -27,6 +27,7 @@ module Control.Computations.CompEngine.CompSrc (
   CompSrcInstanceId (..),
   AnyCompSrcDep,
   SomeCompSrcDep (..),
+  AnyCompSrcDepByKey (..),
   AnyCompSrcKey,
   SomeCompSrcKey (..),
   AnyCompSrcVer,
@@ -286,6 +287,42 @@ instance IsDep AnyCompSrcDep where
   type DepVer AnyCompSrcDep = AnyCompSrcVer
   depKey (ForAnyCompFlow i p d) = ForAnyCompFlow i p (depKey d)
   depVer (ForAnyCompFlow i p d) = ForAnyCompFlow i p (depVer d)
+
+{- | An 'AnyCompSrcDep', wrapped so 'Eq'\/'Hashable' compare by *key alone*,
+ ignoring the version -- lets code that only ever needs "is this key
+ present" (a by-key set membership test, e.g. 'SimpleStateIf.hs'\'s
+ @updateEdges@) work directly off dependencies already in hand, with no
+ need to call 'depKey' first to build a standalone 'AnyCompSrcKey' purely
+ for that comparison.
+
+ That rebox is not free: 'depKey' on an 'AnyCompSrcDep' allocates a fresh
+ 'ForAnyCompFlow' existential (dictionary bundle and all -- see its
+ haddock), so calling it once per element purely to build a throwaway
+ comparison set costs one allocation per element for a set that's then
+ discarded. Wrapping in 'AnyCompSrcDepByKey' instead costs nothing: it's a
+ newtype over the 'AnyCompSrcDep' GHC already has in hand, not a new value,
+ so building a @HashSet AnyCompSrcDepByKey@ from an existing
+ @HashSet AnyCompSrcDep@ reboxes zero elements -- only the 'HashSet''s own
+ internal structure (which any change of comparison function must rebuild
+ regardless) is new.
+-}
+newtype AnyCompSrcDepByKey = AnyCompSrcDepByKey {unAnyCompSrcDepByKey :: AnyCompSrcDep}
+
+-- | Reuses 'applyIfEqualIds' -- the same id-then-cast dance
+-- 'ForAnyCompFlow'\'s own 'Eq' instance is built on -- but compares only
+-- the underlying 'Dep'\'s key field once ids match and the cast succeeds,
+-- instead of the whole (key, version) pair.
+instance Eq AnyCompSrcDepByKey where
+  AnyCompSrcDepByKey d1 == AnyCompSrcDepByKey d2 =
+    applyIfEqualIds d1 d2 False $ \_ (SomeCompSrcDep dd1) (SomeCompSrcDep dd2) ->
+      dep_key dd1 == dep_key dd2
+
+-- | Hashes the source id and the underlying 'Dep'\'s key field directly,
+-- with no intermediate 'AnyCompSrcKey' construction -- the version field
+-- is read straight past, never even projected out.
+instance Hashable AnyCompSrcDepByKey where
+  hashWithSalt s (AnyCompSrcDepByKey (ForAnyCompFlow i _ (SomeCompSrcDep d))) =
+    s `hashWithSalt` i `hashWithSalt` dep_key d
 
 {- | Tag a dependency with the id of the source it came from, recomputing
  that id from @s@ via 'compSrcId' every time.

@@ -921,6 +921,21 @@ updateSrcDependentVersion st key ver ref = do
  already-existentially-wrapped value), but is threaded the same way for
  symmetry and because 'addSrcDependent'\/'updateSrcDependentVersion' need it
  regardless.
+
+ The @oldSrc@ side of the diff pays a version of that same rebox cost, just
+ on the other set: "is this key already in @oldSrc@" used to be answered by
+ pre-reboxing the whole of @oldSrc@ into a @HashSet AnyCompSrcKey@
+ (@HashSet.map depKey oldSrc@) up front, i.e. one fresh 'AnyCompSrcKey'
+ allocation per *old* dependency, most of which (the overwhelmingly common
+ "same key, new version" case this function exists to make cheap) are then
+ only ever probed, never otherwise used. 'AnyCompSrcDepByKey'
+ ("CompSrc.hs") removes that: it's a zero-cost newtype over the
+ 'AnyCompSrcDep' already sitting in @oldSrc@, with its own by-key-only
+ 'Eq'\/'Hashable', so @oldSrcByKey@ below reboxes nothing -- the membership
+ test in 'classifySrcDep' runs directly off @dep@ itself. A real
+ 'AnyCompSrcKey' is still built once per @newSrc@ element (unavoidable, as
+ above) and once more per element of the (typically small) *removed* set at
+ the very end, rather than once per @oldSrc@ element up front.
 -}
 updateEdges
   :: DefTable p a
@@ -938,11 +953,12 @@ updateEdges dt st row oldCompVer newCompVerMap oldSrc newSrc = do
       newCompTargets = IntMap.keysSet newCompVerMap
       addedComp = IntSet.difference newCompTargets oldCompTargets
       removedComp = IntSet.difference oldCompTargets newCompTargets
-      -- The old keys, computed once (depKey per oldSrc element, unavoidable
-      -- -- this is the only place that ever learns "a key was there before")
-      -- so 'classifySrcDep' below can test each new dependency's key for
-      -- membership without ever looking at oldSrc again.
-      oldSrcKeys = HashSet.map depKey oldSrc
+      -- The old deps, wrapped (not reboxed -- see AnyCompSrcDepByKey's
+      -- haddock in CompSrc.hs) for a by-key membership test: this is the
+      -- only place that ever learns "a key was there before", same as
+      -- always, but the wrap itself allocates nothing per element, unlike
+      -- the 'AnyCompSrcKey'-per-element rebox this replaced.
+      oldSrcByKey = HashSet.map AnyCompSrcDepByKey oldSrc
       newEdges =
         VU.fromList
           [DT.CompDepEdge t (encodeVer v) | (t, v) <- IntMap.toList newCompVerMap]
@@ -958,18 +974,19 @@ updateEdges dt st row oldCompVer newCompVerMap oldSrc newSrc = do
           && VU.length oldCompVer == VU.length newEdges
           && VU.and (VU.zipWith (\o n -> DT.cdeTarget o == DT.cdeTarget n) oldCompVer newEdges)
       -- Classify one newSrc dependency, computing its key exactly once:
-      -- 'Just' when this key was already in oldSrcKeys (kept -- version
-      -- update in place), 'Nothing' when it wasn't (genuinely new -- add).
-      -- Both branches run their IO effect immediately (this is a fold step,
-      -- not a pure classifier) so the caller never needs to re-inspect
-      -- @dep@ or recompute its key.
+      -- membership against oldSrcByKey needs no key at all (dep itself,
+      -- newtype-wrapped, is the probe -- see AnyCompSrcDepByKey), so 'key'
+      -- is derived only for the branches that actually consume it (both
+      -- do). Both branches run their IO effect immediately (this is a fold
+      -- step, not a pure classifier) so the caller never needs to
+      -- re-inspect @dep@ or recompute its key.
       classifySrcDep dep = do
         let key = depKey dep
             ver = depVer dep
-        if HashSet.member key oldSrcKeys
+        if HashSet.member (AnyCompSrcDepByKey dep) oldSrcByKey
           then updateSrcDependentVersion st key ver row
           else addSrcDependent st key ver row
-        pure key
+        pure (AnyCompSrcDepByKey dep)
 
   if targetsAligned
     then DT.overwriteCompDepsInPlace dt (DT.refRow row) newEdges
@@ -980,13 +997,18 @@ updateEdges dt st row oldCompVer newCompVerMap oldSrc newSrc = do
   forM_ (IntSet.toList addedComp) $ \t -> addRdep st (DT.mkDefRefUnsafe t) row
 
   -- One pass over newSrc: add-or-update each dependency (see
-  -- 'classifySrcDep' above) while accumulating the keys newSrc actually
-  -- has, so that whatever's left in oldSrcKeys afterwards -- keys this row
-  -- depended on before that newSrc never visited -- is exactly the removed
-  -- set, with no second depKey pass over either side needed to find it.
-  newSrcKeysSeen <- foldM (\seen dep -> (`HashSet.insert` seen) <$> classifySrcDep dep) HashSet.empty (HashSet.toList newSrc)
-  let removedSrcKeys = HashSet.difference oldSrcKeys newSrcKeysSeen
-  srcGarbageKeys <- fmap catMaybes $ forM (HashSet.toList removedSrcKeys) $ \key -> removeSrcDependentKey st key row
+  -- 'classifySrcDep' above) while accumulating the (unreboxed) keys newSrc
+  -- actually has, so that whatever's left in oldSrcByKey afterwards -- keys
+  -- this row depended on before that newSrc never visited -- is exactly the
+  -- removed set, with no second depKey pass over either side needed to find
+  -- it. A real 'AnyCompSrcKey' is only built below, once per element of
+  -- this (typically small) removed set -- not once per oldSrc element.
+  newSrcSeenByKey <- foldM (\seen dep -> (`HashSet.insert` seen) <$> classifySrcDep dep) HashSet.empty (HashSet.toList newSrc)
+  let removedSrcDeps = HashSet.difference oldSrcByKey newSrcSeenByKey
+  srcGarbageKeys <-
+    fmap catMaybes $
+      forM (HashSet.toList removedSrcDeps) $
+        \(AnyCompSrcDepByKey dep) -> removeSrcDependentKey st (depKey dep) row
 
   pure (compGarbage <> mempty{garbage_deps = HashSet.fromList srcGarbageKeys})
 

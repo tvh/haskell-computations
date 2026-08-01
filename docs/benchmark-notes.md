@@ -2202,3 +2202,159 @@ equal. `stack test --flag incremental-computations:werror` — 153 tests,
 including the `debugSrcKeyInternLiveCount`\/`debugTotalSrcDepInternLiveCount`
 churn tests and `TestCompReqCombined.hs`'s golden ordering trace (left
 untouched) — passes unmodified.
+
+## Stage 10 — the `-hb` biography, `depKey`/`depVer` reboxing, and a mostly-null result
+
+A `-hb` biography profile of Hospital (profiling build, `PERSIST_BENCH_SCALE=0.1`)
+put peak heap at 254.3 MB **VOID** (allocated, never read at all) out of
+303.9 MB total — 83.7%, dwarfing `INHERENT_USE` (31.5 MB) and `DRAG`
+(18.0 MB) combined. `-hc` restricted to VOID+DRAG localised 70% of it to
+three cost centres: `depVer`\/`updateEdges` (67.6 MB, 24.8%), `evalCompAp.
+prepSrcLeaf` (67.4 MB, 24.8%), `depKey`\/`updateEdges` (56.4 MB, 20.7%).
+`-hy` on the same selection: `ForAnyCompFlow` 29.5 MB, `Eq` 22.1, `CTuple4`
+18.4, `Show` 14.7, `Hashable` 14.6, `CompSrcId` 7.4 — i.e. the existential's
+own dictionary bundle (`ForAnyCompFlow c i k`'s packed `(Typeable s, c s,
+IsCompFlowData (k s))` context — `IsCompFlowData` is exactly `(Show, Eq,
+Typeable, Hashable)`, a `CTuple4` constraint tuple), not the payload,
+dominates the byte count.
+
+### The mechanism, and what turned out to be two different things
+
+`CompSrc.hs`'s `IsDep AnyCompSrcDep` instance:
+
+```haskell
+instance IsDep AnyCompSrcDep where
+  depKey (ForAnyCompFlow i p d) = ForAnyCompFlow i p (depKey d)
+  depVer (ForAnyCompFlow i p d) = ForAnyCompFlow i p (depVer d)
+```
+
+allocates a fresh `ForAnyCompFlow` existential *every call*, dictionary
+bundle and all — a rebox of a value that already exists, purely to
+project out its key or version as a same-shaped existential. `SimpleStateIf.
+hs`'s `updateEdges` haddock (written for Stage 3's `9fe2db3`-era by-key
+diff) already reasoned carefully about this cost for the *new*-side of the
+diff (`classifySrcDep`, one `depKey`/`depVer` per `newSrc` element,
+correctly called "unavoidable"), but the *old*-side still built
+`oldSrcKeys = HashSet.map depKey oldSrc` — one fresh `AnyCompSrcKey` rebox
+per *old* dependency, for a comparison set where the overwhelmingly common
+case (same key, new version — the whole reason this by-key diff exists)
+only ever probes it, never otherwise uses the result.
+
+`prepSrcLeaf`'s 24.8% (`Impl.hs:756`, `mapM_ (dependOn . wrapCompSrcDepWithId
+(Proxy @s) cid) inputs`) turned out to be a **different mechanism**, not
+the same one reached from another angle: Stage 9 already eliminated the
+redundant `TypeRep`-to-`Text` render at this call site (passing the
+group's `cid` once instead of re-deriving it per dependency), but the
+`ForAnyCompFlow` construction itself is not a rebox of an existing
+`AnyCompSrcDep` — it's the *first* wrap of a freshly-returned, still-typed
+`CompSrcDep s` (from `compSrcExecute`) into the erased representation
+`dependOn` needs to store it. There is no already-built `AnyCompSrcDep`
+here to share; every dependency the source just reported is, definitionally,
+a new value. Nothing in this stage touches `prepSrcLeaf` as a result — the
+one-time construction cost is intrinsic to the existential boundary, not
+waste.
+
+### The fix: compare by key without reboxing
+
+`AnyCompSrcDepByKey` (`CompSrc.hs`), a zero-cost newtype over `AnyCompSrcDep`
+with `Eq`\/`Hashable` that read the id and the underlying `Dep`'s key field
+directly (`Eq` reuses `applyIfEqualIds` — the same id-then-cast dance
+`ForAnyCompFlow`'s own `Eq` instance already uses, just comparing `dep_key`
+instead of the whole value; `Hashable` pattern-matches once and hashes id
++ key, skipping the version). `updateEdges` now builds `oldSrcByKey =
+HashSet.map AnyCompSrcDepByKey oldSrc` — wrapping, not reboxing, every
+`oldSrc` element — and `classifySrcDep`'s membership test probes that set
+with `AnyCompSrcDepByKey dep` directly. A real `AnyCompSrcKey` is still
+built exactly where it was already unavoidable: once per `newSrc` element
+(for the two mutation calls), and now additionally once per element of the
+*removed* set at the very end (typically small, not full-`oldSrc`-sized).
+Net effect: the old side of the diff goes from *N* `AnyCompSrcKey` reboxes
+to zero, at the cost of nothing new. `depVer` is untouched — it was already
+minimal, one call per `newSrc` element, matching the existing haddock's
+reasoning.
+
+### Numbers — and the headline metric didn't move
+
+Same machine, same recipe as Stages 7–9. Two same-session reps each side
+(`HOSPITAL_BENCH=1`, default `HOSPITAL_BENCH_RERUN_KEYS=400`), plus one rep
+at `RERUN_KEYS=4000`, plus the control (`stack bench`, scale 1.0).
+
+**Hospital:**
+
+| | `max_live_bytes` | B/instance | `allocated_bytes` (cold) | `allocated_bytes`/rerun (400 keys) | `allocated_bytes`/rerun (4000 keys) |
+|---|---|---|---|---|---|
+| before (HEAD `ce6fe80`) | 3,909,222,144 (3909.2 MB) ×2 reps, bit-identical | 4,005.1 B | 36,096.9 MB (36,096,881,968 / 36,096,888,000) | ~327,107 B (327,106.1 / 327,107.7) | 150,424.9 B |
+| after (this stage) | 3,909,222,144 (3909.2 MB) ×2 reps, bit-identical | 4,005.1 B | 36,028.7 MB (36,028,709,200 / 36,028,714,128) | ~327,034 B (327,034.3 / 327,034.5) | 150,409.2 B |
+| Δ | **0.00%** | 0.00% | **−0.19%** | −0.022% | −0.010% |
+
+`+RTS -s` on the full run (cold + live + rerun-heavy) agrees: total bytes
+allocated in the heap 37,196,157,312 → 37,155,179,920 (−0.11%), bytes
+copied during GC 14,496,035,400 → 14,493,400,104 (−0.018%, noise-level),
+**maximum residency identical to the byte, 3,909,222,144, both sides,
+11 samples each** — GHC's own residency sampler agrees with `GHC.Stats`'s
+`max_live_bytes` exactly.
+
+**Existing (control), `stack bench`, scale 1.0:**
+
+| | `max_live_bytes` | B/instance | `allocated_bytes` (cold) |
+|---|---|---|---|
+| before | 328,690,680 (328.7 MB) | 328.8 B | 24,049,698,656 (24,049.7 MB) |
+| after | 328,689,264 (328.7 MB) | 328.8 B | ~24,048.8 MB (24,048,770,664 / 24,048,772,072) |
+| Δ | −0.0004% (noise) | flat | −0.004% |
+
+No regression on the control — the requirement — and if anything both its
+numbers moved a hair in the same direction as Hospital's, consistent with
+this path being exercised (at much lower relative weight, 300 distinct
+keys vs. Hospital's larger per-row dependency sets).
+
+### Verdict: real, but not the win the profile promised
+
+This is **not** the "twice today a change looked real in profile and was
+an exact no-op in production" pattern from earlier in this campaign —
+`allocated_bytes` genuinely, reproducibly drops (−0.19% Hospital cold,
+consistent across reps and corroborated independently by `+RTS -s`'s own
+counters). The rebox the profile pointed at is real and this stage removes
+it. But it is also **not** the memory-roadmap win the 124 MB of combined
+VOID/DRAG (`depKey`+`depVer`\/`updateEdges`) suggested: `max_live_bytes` —
+the metric every stage in this doc's memory roadmap actually tracks — is
+**bit-identical**, both by `GHC.Stats` and by the RTS's independent
+`-s` residency sampler, at both benchmarks.
+
+Read together, the honest explanation is that the reboxed `AnyCompSrcKey`
+values were short-lived nursery garbage — dead well before any GC's
+residency sample could ever catch them, allocation churn and copying-GC
+pressure, not peak occupancy. Removing them lowers total allocation (a
+real cost: alloc-rate-bound code pays for it in `MUT` time and minor-GC
+frequency, `534` Gen 0 collections vs `535` here) but was never going to
+move `max_live_bytes`, because it was never part of what got sampled as
+live. The profiling build's `-hb` biography, built without the
+optimizations `-fprof-auto` disables, cannot distinguish "large but
+transient churn" from "large and actually retained" the way `GHC.Stats`'s
+production sampling does — a caveat this doc's own "confirm against
+production" rule exists precisely to catch, and did.
+
+**Disposition: kept.** Non-regressive on the control (the hard
+requirement), a real and reproducible small win on total allocation with
+no measurable downside, correctly scoped (adds one newtype and its two
+instances, touches one function's internals, no public API change), and
+directly continues this campaign's established practice of not leaving a
+known, provably-real redundant allocation in place merely because its
+impact turned out smaller than the profile implied. `prepSrcLeaf`'s 24.8%
+is left alone, having turned out to be a different, non-redundant
+mechanism (see above) — not a follow-up target.
+
+### Correctness
+
+`AnyCompSrcDepByKey`'s `Eq` reuses `applyIfEqualIds`, the exact machinery
+`ForAnyCompFlow`'s own `Eq` instance is built on, so the id-then-cast
+discipline that makes that instance sound applies here unchanged; `Hashable`
+reads the same `dep_key` field `Eq` compares against, so the two instances
+agree on one equivalence relation (by id and key, ignoring version) as
+required. The version each dependency carries is never dropped or altered
+anywhere in this change — `AnyCompSrcDepByKey` is used only to decide *set
+membership*, never written back, read for logging, or substituted for a
+real `AnyCompSrcVer`/`AnyCompSrcKey` at any call site that needs one.
+`stack test --flag incremental-computations:werror` — 153 tests, including
+`test_modifcationWhileWorkingOnQueue` (per-dependent version tracking) and
+the intern-table churn tests — passes unmodified; `TestCompReqCombined.hs`'s
+golden ordering trace was not touched.
