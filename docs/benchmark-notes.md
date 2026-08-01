@@ -2068,3 +2068,137 @@ whether the registry-threading alone recovers a meaningful slice of the
 committing to the larger `SrcDepIntern`/`KeyIntern` unification, which
 should be scoped as its own dedicated change with `DefTableTest.hs`'s
 rework budgeted in up front, not discovered mid-implementation.
+
+## Stage 9 — the `CompSrcId`-caching lever, implemented and measured (commit `b3231ae`)
+
+Picked up Stage 8's recommended first move: `wrapCompSrcDep`
+(`CompSrc.hs`) re-renders a `TypeRep` to `Text` (`identifyProxy`) on every
+call, and it is called once per dependency, not once per distinct key —
+~1.6M times on Hospital's cold eval, all landing on 5 distinct ids. Every
+call site turned out to already have that id in hand for free, no new
+plumbing required:
+
+- `Impl.hs`'s `doCompSrcReq` and `prepSrcLeaf` both take a
+  `TypedCompSrcId s` parameter that is *exactly* the id `withTypedCompSrcId`
+  \/ `withTypedCompSrcIdIndexed` used to resolve the live instance — the
+  registry only returns `Ok` when the requested key matches the key
+  `registerCompSrc` stored the instance under (which is itself
+  `compSrcId src`, computed once, at registration). So
+  `unTypedCompSrcId srcId` (or `sid`) computed once per request\/leaf and
+  reused across that request's whole `mapM_ (dependOn . wrapCompSrcDep ...)
+  inputs` loop is, by construction, the identical value `wrapCompSrcDep`
+  would have recomputed per element.
+- `CompFlowRegistry.hs`'s `allCompSrcChanges` (the third call site Stage 8
+  found) had the same shape one level up: `rs_srcs`'s own `HashMap` is keyed
+  by `CompSrcId`, and `getChanges` was iterating `HashMap.elems`, throwing
+  that key away before rebuilding it from the instance via `wrapCompSrcDep`
+  over every changed dep in the set. Switched to `HashMap.toList` and
+  threaded the key through instead.
+
+**Shape chosen**: a new `wrapCompSrcDepWithId :: CompSrc s => Proxy s ->
+CompSrcId -> CompSrcDep s -> AnyCompSrcDep`, with `wrapCompSrcDep` rewritten
+as `wrapCompSrcDep s = wrapCompSrcDepWithId (Proxy @s) (compSrcId s)` — the
+"one-off, does the derivation itself" case now written in terms of the
+"caller already knows the id" case, not the reverse. The `Proxy` argument
+(rather than none, or a live `s`) is load-bearing, not decorative:
+`CompSrcKey`\/`CompSrcVer` are non-injective type families, so a signature
+of just `CompSrcId -> CompSrcDep s -> AnyCompSrcDep` fails GHC's ambiguity
+check outright (`s` appears only inside type-family applications) — the
+`Proxy s` argument is what fixes `s` for the compiler, exactly the role
+`unsafeMkTypedCompSrcId`'s own `Proxy` argument already plays. No live
+instance needed passing through, since the id is precomputed.
+
+`wrapCompSrcDepWithId` stays out of the public
+`Control.Computations.CompEngine` facade (hidden alongside `compSrcId`,
+same reasoning: it trusts the caller's `sid` unchecked, which is exactly
+the kind of shortcut the facade doesn't want to encourage) — `compSrcId`,
+`typedCompSrcIdOf`, and `wrapCompSrcDep`'s own signatures are all
+unchanged, so this is a strictly additive change to the internal
+`CompSrc` module's export list.
+
+### The sink side: not fixed, and shouldn't be
+
+Checked `wrapCompSinkOuts` (`CompSink.hs:279`) as the brief asked. It has
+the identical shape (`compSinkId s` computed inline) but a different call
+pattern: both its call sites (`doCompSinkReq`, `doCompSinkReqValue` in
+`Impl.hs`) invoke it exactly **once per sink request**, wrapping the whole
+output set in one `Map.singleton` — there is no per-element loop
+comparable to `wrapCompSrcDep`'s `mapM_ ... inputs`. A sink request already
+pays for a `TypeRep`-to-`Text` render once, the same as it always has; there
+is nothing to amortize across, so a `wrapCompSinkOutsWithId` twin would add
+API surface (another facade-hidden export, another haddock, another call
+site to keep in sync) for a call count this change cannot reduce. Left
+alone.
+
+### `identifyProxy` itself: not memoized, deliberately
+
+Considered caching `identifyProxy`'s `TypeRep -> Text` render globally
+(e.g. a `Typeable`-keyed table behind `unsafePerformIO`), which would fix
+every call site at once, including ones this stage didn't touch. Rejected:
+per-type memoization in Haskell needs either a global mutable table keyed
+on `TypeRep` (a `Data.Map`/`HashMap` behind an `IORef`, guarded with
+`unsafePerformIO` — real global mutable state with its own GC-retention and
+thread-safety story, for a codebase that otherwise has none) or a
+`reflection`-style type-class dictionary trick, and `identifyProxy` is used
+well outside this hot path (every `CompSrcId`\/`CompSinkId` construction
+anywhere) where the one-render-per-registration cost is already
+negligible. The targeted, call-site-local fix above gets the actual
+measured win without introducing global state; not pursued further.
+
+### Numbers
+
+Same machine (Apple-silicon Mac, Darwin 25.5), same recipe as Stage 7\/8
+(`stack bench`, `HOSPITAL_BENCH=1 stack bench`). Two reps per config
+(cold-eval figures below are bit-identical run-to-run within a config, as
+in every prior stage); RERUN_KEYS=4000 has one rep per side, noted as such.
+
+| | Hospital `max_live_bytes` | Hospital B/instance | Hospital `allocated_bytes` (cold) | existing `max_live_bytes` | existing B/instance | existing `allocated_bytes` (cold) |
+|---|---|---|---|---|---|---|
+| before (Stage 7\/8, HEAD `d6d3810`) | 4,012.4 MB | 4,110.8 B | 37,625.3 MB | 365.5 MB | 365.5 B | 24,250.1 MB |
+| after (this stage) | 3,909.2 MB | 4,005.1 B | 36,096.9 MB | 328.7 MB | 328.8 B | 24,049.7 MB |
+| Δ | −2.57% | −2.57% | −4.06% | −10.06% | −10.06% | −0.83% |
+
+Both benchmarks improved on both metrics — no regression on the existing
+benchmark, which is the control's actual requirement. The existing
+benchmark's movement is larger than the brief's own prior ("barely
+exercises this path, expect little movement") anticipated: its 300 source
+keys are distinct, but `wrapCompSrcDep` is called once per *request*, not
+once per *distinct key*, and this graph's bottom levels (1,025,000 raw
+def-slots before dedup, 999,760 achieved) generate close to a million
+source-reading requests against those 300 keys — enough repeated-key
+traffic for the per-call saving to compound. Hospital's cold eval — the
+`~1.6M calls, 5 distinct ids` case the brief specifically targeted — shows
+the larger absolute drop (1,528 MB of the ~37.6 GB allocated, 103 MB of the
+~4.0 GB live) and confirms GHC was **not** already floating the
+`identifyProxy` call away: the win materialized, exactly because the
+existential `AnyCompSrc` blocks the specialization that would have let GHC
+do this on its own (see `wrapCompSrcDep`'s haddock).
+
+Live-update side (`HOSPITAL_BENCH_RERUN_KEYS` default of 400, two reps):
+`allocated_bytes/rerun` dropped from ~348,971 B to ~327,107 B (−6.3%),
+consistent with the same per-dependency saving applying to the rerun path
+(reruns re-enter `doCompSrcReq`\/`prepSrcLeaf` exactly like cold eval).
+At `HOSPITAL_BENCH_RERUN_KEYS=4000` (one rep per side) the same metric
+showed no measurable change (150,417 B before vs. 150,425 B after) — most
+plausibly single-rep noise rather than a real effect boundary, but not
+re-verified with more reps in this session; flagged here rather than
+smoothed over.
+
+Wall times, both benchmarks: overlapping ranges session to session (Hospital
+cold eval 13.2–13.4 s, existing-benchmark cold eval 5.46–5.77 s, before and
+after), consistent with this doc's standing note that wall time on this
+machine has too wide a range to judge a change by — not used as evidence
+either way here.
+
+### Correctness
+
+The ids `wrapCompSrcDepWithId` now tags dependencies with are the *same
+value*, not just an equal one: the registry only ever resolves a request
+successfully when the caller's key matches the key `registerCompSrc` stored
+the instance under (`compSrcId src`, computed once at registration), so
+`unTypedCompSrcId srcId`\/`sid` at every one of this stage's call sites is
+that exact stored value, not a re-derivation that merely happens to compare
+equal. `stack test --flag incremental-computations:werror` — 153 tests,
+including the `debugSrcKeyInternLiveCount`\/`debugTotalSrcDepInternLiveCount`
+churn tests and `TestCompReqCombined.hs`'s golden ordering trace (left
+untouched) — passes unmodified.
