@@ -1835,3 +1835,236 @@ including the version-tracking and intern-churn tests this area's own
 haddock calls out by name — passes unmodified. Smaller than hoped, given
 where the remaining ~3.7 GB actually is, but a clean, low-risk win with no
 observed downside.
+
+## Stage 8 — the remaining ~3.7 GB, `-hT`-attributed: hypothesis confirmed, fix not contained (no code change)
+
+Picking up Stage 7's open item: where the Hospital benchmark's remaining
+live set actually is, using the Stage 6 `-hT` recipe (no `-prof`, so no
+`-fprof-auto` distortion) against the current build (commit `01aef23`, tree
+clean, branch `blog/optimizations-i-never-got-to`). Baseline reconfirmed
+bit-identical before profiling: existing benchmark `max_live_bytes`
+365,453,456 B (365.5 B/instance), Hospital `max_live_bytes` 4,012,390,144 B
+(4,110.8 B/instance), cold `allocated_bytes` 24,250,124,904 B / 37,620,245,800
+B respectively — all match Stage 7's reported figures to within session
+noise, confirming a clean, unperturbed starting point.
+
+### Recipe and honest caveats
+
+```
+stack build incremental-computations:bench:incremental-computations-bench
+cd <scratch dir>
+HOSPITAL_BENCH=1 <path>/incremental-computations-bench +RTS -hT -A64m -T -s -RTS
+mv incremental-computations-bench.hp <renamed>.hp
+```
+
+Cold eval: 77.1 s profiled at full scale (vs. ~20–25 s unprofiled, ~3.3×;
+consistent with Stage 6's "far more usable than `-p`, budget for it"
+finding). Cross-checked at `HOSPITAL_BENCH_SCALE=0.1` (97,609 achieved instances) in a
+separate run to confirm the split isn't a scale-specific artifact — see
+"Stability across scale" below.
+
+**A new timing finding, worth recording for future `-hT` work on this
+benchmark**: the `.hp` file's `BEGIN_SAMPLE` clock is cumulative *mutator*
+time, not wall-clock. At full scale the last real sample landed at
+t=9.048 s against a final `+RTS -s` report of `MUT time 9.171s` — a 98.7%
+match — while `GC time` alone was 71.857 s (the heap-census machinery
+itself, at 88.7% of total wall time). Practical consequence: the `.hp`
+sample count says nothing about wall-clock coverage, and a peak-by-total
+sample picked from the file is a snapshot from *whenever the mutator had
+run 9s of cumulative work*, not from a specific wall-clock instant — fine
+for closure-type attribution (the question this stage asks), not fine for
+correlating a sample against a specific phase by wall time.
+
+### The closure-type breakdown at peak
+
+Peak `-hT` census sample: 2,997.7 MB (full scale) — 78.3% of the true
+`max_live_bytes` (4,012.4 MB), consistent with Stage 6's documented 12–20%
+undercount for this workload.
+
+| Closure type | Bytes (full scale) | % of census |
+|---|---|---|
+| `THUNK_1_0` | 810,987,120 | 25.80% |
+| `CompFlow.ForAnyCompFlow` | 309,331,200 | 9.84% |
+| `ARR_WORDS` | 280,605,208 | 8.93% |
+| `FUN_1_0` | 232,273,440 | 7.39% |
+| `GHC.Classes.C:Eq` (dictionary) | 231,936,312 | 7.38% |
+| `GHC.Classes.CTuple4` | 193,280,200 | 6.15% |
+| `Hashable.Class.C:Hashable` (dictionary) | 154,624,224 | 4.92% |
+| `GHC.Internal.Show.C:Show` (dictionary) | 154,624,160 | 4.92% |
+| `CompSrc.CompSrcId` | 115,978,776 | 3.69% |
+| `HashMap.Internal.Leaf` | 103,178,848 | 3.28% |
+| `IntMap.Internal.Bin` | 64,335,160 | 2.05% |
+| `GHC.Types.I#` (boxed Int) | 60,904,384 | 1.94% |
+| `ByteString.Internal.Type.BS` | 51,735,520 | 1.65% |
+| `Text.Internal.Text` | 51,677,344 | 1.64% |
+| `THUNK_2_0` | 51,238,720 | 1.63% |
+| `CompSrc.Dep` | 38,733,936 | 1.23% |
+| `IntMap.Internal.Tip` | 38,601,192 | 1.23% |
+| everything else (116 more types) | 188,666,376 | 6.00% |
+
+**Stability across scale.** Re-run at `HOSPITAL_BENCH_SCALE=0.1` (97,609
+instances) reproduces the same shape closely: census/true ratio 78.5%
+(vs. 78.3%), `THUNK_1_0` 25.73% (vs. 25.80%), `ForAnyCompFlow` 9.82% (vs.
+9.84%), `ARR_WORDS` 9.06% (vs. 8.93%), `Eq`/`CTuple4`/`Hashable`/`Show`
+dictionaries and `CompSrcId`/`Dep` all within 0.1 percentage points of the
+full-scale figures. This is not a sampling fluke of one run; it's the
+workload's actual shape.
+
+### The denominator: confirmed to be source keys, not instances — and the intended machinery is a small minority
+
+`ARR_WORDS` — the unboxed columns and CSR arenas that `DefTable`'s whole
+design (Stages 3–4e) is built around, and that hold **68.3%** of the live
+set on the *existing* benchmark's own `-hT` profile (Stage 4i) — is **only
+8.9–9.1%** here. That inversion is the headline: on a shared-key workload
+the columnar design works exactly as intended and dominates the heap; on
+Hospital's genuinely-unshared-key workload, the columnar arenas are a small
+minority and something else dominates. Everything else in the top of the
+table — `ForAnyCompFlow`, its three-dictionary tax (`Eq`/`Hashable`/`Show`,
+bundled as `CTuple4` for the `IsCompFlowData` constraint tuple),
+`CompSrcId`, `Dep`, `HashMap.Leaf`/`IntMap.Bin`/`Tip` (the interning and
+reverse-index containers), `Text`/`ByteString` (the key/value payloads
+themselves) — is the *identity representation* of a source key/dependency,
+not per-instance state. Summed, that identifiable cluster is **48.0% of the
+census** (1,508,036,872 B); add `THUNK_1_0` (25.8%, almost certainly the
+same family — see "What `THUNK_1_0` probably is" below) and it's **73.8%**.
+Scaled to the true peak by the census/true ratio (×1.276): roughly
+**1.8–2.8 GB of the 4.0 GB peak**, against 1,612,013 source requests
+(essentially 1:1 with distinct keys per the brief) — **~1,190–1,840 bytes
+of identity-representation overhead per key**, out of the observed
+~2,490 B/key (`max_live_bytes` / source requests) noted in this
+investigation's brief (which put it at "~2.5 KB per key" against the
+1.6M-key count). This is the "wrong denominator" the brief predicted, now
+measured rather than assumed: **the memory tracks distinct source
+keys/deps, and specifically their boxed existential identity
+representation, not instances and not the columnar arenas.**
+
+### What `THUNK_1_0` probably is
+
+Not directly attributable without `-prof`/`-hr` (the same wall this
+investigation hit at Stage 6) — but circumstantial evidence points at the
+same family as everything above it, not a separate leak. `THUNK_1_0` is a
+generic single-pointer-field thunk, consistent with the unforced
+intermediate closures a chain of `ForAnyCompFlow`-rewrapping calls
+(`depKey`, `depVer`, `wrapCompSrcDep`) leaves behind before something
+forces them, and with `Data.Text`/`Data.ByteString` key-construction
+thunks upstream in `SystemSrc.hs`'s per-request `Dep key (fmap
+largeHash128 mVal)`. It sampled at a near-identical percentage at both
+scales (25.73% vs. 25.80%), which argues for "proportional to distinct
+keys" over "growing leak" — consistent with Stage 4j's finding on the
+*other* benchmark that a `-hT`-only investigation eventually hits an
+attribution wall that only `-hr` (retainer profiling, `-prof`-only) can
+cross. Not pursued further here for the same reason Stage 6 didn't:
+`-prof` reintroduces the exact distortion (~7-10x) this recipe exists to
+avoid, and the headline finding (denominator = source keys via boxed
+existential identity, not instances) doesn't depend on resolving this.
+
+### Step 2's hypothesis: confirmed, directionally — and the layering problem is worse than "an extra table"
+
+The brief's hypothesis — `SrcIndex.hs`'s `KeyIntern` and `DefTable.hs`'s
+`SrcDepIntern` both independently store a full boxed existential for what
+is, for Hospital's unshared keys, the same identity — is **confirmed by
+this profile**, not refuted. Tracing the actual call graph (not just the
+type signatures) turns up a third copy the brief didn't name:
+`SimpleStateIf.hs`'s `SrcKeyArena` (the *reverse*-index's own per-dependent
+column) stores its own freshly-rewrapped `AnyCompSrcVer` per (key,
+dependent) pair, via the same `depVer (ForAnyCompFlow i p d) = ForAnyCompFlow
+i p (depVer d)` pattern that `depKey` uses (`CompSrc.hs`) — so it's a
+triple, not a double: `KeyIntern`'s `AnyCompSrcKey`, `SrcDepIntern`'s
+`AnyCompSrcDep`, and `SrcKeyArena`'s `AnyCompSrcVer`, three independent
+`ForAnyCompFlow` boxes (each dragging its own `Eq`/`Hashable`/`Show`
+dictionary bundle) for one logical (key, dependent, version) fact.
+
+**Why no fix was implemented this session.** The brief's own proposed
+direction — have `SrcDepIntern` store the already-interned `SrcKeyId` (from
+the global `KeyIntern`) plus the version, instead of a whole
+`AnyCompSrcDep` — requires the interning step to move from
+`DefTable.writeSrcDeps`/`readSrcDeps` (today fully self-contained: no
+dependency on `SrcIndex.hs`) to `SimpleStateIf.hs`'s `updateEdges`, the one
+place both `DefTable` and the global `KeyIntern` (via `SifState`) are
+already in scope — exactly as the brief anticipated. Two things, found only
+by tracing the real call sites rather than reasoning from the type
+signatures alone, make this bigger than "move a function call":
+
+1. **A hard module-cycle constraint, not just a style preference.**
+   `SrcIndex.hs` already imports `DefTable.hs` (for `DefRef`), so
+   `DefTable.hs` cannot import `SrcIndex.hs`'s `SrcKeyId` back — GHC has no
+   mutual-recursive-module story here without `.hs-boot` files. Hoisting the
+   interning to `SimpleStateIf.hs` is therefore not optional convenience,
+   it's the *only* direction that doesn't require restructuring the module
+   graph, and it means `readSrcDeps`/`writeSrcDeps` can no longer take/return
+   a self-contained `HashSet AnyCompSrcDep` — some caller-supplied,
+   already-interned representation has to cross that boundary instead.
+2. **`DefTable.hs`'s own test suite is built on exactly the signature that
+   would have to change.** `DefTableTest.hs` constructs real `AnyCompSrcDep`
+   values through a local `TestSrc` fixture with no access to a
+   `KeyIntern`, and round-trips them through `writeSrcDeps`/`readSrcDeps`
+   directly (`test_srcDepsRoundTrip`, `test_srcDepsDistinctValuesGetDistinctIds`
+   — which specifically asserts that the *same key* at two *different*
+   versions gets two distinct interned ids, both independently readable
+   back out) and inspects `SrcDepIntern`'s own fields (`sdi_count`) as part
+   of the assertions. Changing what `SrcDepIntern` stores means rewriting,
+   not just re-running, a double-digit slice of that suite — the
+   "intern-table churn regression tests... must keep passing" constraint is
+   satisfiable, but "keep passing unmodified" is not, and reworking that
+   suite correctly (preserving the refcounting semantics, the
+   retain-before-release ordering hazard, and the distinct-version coverage)
+   is real design and review work in its own right, not a mechanical
+   follow-on.
+
+Both `readSrcDeps` call sites in `SimpleStateIf.hs` (`freeRowCascade`,
+reached via `updateEdges`'s `removeRdep` cascade, and `updateEdges` itself)
+turned out, on inspection, to use
+only `depKey` on the result and discard the version entirely — and
+`notifyDepChange` (the function `test_modifcationWhileWorkingOnQueue`
+actually exercises) reads per-dependent versions from `SrcKeyArena`, never
+from `dt_srcDeps`. That's a genuine simplification opportunity, but not a
+free one: `DefTable.hs`'s own module contract (its haddock and its test
+suite) is written to guarantee full `AnyCompSrcDep` fidelity independent of
+what today's two callers happen to do with it, so narrowing that contract
+is itself the same "real architectural change" — just discovered from a
+different angle than the layering issue above.
+
+**A second, independent lever found via this profile, also not
+implemented.** `CompSrcId` (115,978,776 B, 3.69% of census) is
+reconstructed fresh on every `wrapCompSrcDep` call
+(`compSrcId s = unTypedCompSrcId (typedCompSrcIdOf s)`, called once per
+source request — ~1.6M times here) even though Hospital's whole graph uses
+only 5 distinct `CompSrcId` values (one per `SystemSrc` instance).
+`CompFlowRegistry.hs`'s `registerSrc`-shaped code already computes
+`compSrcId src` once, at registration time — that value is never threaded
+back down to where `wrapCompSrcDep` runs. A fix would cache a
+`CompSrcId`/`TypedCompSrcId s` per registered instance and thread it
+through `Impl.hs`'s and `CompFlowRegistry.hs`'s three `wrapCompSrcDep` call
+sites instead of re-deriving it per request — additive to `CompSrc.hs`'s
+API (no existing signature needs to change) and doesn't touch
+`DefTable`/`SrcIndex` at all, but it does require plumbing a cached value
+through the registry and the request-dispatch path in `Impl.hs` — its own
+multi-file change, and one that needs care to confirm the cached value
+can never drift from what a live instance would report, on a path that
+runs once per source request.
+
+### Disposition: not fixed — findings recorded, no code change
+
+Per this investigation's own ground rule ("the bar for acting is a
+number") and this session's explicit instruction to stop and report rather
+than half-build a large or risky change: the hypothesis is confirmed, the
+mechanism is understood down to specific closure types and call sites, and
+two candidate fixes are scoped (the `SrcDepIntern`/`KeyIntern` unification
+the brief proposed, and the independent `CompSrcId`-caching lever this
+profile surfaced) — but both cross module boundaries this codebase
+deliberately keeps acyclic, and the first also means reworking
+`DefTable.hs`'s own test suite beyond "still passes unmodified". Neither is
+a contained, single-sitting change with the confidence this investigation's
+own standard demands. `src/` and `bench/` are untouched by this stage.
+Numbers are therefore identical to Stage 7's: Hospital `max_live_bytes`
+4,012.4 MB / 4,110.8 B/instance, existing benchmark 365.5 MB / 365.5
+B/instance, both reconfirmed bit-identical at the top of this stage before
+profiling began.
+
+**If pursued**, the recommended order is the `CompSrcId`-caching lever
+first — smaller blast radius, no test-suite rework, and it isolates
+whether the registry-threading alone recovers a meaningful slice of the
+3.69% (and whatever share of `THUNK_1_0` correlates with it) before
+committing to the larger `SrcDepIntern`/`KeyIntern` unification, which
+should be scoped as its own dedicated change with `DefTableTest.hs`'s
+rework budgeted in up front, not discovered mid-implementation.
