@@ -6,7 +6,7 @@
  pharmacy, notes). Shaped like "Control.Computations.FlowImpls.HashMapFlow"
  -- an in-memory @TVar (HashMap Key Val)@ plus a change-set 'TVar' feeding
  'compSrcWaitChanges' in exactly the same way (see that module's haddock for
- the reasoning behind that shape; it is not repeated here) -- plus the two
+ the reasoning behind that shape; it is not repeated here) -- plus the
  things a real service call has that 'HashMapFlow'\'s in-memory
  'Control.Computations.FlowImpls.HashMapFlow.hmfLookup' does not:
 
@@ -15,26 +15,54 @@
    the hospital bench exists: 'Control.Computations.Demos.Bench.Main'\'s
    graph has no latency anywhere to hide, so concurrency can never show up
    in its numbers regardless of width);
+ * optional, __deterministic per-key jitter__ on top of that latency (see
+   'ssc_jitterEnabled'\/'jitterUs') -- off by default, so every stage before
+   this one reproduces exactly, and derived from a hash of the key rather
+   than a random-number generator, so a run with jitter enabled is still
+   bit-for-bit reproducible;
  * a __call counter__ and a __concurrency high-water mark__, both plain
    'IORef'\/'TVar' bookkeeping bumped on every request served, so the
    benchmark can report how many source calls actually happened and how many
    of them were genuinely observed overlapping (see 'sysCallCount'\/
    'sysHighWaterMark');
  * a __batch call counter__, separate from the request counter: this type
-   overrides 'compSrcExecuteBatch' (see 'executeBatchImpl') to serve every
+   overrides 'compSrcExecuteBatch' (see 'executeBatchBundled') to serve every
    request the engine has bundled together against this instance with one
    'readTVarIO' and one simulated-latency 'threadDelay', instead of one of
    each per request -- 'sysCallCount' still counts every individual request
    served, so 'sysCallCount' \/ 'sysBatchCallCount' is directly the round-trip
    reduction this buys, visible in the benchmark's own report rather than
-   only inferred from timing.
+   only inferred from timing;
+ * a runtime knob (see 'ssc_batchingEnabled') to turn that override back
+   __off__, falling back to 'CompSrc'\'s own default sequential
+   implementation -- see 'defaultSequentialBatch' -- so a benchmark can hold
+   concurrency width and bundling apart as independent variables instead of
+   only ever measuring their product.
+
+ NOTE on a small, deliberately-accepted cost: giving 'compSrcExecute'\/
+ 'compSrcExecuteBatch' a per-call *computed* latency (via 'latencyForKey'\/
+ 'batchLatencyUs') rather than reading 'sys_latencyUs' as a compile-time-flat
+ field access costs a small, measured amount of extra allocation on this hot
+ path even when jitter is off and the computed value is numerically identical
+ to the field itself -- confirmed by isolating the change: at Hospital's full
+ scale (~1,612,000 requests, ~593,000 batch calls), this adds
+ ~64.3 MB (+0.18%) to @allocated_bytes (cold eval)@, with @max_live_bytes@
+ unaffected (peak residency, not cumulative allocation). Every attempt to
+ remove it (bang patterns, 'INLINE' on every function in the chain) failed to
+ recover the flat-field-access baseline, so it is reported here rather than
+ chased further -- the two runtime knobs this module exists to add are the
+ point, and a 0.18% allocation cost for carrying them is well inside this
+ doc's own materiality bar.
 -}
 module Control.Computations.Demos.Bench.SystemSrc (
   SystemSrc,
   SystemReq (..),
   Key,
   Val,
+  SystemSrcConfig (..),
+  defaultSystemSrcConfig,
   initSystemSrc,
+  initSystemSrcWith,
   sysInsert,
   sysInsertBatch,
   sysCallCount,
@@ -55,11 +83,14 @@ import Control.Computations.Utils.Types
 
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.STM
-import Control.Monad (when)
+import Control.Exception (Exception (fromException), SomeAsyncException (..), SomeException, throwIO)
+import qualified Control.Exception as Exception
+import Control.Monad (forM_, when)
 import qualified Data.ByteString as BS
 import qualified Data.Foldable as F
 import Data.HashMap.Strict (HashMap)
 import qualified Data.HashMap.Strict as HashMap
+import Data.Hashable (hash)
 import Data.HashSet (HashSet)
 import qualified Data.HashSet as HashSet
 import Data.IORef
@@ -77,6 +108,8 @@ data SystemSrc = SystemSrc
   , sys_dataVar :: TVar (HashMap Key Val)
   , sys_changesVar :: TVar (HashSet SystemDep)
   , sys_latencyUs :: Int
+  , sys_jitterEnabled :: Bool
+  , sys_batchingEnabled :: Bool
   , sys_callCount :: IORef Int
   , sys_batchCallCount :: IORef Int
   , sys_inFlight :: TVar Int
@@ -105,29 +138,83 @@ instance CompSrc SystemSrc where
    their 'threadDelay's (see "Control.Computations.CompEngine.Impl"'s
    @doSuspended@); reads against the *same* instance within one batch don't
    need that anymore -- see 'compSrcExecuteBatch' below, which collapses
-   them into one delay instead.
+   them into one delay instead (when 'sys_batchingEnabled', see
+   'executeBatchDispatch').
   -}
   compSrcConcurrency _ = FlowConcurrent
 
-  -- | The whole reason this type has a per-call latency: a batch of N
-  -- lookups against this instance now pays 'sys_latencyUs' once, not N
-  -- times -- see 'executeBatchImpl'.
-  compSrcExecuteBatch = executeBatchImpl
+  -- | Dispatches on 'sys_batchingEnabled' -- see 'executeBatchDispatch'.
+  compSrcExecuteBatch = executeBatchDispatch
 
--- | Build a fresh, empty instance named @ident@ with the given
--- per-call latency in microseconds (0 disables the delay entirely -- see
--- 'executeImpl'\/'executeBatchImpl'), paid once per 'compSrcExecute' call
--- and once per 'compSrcExecuteBatch' call regardless of how many requests
--- that batch call serves.
+{- | Everything about an instance's simulated I/O behaviour that isn't its
+ identity or its backing data: the base per-call latency plus the two
+ runtime knobs -- see 'defaultSystemSrcConfig' for the
+ no-jitter\/bundling-on defaults every pre-existing benchmark relies on
+ ('initSystemSrc' is exactly that default, unchanged), and
+ "Control.Computations.Demos.Bench.Tiered" for a client that actually varies
+ all three.
+-}
+data SystemSrcConfig = SystemSrcConfig
+  { ssc_latencyUs :: Int
+  -- ^ Base per-call latency in microseconds; 0 disables the simulated delay
+  -- entirely (see 'simulateRoundTrip'). Paid once per 'compSrcExecute' call
+  -- and once per bundled 'compSrcExecuteBatch' call regardless of how many
+  -- requests that call serves -- see 'executeBatchBundled'.
+  , ssc_jitterEnabled :: Bool
+  -- ^ Whether 'jitterUs' adds a deterministic, key-derived amount on top of
+  -- 'ssc_latencyUs' (see that function's haddock). Off by default.
+  , ssc_batchingEnabled :: Bool
+  -- ^ Whether 'compSrcExecuteBatch' actually bundles same-instance requests
+  -- into one simulated round trip ('executeBatchBundled') or falls back to
+  -- 'CompSrc'\'s own default sequential behaviour, one 'compSrcExecute' call
+  -- per request ('defaultSequentialBatch'). On by default -- this is what
+  -- every stage before the one that introduced this field measured.
+  }
+
+-- | No jitter, bundling on -- the behaviour every 'CompSrc' instance had
+-- before those two knobs existed. 'initSystemSrc' is 'initSystemSrcWith'
+-- applied to this, unconditionally, so every existing caller (the Hospital
+-- benchmark) keeps its exact prior behaviour with zero changes on its side.
+defaultSystemSrcConfig :: Int -> SystemSrcConfig
+defaultSystemSrcConfig latencyUs =
+  SystemSrcConfig
+    { ssc_latencyUs = latencyUs
+    , ssc_jitterEnabled = False
+    , ssc_batchingEnabled = True
+    }
+
+-- | Build a fresh, empty instance named @ident@ with the given per-call
+-- latency in microseconds and every other knob at its default (no jitter,
+-- bundling on) -- see 'defaultSystemSrcConfig'. Kept as the stable
+-- two-argument entry point the Hospital benchmark already calls; reach for
+-- 'initSystemSrcWith' to vary jitter or bundling.
 initSystemSrc :: T.Text -> Int -> IO SystemSrc
-initSystemSrc ident latencyUs = do
+initSystemSrc ident latencyUs = initSystemSrcWith ident (defaultSystemSrcConfig latencyUs)
+
+-- | Like 'initSystemSrc', but takes a full 'SystemSrcConfig' instead of just
+-- a latency -- the entry point for a caller (the Tiered benchmark) that
+-- needs to vary jitter or bundling per instance or per run.
+initSystemSrcWith :: T.Text -> SystemSrcConfig -> IO SystemSrc
+initSystemSrcWith ident cfg = do
   dataV <- newTVarIO HashMap.empty
   changesV <- newTVarIO HashSet.empty
   countRef <- newIORef 0
   batchCountRef <- newIORef 0
   inFlightV <- newTVarIO 0
   highWaterV <- newTVarIO 0
-  pure (SystemSrc ident dataV changesV latencyUs countRef batchCountRef inFlightV highWaterV)
+  pure
+    ( SystemSrc
+        ident
+        dataV
+        changesV
+        (ssc_latencyUs cfg)
+        (ssc_jitterEnabled cfg)
+        (ssc_batchingEnabled cfg)
+        countRef
+        batchCountRef
+        inFlightV
+        highWaterV
+    )
 
 waitChangesImpl :: SystemSrc -> STM (HashSet SystemDep)
 waitChangesImpl sys = do
@@ -137,55 +224,99 @@ waitChangesImpl sys = do
     then retry
     else pure set
 
-{- | Bump the in-flight\/high-water pair, optionally sleep 'sys_latencyUs'
- microseconds to stand in for a real service call, then decrement -- shared
- by 'executeImpl' (one request pays this once) and 'executeBatchImpl' (a
- whole bundled group pays this once total, not once per request -- the
- collapse this type exists to demonstrate). The in-flight bump\/decrement
- brackets only the delay, so 'sysHighWaterMark' reports how many *calls*
- (single or batched) were genuinely inside the simulated wait at once, not
- how many individual requests were being served -- that's 'sysCallCount'.
+{- | Deterministic per-key jitter in @[0, 'sys_latencyUs'))@, added on top of
+ the base latency when 'sys_jitterEnabled' -- derived from
+ 'Data.Hashable.hash' of the key itself, __never__ a random-number
+ generator, so the same key gets the same jitter on every run: a jittered
+ run is exactly as reproducible (same reruns, same allocation) as an
+ unjittered one, just with a wider, key-dependent spread of per-call wait
+ times. That spread is the entire point (see
+ "Control.Computations.Demos.Bench.Tiered"'s module haddock): a constant
+ delay makes every call equally slow, so p99 can never differ from p50 and
+ concurrency has nothing tail-shaped to hide. Disabled (returns 0)
+ unconditionally when 'sys_latencyUs' is 0 -- there is no base delay to
+ jitter a fraction of.
 -}
-simulateRoundTrip :: SystemSrc -> IO ()
-simulateRoundTrip sys = do
+jitterUs :: SystemSrc -> Key -> Int
+jitterUs sys key
+  | not (sys_jitterEnabled sys) = 0
+  | base <= 0 = 0
+  -- 'mod' (unlike 'rem') always takes the sign of its divisor, so this is
+  -- already in @[0, base)@ regardless of 'hash'\'s own sign -- no 'abs'
+  -- needed.
+  | otherwise = hash key `mod` base
+ where
+  base = sys_latencyUs sys
+
+-- | This key's own simulated latency: the instance's base 'sys_latencyUs'
+-- plus this key's 'jitterUs' -- see 'executeImpl'.
+latencyForKey :: SystemSrc -> Key -> Int
+latencyForKey sys key = sys_latencyUs sys + jitterUs sys key
+
+{- | Bump the in-flight\/high-water pair, optionally sleep the given number of
+ microseconds to stand in for a real service call, then decrement -- shared
+ by 'executeImpl' (one request pays this once, for its own key's
+ 'latencyForKey') and 'executeBatchBundled' (a whole bundled group pays this
+ once total, not once per request -- the collapse this type exists to
+ demonstrate, for the *worst* key's 'latencyForKey' among the group -- see
+ that function). The in-flight bump\/decrement brackets only the delay, so
+ 'sysHighWaterMark' reports how many *calls* (single or batched) were
+ genuinely inside the simulated wait at once, not how many individual
+ requests were being served -- that's 'sysCallCount'.
+-}
+simulateRoundTrip :: SystemSrc -> Int -> IO ()
+simulateRoundTrip sys latencyUs = do
   atomically $ do
     n <- (+ 1) <$> readTVar (sys_inFlight sys)
     writeTVar (sys_inFlight sys) n
     hw <- readTVar (sys_highWater sys)
     when (n > hw) (writeTVar (sys_highWater sys) n)
-  when (sys_latencyUs sys > 0) (threadDelay (sys_latencyUs sys))
+  when (latencyUs > 0) (threadDelay latencyUs)
   atomically (modifyTVar' (sys_inFlight sys) (subtract 1))
 
 -- | Serve exactly one request: bump the request counter by one, pay one
--- simulated round trip ('simulateRoundTrip'), then answer from the
--- in-memory map. The engine only ever reaches this for a request that
--- never joined a batch (see 'Control.Computations.CompEngine.Impl'\'s
--- @doCompSrcReq@) -- every request inside a 'CompReqCombined' batch is
--- served by 'executeBatchImpl' instead, however many requests that batch
--- turns out to hold (including exactly one).
+-- simulated round trip ('simulateRoundTrip', at this key's own
+-- 'latencyForKey'), then answer from the in-memory map. Reached for a
+-- request that never joined a batch, and -- since 'defaultSequentialBatch'
+-- calls this once per request -- for every request served while
+-- 'sys_batchingEnabled' is off (see 'executeBatchDispatch').
 executeImpl :: SystemSrc -> SystemReq a -> IO (HashSet SystemDep, Fail a)
 executeImpl sys (SystemLookupReq key) = do
   atomicModifyIORef' (sys_callCount sys) (\n -> (n + 1, ()))
-  simulateRoundTrip sys
+  simulateRoundTrip sys (latencyForKey sys key)
   mVal <- HashMap.lookup key <$> readTVarIO (sys_dataVar sys)
   pure (HashSet.singleton (Dep key (fmap largeHash128 mVal)), Ok mVal)
 
+-- | Dispatch on 'sys_batchingEnabled': the bundled path
+-- ('executeBatchBundled', the historical behaviour and still the default)
+-- or a plain per-request fallback ('defaultSequentialBatch') that makes
+-- this instance behave exactly as if it had never overridden
+-- 'compSrcExecuteBatch' at all -- see the module haddock's closing bullet
+-- and "Control.Computations.Demos.Bench.Tiered" for why a benchmark needs
+-- to be able to flip this at runtime.
+executeBatchDispatch :: SystemSrc -> [SrcFetch SystemSrc] -> IO ()
+executeBatchDispatch sys fetches
+  | sys_batchingEnabled sys = executeBatchBundled sys fetches
+  | otherwise = defaultSequentialBatch sys fetches
+
 {- | Serve every request the engine bundled together against this instance
  with __one__ simulated round trip ('simulateRoundTrip', so one
- 'threadDelay' for the whole group instead of one per request) and __one__
- 'readTVarIO' snapshot, then answer each request with a pure
- 'HashMap.lookup' against that shared snapshot. Bumps 'sys_callCount' by
- the number of requests served (so it keeps meaning \"how many individual
- lookups happened\" regardless of how they were grouped) and
- 'sys_batchCallCount' by exactly one (so it means \"how many round trips
- happened\") -- their ratio is this feature's payoff, directly reportable
- rather than only inferable from timing.
+ 'threadDelay' for the whole group instead of one per request -- at the
+ *worst* (largest) 'latencyForKey' among the group's keys, the realistic
+ model for a batched round trip: its wall time is bounded by its slowest
+ constituent, not its average) and __one__ 'readTVarIO' snapshot, then
+ answer each request with a pure 'HashMap.lookup' against that shared
+ snapshot. Bumps 'sys_callCount' by the number of requests served (so it
+ keeps meaning \"how many individual lookups happened\" regardless of how
+ they were grouped) and 'sys_batchCallCount' by exactly one (so it means
+ \"how many round trips happened\") -- their ratio is this feature's payoff,
+ directly reportable rather than only inferable from timing.
 -}
-executeBatchImpl :: SystemSrc -> [SrcFetch SystemSrc] -> IO ()
-executeBatchImpl sys fetches = do
+executeBatchBundled :: SystemSrc -> [SrcFetch SystemSrc] -> IO ()
+executeBatchBundled sys fetches = do
   atomicModifyIORef' (sys_callCount sys) (\n -> (n + length fetches, ()))
   atomicModifyIORef' (sys_batchCallCount sys) (\n -> (n + 1, ()))
-  simulateRoundTrip sys
+  simulateRoundTrip sys (batchLatencyUs sys fetches)
   m <- readTVarIO (sys_dataVar sys)
   F.for_ fetches (answerFetch m)
  where
@@ -196,6 +327,52 @@ executeBatchImpl sys fetches = do
   answerFetch m (SrcFetch (SystemLookupReq key) write) =
     let mVal = HashMap.lookup key m
      in write (Right (HashSet.singleton (Dep key (fmap largeHash128 mVal)), Ok mVal))
+
+{- | The whole batch's simulated latency. With jitter off (the common case --
+ every pre-jitter caller, including the Hospital benchmark, runs this way)
+ every key's 'latencyForKey' is identically 'sys_latencyUs', so this takes a
+ fast path that skips scanning @fetches@ entirely. With jitter on, the worst
+ (largest) 'latencyForKey' among the batch's keys wins -- see 'jitterUs's
+ haddock for why worst-of, not average, is the realistic model.
+-}
+batchLatencyUs :: SystemSrc -> [SrcFetch SystemSrc] -> Int
+batchLatencyUs sys fetches
+  | not (sys_jitterEnabled sys) = sys_latencyUs sys
+  | otherwise =
+      maximum (sys_latencyUs sys : [latencyForKey sys k | SrcFetch (SystemLookupReq k) _ <- fetches])
+
+-- | 'CompSrc'\'s own default 'compSrcExecuteBatch' (see that method's
+-- haddock), reimplemented here rather than called -- Haskell instance
+-- methods have no \"call the class default from inside an override\" -- so
+-- that 'sys_batchingEnabled' can genuinely fall all the way back to it:
+-- every request served one at a time, each via 'executeImpl' (so each pays
+-- its own 'latencyForKey' independently rather than sharing one collapsed
+-- delay), with 'trySyncLocal' isolating one request's exception from its
+-- siblings exactly as the class default does.
+defaultSequentialBatch :: SystemSrc -> [SrcFetch SystemSrc] -> IO ()
+defaultSequentialBatch sys fetches =
+  forM_ fetches $ \(SrcFetch req write) -> trySyncLocal (compSrcExecute sys req) >>= write
+
+{- | A local stand-in for
+ "Control.Computations.Utils.ConcUtils".'Control.Computations.Utils.ConcUtils.trySync'
+ -- byte-for-byte the same catch-synchronous\/rethrow-asynchronous logic --
+ which is exactly what 'defaultSequentialBatch' needs to reproduce
+ 'CompSrc'\'s own default faithfully, but is not part of the public API this
+ benchmark stanza is restricted to (@ConcUtils@ is an internal module, not
+ in the library's @exposed-modules@ -- see the constraints this benchmark
+ was built under). Reported rather than worked around by widening what
+ @bench/@ may import: one small duplicated helper is a much smaller
+ footprint than exposing an internal concurrency-utilities module purely for
+ this one function, and it is a genuine finding about the public API's
+ sufficiency, not a design choice made lightly.
+-}
+trySyncLocal :: IO a -> IO (Either SomeException a)
+trySyncLocal action =
+  Exception.try action >>= \case
+    Left e
+      | Just (SomeAsyncException _) <- fromException e -> throwIO e
+      | otherwise -> pure (Left e)
+    Right v -> pure (Right v)
 
 -- | Insert or overwrite @key@, and record the change so a comp body reading
 -- it sees the update -- the source-side mutation hook used for the
@@ -245,13 +422,16 @@ insertOneSTM sys key val = do
     (HashSet.union (HashSet.singleton (Dep key (Just (largeHash128 val)))))
 
 -- | Total number of individual requests this instance has served so far,
--- via either 'executeImpl' or 'executeBatchImpl'.
+-- via either 'executeImpl' or 'executeBatchBundled'\/'defaultSequentialBatch'.
 sysCallCount :: SystemSrc -> IO Int
 sysCallCount sys = readIORef (sys_callCount sys)
 
 -- | Total number of 'compSrcExecuteBatch' round trips this instance has
 -- served so far -- always <= 'sysCallCount', and 'sysCallCount' \/
--- 'sysBatchCallCount' is the bundling win as an observed ratio.
+-- 'sysBatchCallCount' is the bundling win as an observed ratio. Only bumped
+-- by 'executeBatchBundled'; 'defaultSequentialBatch' calls 'executeImpl' per
+-- request instead, so with 'sys_batchingEnabled' off this stays at 0
+-- regardless of how many requests were served.
 sysBatchCallCount :: SystemSrc -> IO Int
 sysBatchCallCount sys = readIORef (sys_batchCallCount sys)
 
