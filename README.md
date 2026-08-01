@@ -288,9 +288,6 @@ reruns at scale 1.0; `0` disables the phase) sets keys mutated per round;
 scale benchmark's `PERSIST_BENCH_LIVE_LOOPS` diagnostic (see
 `bench/Control/Computations/Demos/Bench/Main.hs`).
 
-For measured numbers, what the optimization work found, and the two bugs that
-came out of it, seeand `docs/benchmark-notes.md`.
-
 [`docs/benchmark-notes.md`](docs/benchmark-notes.md) has measured numbers
 from prior runs, stage by stage, with what was kept and what was reverted.
 
