@@ -2358,3 +2358,105 @@ real `AnyCompSrcVer`/`AnyCompSrcKey` at any call site that needs one.
 `test_modifcationWhileWorkingOnQueue` (per-dependent version tracking) and
 the intern-table churn tests — passes unmodified; `TestCompReqCombined.hs`'s
 golden ordering trace was not touched.
+
+## Stage 11 — info-table profiling: the recipe works, the coverage does not (no code change)
+
+`THUNK_1_0` has been the largest single closure type in the Hospital heap
+since Stage 8 measured it at 810,987,120 bytes, 25.80% of a production-build
+`-hT` census, against `ARR_WORDS` -- the unboxed columnar payload the whole
+`DefTable`/`SrcIndex` design exists to hold -- at 8.93%. Three separate
+attempts to localise it failed, all for the same reason: every tool that maps
+heap to source needs `-fprof-auto`, and on this codebase `-fprof-auto`
+attribution has been directionally useful and **wrong about magnitude every
+time** (Stages 6, 8 and 10).
+
+Info-table profiling is the first tool tried here that does not have that
+flaw. `-finfo-table-map` emits an address-to-source map for every info table
+at compile time, and `+RTS -hi` censuses the heap by info table, both on an
+ordinary `-O2` build with no profiling runtime.
+
+### The recipe
+
+Build the benchmark with `-finfo-table-map` (`-fdistinct-constructor-tables`
+separates constructor allocations that would otherwise share one table), into
+a work dir of its own so the normal build is not clobbered. Run with **both**
+`-hi` and `-l`: `-hi` writes the census to `<program>.hp`, but the
+address-to-source map is emitted into the *eventlog*, so without `-l` the
+`.hp` is a list of bare hex addresses and nothing can be resolved. Read the
+map back with `ghc-events show <file>.eventlog`, which prints lines of the
+form:
+
+```
+Info Table: 100707a48:16:sat_sDKc_info - src/Control/Computations/Utils/SourceLocation.hs:41:1-52
+```
+
+Then join: parse the largest `BEGIN_SAMPLE`/`END_SAMPLE` block out of the
+`.hp`, strip the `0x` from each entry's address, and look it up in the map.
+NOTE: the join is the part worth writing down. The `.hp` and the eventlog are
+separate artifacts with no cross-reference, addresses appear as `0x…` in one
+and bare hex in the other, and neither file is useful alone.
+
+NOTE: `.hp` and `.eventlog` are fixed filenames written into the working
+directory, exactly like `.prof` -- consecutive runs overwrite each other
+silently. Run from a scratch directory. This has destroyed one
+investigation's results already (Stage 6).
+
+### The result: 6.7% attributed
+
+Peak census sample 3,040.2 MB, of which **203.2 MB (6.7%) resolved to a local
+source location and 2,837.0 MB (93.3%) did not**, against 29,429 info-table
+map entries. Top attributed sites:
+
+| Bytes | % of peak | Site |
+|---|---|---|
+| 77.1 MB | 2.54% | *(map entry present, empty source span)* |
+| 51.6 MB | 1.70% | `Impl.hs:(798,5)-(901,51)` |
+| 38.6 MB | 1.27% | *(empty source span)* |
+| 25.8 MB | 0.85% | *(empty source span)* |
+| 4.0 MB | 0.13% | `Utils/Fail.hs:411:32-65` |
+
+Only code compiled with `-finfo-table-map` gets entries, and the Stackage
+dependencies were not. So the 93.3% is `containers`, `vector`, `hashable`,
+`bytestring` and the RTS -- precisely where a `HashMap`/`IntMap`/boxed-vector
+heavy engine would be expected to hold its bytes. **The tool works; the
+coverage is what fails.** At local-package scope this cannot answer the
+question it was reached for.
+
+Settling it means rebuilding every dependency with the flag --
+`ghc-options: {"$everything": -finfo-table-map}` in `stack.yaml` -- which is
+a full world rebuild. Not attempted here; recorded as the one remaining lever
+that would actually resolve `THUNK_1_0`.
+
+### One real finding, measured as nothing, reverted
+
+The attributed `Impl.hs` span led to a genuine strictness hole in
+`updateEdges` (`SimpleStateIf.hs`): `foldM` is not strict in its accumulator,
+so `(HashSet.insert byKey) <$> classifySrcDep dep` chains one unforced
+`HashSet.insert` thunk per element of `newSrc`, held until
+`HashSet.difference` finally demands the result. Forcing the accumulator with
+a bang is a five-line change.
+
+Measured on the production build:
+
+| | Hospital | existing (control) |
+|---|---|---|
+| `max_live_bytes` | 3,909,222,144 -> 3,909,222,144 (**bit-identical**) | 328,689,264 -> 328,689,264 (**bit-identical**) |
+| `allocated_bytes` (cold) | 36,028.7 -> 36,161.6 MB (+0.37%) | 24,048.8 -> 23,982.2 MB (-0.28%) |
+
+Peak did not move at all, and both allocation deltas sit inside the ~0.27%
+run-to-run band Stage 7 measured for `allocated_bytes`. The reason is
+structural: those thunks live and die inside a single `updateEdges` call, so
+no heap census ever sees them -- the same reason Stage 10's reboxing fix cut
+allocation without touching peak.
+
+Reverted, per this document's own rule: no improvement in a step means mark
+it tried and revert. The laziness is real and would chain proportionally to
+the size of a row's source-dependency set, so it is worth revisiting if a
+graph with wide per-row source-dep sets ever shows up -- this one averages
+about 1.65, which is why it is invisible.
+
+### Disposition
+
+No code change. The recipe and its coverage limit are the deliverable: the
+next person to chase `THUNK_1_0` should start by rebuilding dependencies with
+`-finfo-table-map` rather than repeating a local-scope profile.
