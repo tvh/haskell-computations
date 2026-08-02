@@ -45,16 +45,75 @@ import Control.Monad.Reader
 -- on the suspend/resume hot path.
 import Control.Monad.State.Strict
 import qualified Data.Foldable as F
+import Data.HashMap.Strict (HashMap)
 import qualified Data.HashMap.Strict as HashMap
 import qualified Data.HashSet as HashSet
 import Data.IORef
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Typeable (Proxy (..), cast)
+import Data.Word (Word64)
 
-newtype CompEngine = CompEngine
+data CompEngine = CompEngine
   { ce_compEngineIfs :: CompEngineIfs
+  , ce_capSeqCounter :: IORef Word64
+  -- ^ see 'CapSeq'\'s haddock -- one monotone counter, shared by every
+  -- 'tellGarbage' call for the lifetime of this engine, so stamps compare
+  -- correctly across every accumulation window, not just within one.
   }
+
+{- | A monotone "who touched this cap last, and how" stamp, one per
+ 'AnyCompAp', carried alongside a 'GenDel' accumulation so a cap's
+ revive-vs-free history within one accumulation window can be resolved by a
+ commutative 'Semigroup' instead of by mutating a shared set in call order.
+
+ 'CompEngineM' is @StateT GenDel@, and a later parallel-evaluation project
+ needs to merge per-worker 'GenDel' accumulators on join -- 'GenDel'\'s
+ other fields were already commutative unions, but 'tellGarbage' (see its
+ haddock) was not: it deleted a key from the *whole accumulated* set,
+ which only means what it is supposed to mean ("the most recent thing that
+ happened to this cap was a revival") if deletions apply in call order. A
+ plain merged union of two workers' accumulators has no call order to
+ apply them in.
+
+ The obvious fix -- track revived caps additively in a separate set,
+ subtract it from the freed set once at the end -- is wrong, and wrong
+ already at width 1 (single-threaded, no merging involved at all).
+ Counterexample, entirely within one accumulation window: cap X is
+ re-evaluated successfully, so its revival is recorded; later in the same
+ window X's last dependent stops depending on it, so a cascade reports X
+ as freed. Today (and under this stamp scheme) X ends up freed, because
+ that is the *last* thing that happened to it, and its output is correctly
+ deleted. Additively, "X was revived at some point" and "X was freed at
+ some point" are both true and neither is more recent than the other, so
+ subtracting the revived set from the freed set unconditionally erases X
+ from the freed set -- and a dead output is never deleted. See
+ @test_reviveThenFreeInSameRoundDeletesOutput@ in TestRevive.hs, which
+ exists specifically to catch a future refactor sliding back to this
+ additive shape.
+
+ Order therefore has to be encoded in the values being merged, not in the
+ order the merge happens to run in -- a monotone counter stamped onto
+ every event, combined with 'max', does that: whichever stamp is larger
+ (freed's or revived's) is definitionally the more recent event, regardless
+ of what order the two 'GenDel' fragments carrying them get '<>'-ed
+ together. At width 1 the counter's issue order *is* wall-clock/call order
+ (see 'ce_capSeqCounter'), so @cs_revived > cs_freed@ after merging is
+ exactly "the last event for this cap was a revive" -- bit-identical to
+ today's mutate-in-call-order behaviour, including the counterexample
+ above (checked directly, not just argued: see the test cited above).
+-}
+data CapSeq = CapSeq
+  { cs_freed :: !Word64
+  , cs_revived :: !Word64
+  }
+  deriving (Show, Eq)
+
+instance Semigroup CapSeq where
+  CapSeq f1 r1 <> CapSeq f2 r2 = CapSeq (max f1 f2) (max r1 r2)
+
+instance Monoid CapSeq where
+  mempty = CapSeq 0 0
 
 {- | Track generated outputs and index them by the computation that created them.
  See test_oneComputationRecomputedButOtherUnreferencesIt in TestOutputs
@@ -68,28 +127,49 @@ newtype CompEngine = CompEngine
 data GenDel = GenDel
   { _gd_generated :: Map AnyCompAp AnyCompSinkOutsMap
   , _gd_garbage :: Garbage
+  , _gd_capSeq :: HashMap AnyCompAp CapSeq
+  -- ^ see 'CapSeq'\'s haddock. Merged via its own commutative 'Semigroup'
+  -- ('max' per field), same as every other 'GenDel' field -- unlike
+  -- '_gd_garbage'\'s 'garbage_caps', nothing here ever needs a targeted
+  -- deletion.
   }
   deriving (Show, Eq)
 
 instance Semigroup GenDel where
-  (<>) (GenDel a1 b1) (GenDel a2 b2) =
-    GenDel (Map.unionWith unionAnyCompSinkOutsMap a1 a2) (b1 <> b2)
+  (<>) (GenDel a1 b1 c1) (GenDel a2 b2 c2) =
+    GenDel (Map.unionWith unionAnyCompSinkOutsMap a1 a2) (b1 <> b2) (HashMap.unionWith (<>) c1 c2)
 
 instance Monoid GenDel where
-  mempty = GenDel mempty mempty
+  mempty = GenDel mempty mempty mempty
 
 generated :: AnyCompAp -> AnyCompSinkOutsMap -> GenDel
-generated k mo = GenDel (Map.singleton k mo) mempty
+generated k mo = GenDel (Map.singleton k mo) mempty mempty
 
 deleted :: Garbage -> GenDel
-deleted = GenDel mempty
+deleted g = GenDel mempty g mempty
 
+capSeqStamped :: HashMap AnyCompAp CapSeq -> GenDel
+capSeqStamped = GenDel mempty mempty
+
+{- | Resolve 'garbage_caps' against '_gd_capSeq': a cap accumulated into
+ @garbage_caps@ at some point during this window (an ordinary, commutative
+ union -- see 'tellGarbage') is only *actually* garbage if the last thing
+ that happened to it, per its merged 'CapSeq', was a free rather than a
+ revive. See 'CapSeq'\'s haddock for why this comparison, not the presence
+ of the key in @garbage_caps@ itself, is what decides membership now.
+-}
 garbage :: GenDel -> Garbage
-garbage (GenDel gen (Garbage garbage_caps garbage_deps garbage_outputs)) =
-  -- First delete any outputs from the generated outputs
-  -- that belong to a garbage cap
-  let genWithCapsDeleted =
-        foldr Map.delete gen (HashSet.toList garbage_caps)
+garbage (GenDel gen (Garbage garbage_caps garbage_deps garbage_outputs) capSeq) =
+  -- Keep only caps whose most recent event (by merged CapSeq) was a free,
+  -- not a revive -- see this function's haddock.
+  let stillGarbage cap = case HashMap.lookup cap capSeq of
+        Just (CapSeq freedAt revivedAt) -> revivedAt <= freedAt
+        Nothing -> True
+      garbage_caps' = HashSet.filter stillGarbage garbage_caps
+      -- First delete any outputs from the generated outputs
+      -- that belong to a garbage cap
+      genWithCapsDeleted =
+        foldr Map.delete gen (HashSet.toList garbage_caps')
       -- Then remove the resulting set of outputs from any garbage outputs
       result =
         let garbageOutputsRegeneratedFiltered =
@@ -100,7 +180,7 @@ garbage (GenDel gen (Garbage garbage_caps garbage_deps garbage_outputs)) =
                 garbage_outputs
             garbageOutputsTrimmed =
               HashMap.filter (not . nullAnyOutsMap) garbageOutputsRegeneratedFiltered
-         in Garbage garbage_caps garbage_deps garbageOutputsTrimmed
+         in Garbage garbage_caps' garbage_deps garbageOutputsTrimmed
    in if isGarbageEmpty result
         then result
         else pureDebug ("Returning garbage: " ++ show result) result
@@ -310,26 +390,54 @@ runGroupOnce g = do
       Right () -> pure ()
       Left ex -> forM_ fetches $ \(SrcFetch _ write) -> write (Left ex)
 
-{- | Here we remove the cap that generated the garbage from the
- total garbage cap set in the state
- This is necessary to avoid later marking output as garbage
- which might have been regenerated by this cap
- see test_dontDeleteAfterRevival in TestRevive
+{- | Record @g@ as garbage collected while finishing @mKey@\'s evaluation
+ (@mKey@ is 'Nothing' when that evaluation failed), and, if @mKey@ is a
+ 'Just' that has been freed earlier in this same accumulation window,
+ stamp it as revived -- see 'CapSeq'\'s haddock for why a stamp replaces
+ the old "delete the cap that generated the garbage from the accumulated
+ garbage set" mutation (still the same underlying purpose: avoid later
+ marking output as garbage that might have been regenerated by this cap;
+ see @test_dontDeleteAfterRevival@ in TestRevive).
+
+ @base@ and @base + 1@ are reserved for this one call: every cap freed by
+ @g@ is stamped @base@, and @mKey@ (when it gets a revival stamp at all)
+ is stamped @base + 1@ -- strictly later, encoding "the revival happens
+ after this call's own freed set is merged in" (see 'CapSeq'\'s haddock
+ for why that ordering within one call matters). The shared counter then
+ starts the *next* call at @base + 2@, so stamps compare correctly not
+ just within this call but across every call for the lifetime of the
+ engine.
+
+ @mKey@ is deliberately *not* stamped unconditionally on every successful
+ evaluation -- only when it is already a member of the accumulated
+ 'garbage_caps' (checked after this call's own @g@ has been merged in, so
+ a cap @g@ itself just froze counts too). 'garbage' only ever looks
+ '_gd_capSeq' up for caps that are in 'garbage_caps' (see its haddock), so
+ a stamp for any other cap is pure dead weight -- and unconditional
+ stamping is not a hypothetical cost: every successful 'doCompAp' call
+ passes a 'Just' here, so on a cold run of a million-cap graph where
+ nothing has been freed yet, unconditional stamping would grow
+ '_gd_capSeq' to a million-entry map for zero benefit, measured to add
+ tens of megabytes of 'max_live_bytes' and a five-percent
+ 'allocated_bytes' regression on this codebase's own persist benchmark.
+ Restricting to caps already in 'garbage_caps' keeps '_gd_capSeq' bounded
+ by however many caps are actually freed in the window, the same
+ population 'garbage_caps' itself is already bounded by.
 -}
 tellGarbage :: Maybe AnyCompAp -> Garbage -> CompEngineM ()
 tellGarbage mKey g =
   CompEngineM $
     do
-      let removeCapFromGarbage genDel =
-            let appended@(GenDel _ garb@(Garbage gCaps _ _)) =
-                  genDel `mappend` deleted g
-             in case mKey of
-                  Nothing ->
-                    appended
-                  Just key ->
-                    let gCaps' = HashSet.delete key gCaps
-                     in appended{_gd_garbage = garb{garbage_caps = gCaps'}}
-      modify' removeCapFromGarbage
+      counterRef <- asks ce_capSeqCounter
+      base <- lift (lift (atomicModifyIORef' counterRef (\c -> (c + 2, c))))
+      let freedSeqs =
+            HashMap.fromList [(cap, CapSeq base 0) | cap <- HashSet.toList (garbage_caps g)]
+      modify' (\genDel -> genDel `mappend` deleted g `mappend` capSeqStamped freedSeqs)
+      accumulatedGarbageCaps <- gets (garbage_caps . _gd_garbage)
+      case mKey of
+        Just key | key `HashSet.member` accumulatedGarbageCaps ->
+          modify' (\genDel -> genDel `mappend` capSeqStamped (HashMap.singleton key (CapSeq 0 (base + 1))))
+        _ -> pure ()
       let logFun = if mempty == g then logNoLog else logDebug
       logFun ("Collected garbage " ++ show g)
 {-# INLINE tellGarbage #-}
@@ -930,7 +1038,9 @@ execAp :: AnyCompAp -> CompEngineM ()
 execAp (AnyCompAp cap) = void $ doCompAp cap
 
 initCompEngine :: CompEngineIfs -> IO CompEngine
-initCompEngine compEngineIfs = return (CompEngine compEngineIfs)
+initCompEngine compEngineIfs = do
+  counter <- newIORef 0
+  return (CompEngine compEngineIfs counter)
 
 startCompEngine
   :: (F.Foldable t)
