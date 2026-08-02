@@ -445,6 +445,17 @@ evalCompAp outerCap =
   r =
     case outerCap of
       CompAp _ comp _ -> comp_compMap comp
+  -- | Routed through 'doAnyEvalReqValue' rather than calling 'evalWithCache'
+  -- directly: inlining both sides shows this is not just monad-law
+  -- equivalent but literally the same code --
+  -- @evalWithCache env False innerCap k (doCompAp innerCap)@ unfolds (via
+  -- 'evalWithCache's own definition) to exactly
+  -- @evalWithCacheValue False innerCap (doCompAp innerCap) >>= \x -> loop env
+  -- (contToCompM (k x))@, which is 'doAnyEvalReqValue' unfolded the same
+  -- way. A later promise table needs to wrap every place a cap gets
+  -- evaluated-or-looked-up; routing the CPS entry point through the value
+  -- one collapses that to a single site instead of two that must be kept in
+  -- sync by hand.
   doAnyEvalReq
     :: forall a x
      . IsCompResult x
@@ -453,7 +464,7 @@ evalCompAp outerCap =
     -> CompCont (Maybe (CompApResult x)) a
     -> CompEngineM (CompResult a)
   doAnyEvalReq env innerCap k =
-    evalWithCache env False innerCap k (doCompAp innerCap)
+    doAnyEvalReqValue innerCap >>= \x -> loop env (contToCompM (k x))
 
   doAnyCacheReq
     :: forall a x
