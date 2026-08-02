@@ -2561,3 +2561,66 @@ are now measured as dead weight on two independent realistic graph shapes,
 under both uniform and heterogeneous latency. They cost a public class
 method, a registry field, and a dispatch path. Worth deciding whether they
 earn that; bundling subsumes them for every workload measured so far.
+
+## Stage 12a — correction: the benchmarks had no `-N`, and it does not matter here
+
+Stage 12's grid was measured with the `benchmarks:` stanza set to
+`-with-rtsopts=-A64m -T` — **no `-N`** — while the `tests:` stanza has always
+had `-with-rtsopts=-N`. Some cells were run with an explicit
+`--ba "+RTS -N -RTS"` and some were not, so the grid was confounded. Commit
+`3f1d170` puts `-N` inside the stanza's single quoted token and makes all three
+benchmarks print `getNumCapabilities`, verified on the built binary rather than
+the cabal file (`+RTS --info` reports `("Flag -with-rtsopts", "-A64m -T -N")`;
+this machine gives 14 capabilities).
+
+### Stage 12's conclusion survives, re-measured with every cell identical
+
+Cold eval, seconds, two reps per cell agreeing within 0.5%:
+
+| bundling | width 1 | width 2 | width 4 | width 8 |
+|---|---|---|---|---|
+| on | **71.4** | 74.2 | 74.2 | 74.1 |
+| off | 108.9 | 111.3 | 111.4 | 111.3 |
+
+**Bundling 1.53x** (Stage 12 measured 1.51x). **Concurrency still contributes
+nothing at any width**, and width 1 -> 2 costs about 4%. The explanation stands:
+dispatch groups source leaves by instance and runs one worker per group, so
+same-instance leaves serialise by construction and only multi-instance batches
+can overlap — which this graph almost never produces.
+
+### `-N` does nothing for this benchmark, and that is expected
+
+Same-session sweep at bundling on, width 1:
+
+| `-N1` | `-N4` | `-N8` | `-N14` |
+|---|---|---|---|
+| 72.5 s | 72.1 s | 71.3 s | 71.5 s |
+
+Flat. The workload is blocked in safe-FFI `usleep`, and a `safe` FFI call
+already releases its capability at `-N1` — that is exactly why safe-FFI was
+chosen over busy-wait in Stage 12. Extra capabilities have nothing to do until
+something makes the *engine* concurrent.
+
+NOTE: the grid above reads ~17% slower than Stage 12's (71.4 vs 61.0 at
+bundling on, width 1). That gap is **cross-session drift, not an `-N` effect** —
+the same-session sweep is flat across every setting. An idle-capability-spinning
+hypothesis was raised and refuted by that sweep. Wall-time numbers on this
+machine are only comparable within a session; the ~2x range documented in
+Stage 5 applies across them.
+
+### `max_live_bytes` is `-N`-dependent — baselines are not portable across settings
+
+| | at `-N1` | at `-N14` | |
+|---|---|---|---|
+| persist `max_live_bytes` | 328,689,264 | 363,080,112 | **+10.5%** |
+| hospital `max_live_bytes` | 3,909,222,144 | 3,909,375,296 | +0.004% |
+
+Not a regression — a different measurement configuration. At `-N14` the
+aggregate nursery is 14 x `-A64m` ~= 896 MB, which swamps persist's 363 MB live
+set and is negligible against hospital's 3.9 GB. Any future "bit-identical"
+memory claim must name the capability count it was measured at.
+
+Wall time improved on both from parallel GC: persist cold 6.5 -> 5.7 s, hospital
+14.5 -> 10.5 s. An earlier `-N` sweep also showed hospital's very short
+live-update phase getting ~4x *worse* (0.0062 -> 0.0268 s), where parallel GC's
+fixed per-collection sync cost dominates.
