@@ -2460,3 +2460,104 @@ about 1.65, which is why it is invisible.
 No code change. The recipe and its coverage limit are the deliverable: the
 next person to chase `THUNK_1_0` should start by rebuilding dependencies with
 `-finfo-table-map` rather than repeating a local-scope profile.
+
+## Stage 12 — the tiered benchmark: heterogeneous latency does not re-rank bundling against concurrency
+
+Two structural gaps in the scale and Hospital benchmarks made a question
+unanswerable. Both graphs are **stratified** -- leaves read sources,
+interior computations read only other computations, and exactly one body in
+either mixes the two -- so a batch almost never contains both leaf kinds,
+and the engine's dispatch-then-drain choice (Stage 5) could not cost
+anything. And both use **one global latency** for every source, so no batch
+is worth more than any other.
+
+`bench/Control/Computations/Demos/Bench/Tiered.hs` keeps Hospital's
+skeleton for comparability and changes exactly those two things: interior
+bodies read sources in the same applicative batch as their computation
+dependencies, and each source carries its own latency tier. Risk scoring
+reads a single model-coefficients key shared by every patient, exercising
+the `SrcKeyMany` path that Hospital -- where nearly every key has one
+dependent -- never touches.
+
+### `threadDelay` cannot express sub-millisecond latency here
+
+Discovered while validating the tiers, and worth recording on its own.
+`threadDelay` floors at about 1.28 ms on this machine regardless of the
+delay requested, so the intended 25/100/250/500/1000 us tiers were all
+identical. It is **not** the RTS timer tick -- neither `-V0.0001` nor `-V0`
+moves it.
+
+| requested | `threadDelay` | safe-FFI `usleep` | busy-wait |
+|---|---|---|---|
+| 25 us | 1159 | **47** | 30 |
+| 100 us | 1180 | **133** | 100 |
+| 250 us | 1189 | **319** | 257 |
+| 500 us | 1226 | **636** | 500 |
+| 1000 us | 1248 | **1288** | 1000 |
+
+Overlap, 8 threads x 50 x 1000 us, where fully serial is ~400 ms:
+`threadDelay` 58.6 ms, safe-FFI `usleep` 62.6 ms, busy-wait 150.1 ms.
+
+Busy-wait is the most accurate and the least usable: it holds a capability
+while spinning, so eight spinners on `-N4` serialise. `unsafe` FFI is as
+accurate as `safe` but also never releases the capability. **Safe-FFI
+`usleep` is the only option that gives both resolution and overlap**, at
+about 25% overhead with a floor near 20 us (commit `8f62218`).
+
+### Shape
+
+180 patients, 4 wards, **175,695 instances against an analytic target of
+175,695** (+0.00%), depth spanning levels 1-11 (106,020 instances at level
+1 thinning to a single root). `defaultScale = 0.18`, re-derived after the
+`usleep` swap -- 2.25x more patients than the `threadDelay` floor allowed
+in the same wall time.
+
+### The matrix, latency multiplier 1.0
+
+Cold eval wall time, seconds. Bundling-off rows are medians of three; a
+first-run 109.4 s at width 4 did not reproduce (90.3, 91.9) and was noise.
+
+| bundling | width 1 | width 2 | width 4 | width 8 |
+|---|---|---|---|---|
+| on | **61.0** | 62.2 | 62.7 | 61.7 |
+| off | 92.1 | 91.9 | 91.9 | 93.0 |
+
+Overhead control at multiplier 0: bundling on 2.45 s / off 2.47 s at width
+1; both about 2.8 s at width 4.
+
+### Findings
+
+**Bundling is worth 1.51x** (61.0 vs ~92) and is the only lever that moves
+anything.
+
+**Concurrency contributes nothing, at any width, with or without
+bundling.** This is the second measurement of that result -- Stage 5 found
+the width grid flat under *uniform* latency, and the hypothesis was that a
+slow source among fast ones would re-rank the two. It does not.
+
+The reason is a design consequence, not an artifact. Dispatch groups source
+leaves **by instance and runs one worker per group**, so same-instance
+leaves are serialised by construction; only batches spanning *several*
+instances can overlap. In this graph each body reads one source
+(`vitalWindowComp` vitals, `interactionComp` pharmacy, `riskScoreComp`
+labs, `wardCensusComp` adt); only `patientSummaryComp` reads all five, once
+per patient against roughly 1,935 batch calls per patient. There is
+essentially nothing to overlap, and heterogeneous latency does not create
+any -- it changes what a batch *costs*, not how many instances it spans.
+
+**Dispatch-then-drain therefore costs nothing measurable here**, which is
+the question this benchmark was built to answer -- but for a duller reason
+than expected. The barrier can only cost what overlapping would have saved,
+and overlapping saves nothing on this shape. Mixed leaves were necessary to
+make the question askable and turned out not to be sufficient: the binding
+constraint is instances-per-batch, not leaf kinds per batch. At multiplier
+0 the dispatch machinery costs about 12% (2.45 -> 2.75 s) purely in
+overhead.
+
+### Disposition
+
+The `FlowConcurrency` declaration and the `CompFlowConcurrency` width knob
+are now measured as dead weight on two independent realistic graph shapes,
+under both uniform and heterogeneous latency. They cost a public class
+method, a registry field, and a dispatch path. Worth deciding whether they
+earn that; bundling subsumes them for every workload measured so far.
