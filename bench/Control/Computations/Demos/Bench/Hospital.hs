@@ -192,6 +192,7 @@ import Data.Maybe (fromMaybe)
 import Data.Proxy
 import Data.Time.Clock
 import Data.Word (Word32, Word64)
+import GHC.Conc (getNumCapabilities)
 import GHC.Stats
 import System.Environment (lookupEnv)
 import System.Posix.Process (getProcessID)
@@ -948,8 +949,19 @@ hospitalBenchMain = do
       histogram = depthHistogram wardCount patientCount
       targetInstances = sum (Map.elems histogram)
 
+  caps <- getNumCapabilities
   putStrLn "=== bench: hospital pipeline (applicative-batch, concurrent-source benchmark) ==="
-  printf "HOSPITAL_BENCH_SCALE=%.4f HOSPITAL_BENCH_SRC_LATENCY_US=%d HOSPITAL_BENCH_CONCURRENCY=%d\n" scale latencyUs width
+  -- NOTE: capabilities is part of the config line, not a footnote -- a run
+  -- that doesn't say how many capabilities it had isn't reproducible. See
+  -- the -with-rtsopts NOTE in package.yaml's benchmarks stanza for how this
+  -- benchmark ends up with -N (all cores) rather than the single capability
+  -- earlier baselines in docs/benchmark-notes.md silently ran on.
+  printf
+    "HOSPITAL_BENCH_SCALE=%.4f HOSPITAL_BENCH_SRC_LATENCY_US=%d HOSPITAL_BENCH_CONCURRENCY=%d capabilities: %d\n"
+    scale
+    latencyUs
+    width
+    caps
   printf
     "patients: %d, wards: %d (avg %.1f patients/ward), target instances (analytic): %d\n"
     patientCount

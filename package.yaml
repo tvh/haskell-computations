@@ -237,16 +237,23 @@ benchmarks:
     - -rtsopts
     # NOTE: -with-rtsopts is single-valued -- a second -with-rtsopts= entry
     # does not concatenate with this one, it replaces it (this repo lost a
-    # silently-dropped -N2 to that for an entire optimization campaign). Both
-    # options this benchmark needs (allocation area size, and -T so
-    # GHC.Stats.getRTSStats doesn't throw) must live in this one entry. The
-    # surrounding double quotes are load-bearing: Cabal's ghc-options field
-    # tokenizes on whitespace, so without them "-A64m -T" splits into two
-    # separate GHC arguments and "-T" is rejected as an unknown flag. The
-    # quotes must wrap the *entire* token (Cabal field-string syntax), not
-    # just the value after "=", or the quote characters themselves leak
-    # through as literal text and the tokenizer still splits on the space.
-    - '"-with-rtsopts=-A64m -T"'
+    # silently-dropped -N2 to that for an entire optimization campaign). All
+    # three options this benchmark needs (allocation area size, -T so
+    # GHC.Stats.getRTSStats doesn't throw, and -N so it actually runs on more
+    # than one capability) must live in this one entry. The surrounding
+    # double quotes are load-bearing: Cabal's ghc-options field tokenizes on
+    # whitespace, so without them "-A64m -T -N" splits into three separate
+    # GHC arguments and "-T"/"-N" are rejected as unknown flags. The quotes
+    # must wrap the *entire* token (Cabal field-string syntax), not just the
+    # value after "=", or the quote characters themselves leak through as
+    # literal text and the tokenizer still splits on the space. Without -N
+    # here, every default `stack bench` invocation runs on a single
+    # capability regardless of how many cores the machine has -- this is
+    # what happened through Stage 12 of docs/benchmark-notes.md, and it
+    # partly confounded that grid (see the note there). -N with no thread
+    # count picks up all cores at RTS startup; it can still be overridden at
+    # runtime with an explicit +RTS -N<n> -RTS since -rtsopts is set.
+    - '"-with-rtsopts=-A64m -T -N"'
     dependencies:
     - incremental-computations
     - process

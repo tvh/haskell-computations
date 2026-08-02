@@ -65,6 +65,7 @@ import Data.IORef
 import Data.Maybe (fromMaybe)
 import Data.Time.Clock
 import Data.Word
+import GHC.Conc (getNumCapabilities)
 import GHC.Stats
 import System.Environment (lookupEnv)
 import System.Posix.Process (getProcessID)
@@ -339,8 +340,14 @@ benchMain = do
       targetInstances = 1000000 * scale :: Double
       topSize = last sizes
 
+  caps <- getNumCapabilities
   putStrLn "=== bench: graph shape (persistence-free port of Rust persist_bench) ==="
-  printf "PERSIST_BENCH_SCALE=%.4f (target ~%.0f achieved instances)\n" scale targetInstances
+  -- NOTE: capabilities is part of the config line, not a footnote -- a run
+  -- that doesn't say how many capabilities it had isn't reproducible. See
+  -- the -with-rtsopts NOTE in package.yaml's benchmarks stanza for how this
+  -- benchmark ends up with -N (all cores) rather than the single capability
+  -- earlier baselines in docs/benchmark-notes.md silently ran on.
+  printf "PERSIST_BENCH_SCALE=%.4f (target ~%.0f achieved instances), capabilities: %d\n" scale targetInstances caps
   printf "levels: %d, defs/level: %d, total defs: %d\n" levelsCount defsPerLevel (levelsCount * defsPerLevel)
   putStrLn ("declared level sizes (bottom -> top): " ++ show sizes)
   printf "source keys: %d, top-level sink outputs: %d\n" srcKeys topSize
