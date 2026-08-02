@@ -10,11 +10,15 @@
  things a real service call has that 'HashMapFlow'\'s in-memory
  'Control.Computations.FlowImpls.HashMapFlow.hmfLookup' does not:
 
- * a per-instance __latency__ (a 'threadDelay' inside 'compSrcExecute',
-   standing in for real network\/service time -- this is the whole reason
-   the hospital bench exists: 'Control.Computations.Demos.Bench.Main'\'s
+ * a per-instance __latency__ (a safe-FFI 'c_usleep' call inside
+   'compSrcExecute', standing in for real network\/service time -- this is
+   the whole reason the hospital bench exists: 'Control.Computations.Demos.Bench.Main'\'s
    graph has no latency anywhere to hide, so concurrency can never show up
-   in its numbers regardless of width);
+   in its numbers regardless of width. __Not 'Control.Concurrent.threadDelay'__
+   -- see 'c_usleep'\'s own haddock for why: on the measurement machine
+   'threadDelay' has an effective floor around 1.28 ms regardless of the
+   requested delay, which collapses every sub-millisecond latency tier this
+   type is asked to simulate down to the same wall-clock cost);
  * optional, __deterministic per-key jitter__ on top of that latency (see
    'ssc_jitterEnabled'\/'jitterUs') -- off by default, so every stage before
    this one reproduces exactly, and derived from a hash of the key rather
@@ -28,7 +32,7 @@
  * a __batch call counter__, separate from the request counter: this type
    overrides 'compSrcExecuteBatch' (see 'executeBatchBundled') to serve every
    request the engine has bundled together against this instance with one
-   'readTVarIO' and one simulated-latency 'threadDelay', instead of one of
+   'readTVarIO' and one simulated-latency 'c_usleep' call, instead of one of
    each per request -- 'sysCallCount' still counts every individual request
    served, so 'sysCallCount' \/ 'sysBatchCallCount' is directly the round-trip
    reduction this buys, visible in the benchmark's own report rather than
@@ -81,11 +85,10 @@ import Control.Computations.Utils.Types
 -- EXTERNAL
 ----------------------------------------
 
-import Control.Concurrent (threadDelay)
 import Control.Concurrent.STM
 import Control.Exception (Exception (fromException), SomeAsyncException (..), SomeException, throwIO)
 import qualified Control.Exception as Exception
-import Control.Monad (forM_, when)
+import Control.Monad (forM_, void, when)
 import qualified Data.ByteString as BS
 import qualified Data.Foldable as F
 import Data.HashMap.Strict (HashMap)
@@ -96,6 +99,73 @@ import qualified Data.HashSet as HashSet
 import Data.IORef
 import qualified Data.Text as T
 import Data.Typeable
+import Foreign.C.Types (CInt (..), CUInt (..))
+
+{- | @usleep(3)@ via __safe__ FFI -- what actually simulates a call's latency
+ (see 'simulateRoundTrip'), in place of 'Control.Concurrent.threadDelay'.
+
+ __Why not 'threadDelay'__: on the benchmark machine, GHC's RTS timer gives
+ 'threadDelay' an effective floor around 1.28 ms -- a standalone microbenchmark
+ requesting 25, 100, 250, 500 and 1000 microseconds each measured within
+ 1.13-1.34 ms actual, i.e. every one of those requests collapsed to
+ approximately the same real delay:
+
+ +---------------+----------------+-----------------------+-----------+
+ | requested     | 'threadDelay'  | safe-FFI @usleep@      | busy-wait |
+ +===============+================+========================+===========+
+ | 25 us         | 1159 us        | __47 us__              | 30 us     |
+ +---------------+----------------+-----------------------+-----------+
+ | 100 us        | 1180 us        | __133 us__             | 100 us    |
+ +---------------+----------------+-----------------------+-----------+
+ | 250 us        | 1189 us        | __319 us__             | 257 us    |
+ +---------------+----------------+-----------------------+-----------+
+ | 500 us        | 1226 us        | __636 us__             | 500 us    |
+ +---------------+----------------+-----------------------+-----------+
+ | 1000 us       | 1248 us        | __1288 us__            | 1000 us   |
+ +---------------+----------------+-----------------------+-----------+
+
+ @usleep@ recovers a real, proportional spread across sub-millisecond
+ latencies where 'threadDelay' cannot. The cost is real but small and worth
+ recording: roughly __+25% overhead__ versus the requested delay, with an
+ additive floor near __20 microseconds__ -- so a tier this type serves is
+ proportional to its nominal latency, not exact to it (see
+ "Control.Computations.Demos.Bench.Tiered"'s module haddock for how the
+ default scale accounts for that).
+
+ __Why 'safe', not 'unsafe'__: an @unsafe@ foreign call does not release its
+ calling capability for the duration of the call -- the calling Haskell
+ thread\'s capability is pinned to the C call, unable to run any other
+ Haskell thread, for as long as the call blocks. Several concurrent
+ 'compSrcExecute' calls sleeping via an @unsafe@ @usleep@ would therefore
+ serialize against each other on a capability-starved runtime exactly as if
+ 'compSrcConcurrency' were 'FlowSerial' -- silently zeroing out the very
+ concurrency effect this benchmark exists to measure, without any visible
+ error. @safe@ calls release the capability for another Haskell thread to
+ use while the call blocks, so N concurrent sleepers still overlap.
+ Confirmed directly (8 threads x 50 x 1000-microsecond sleeps each, where a
+ fully serial run would take roughly 400 ms):
+
+ +------------------------+-----------------------+
+ | implementation         | total wall time        |
+ +========================+=======================+
+ | 'threadDelay'          | 58.6 ms (overlaps)     |
+ +------------------------+-----------------------+
+ | safe-FFI @usleep@      | __62.6 ms (overlaps)__ |
+ +------------------------+-----------------------+
+ | busy-wait              | 150.1 ms (partial)     |
+ +------------------------+-----------------------+
+
+ A busy-wait spin is more accurate still (no FFI floor at all, see the first
+ table above) but was rejected for exactly the reason the second table
+ shows: it burns a whole capability the entire time it \"sleeps\" rather than
+ yielding it, so several busy-waiters compete for the same limited @-N@
+ capabilities and partially serialize instead of overlapping -- 150.1 ms
+ above is more than double 'threadDelay'\/@usleep@'s own ~60 ms, on the same
+ 8-way overlap test. An @unsafe@ @usleep@ would fail the same test the same
+ way, for the same underlying reason. The @safe@ annotation here is
+ load-bearing, not a style preference.
+-}
+foreign import ccall safe "unistd.h usleep" c_usleep :: CUInt -> IO CInt
 
 type Key = BS.ByteString
 type Val = BS.ByteString
@@ -130,16 +200,17 @@ instance CompSrc SystemSrc where
   compSrcWaitChanges = waitChangesImpl
 
   {- | 'compSrcExecute' (see 'executeImpl') bumps two counters via plain STM,
-   optionally 'threadDelay's, then takes a 'readTVarIO' snapshot of the
-   backing map -- no write, no lock, nothing here requires calls against this
-   instance to be serialized against each other. Declaring 'FlowConcurrent'
-   is the entire reason this type exists: with a nonzero 'sys_latencyUs',
-   this is what lets several reads against *different* instances overlap
-   their 'threadDelay's (see "Control.Computations.CompEngine.Impl"'s
-   @doSuspended@); reads against the *same* instance within one batch don't
-   need that anymore -- see 'compSrcExecuteBatch' below, which collapses
-   them into one delay instead (when 'sys_batchingEnabled', see
-   'executeBatchDispatch').
+   optionally sleeps via safe-FFI 'c_usleep' (see that function's haddock for
+   why not 'Control.Concurrent.threadDelay'), then takes a 'readTVarIO'
+   snapshot of the backing map -- no write, no lock, nothing here requires
+   calls against this instance to be serialized against each other. Declaring
+   'FlowConcurrent' is the entire reason this type exists: with a nonzero
+   'sys_latencyUs', this is what lets several reads against *different*
+   instances overlap their 'c_usleep' calls (see
+   "Control.Computations.CompEngine.Impl"'s @doSuspended@); reads against the
+   *same* instance within one batch don't need that anymore -- see
+   'compSrcExecuteBatch' below, which collapses them into one delay instead
+   (when 'sys_batchingEnabled', see 'executeBatchDispatch').
   -}
   compSrcConcurrency _ = FlowConcurrent
 
@@ -271,7 +342,7 @@ simulateRoundTrip sys latencyUs = do
     writeTVar (sys_inFlight sys) n
     hw <- readTVar (sys_highWater sys)
     when (n > hw) (writeTVar (sys_highWater sys) n)
-  when (latencyUs > 0) (threadDelay latencyUs)
+  when (latencyUs > 0) (void (c_usleep (fromIntegral latencyUs)))
   atomically (modifyTVar' (sys_inFlight sys) (subtract 1))
 
 -- | Serve exactly one request: bump the request counter by one, pay one
@@ -300,8 +371,8 @@ executeBatchDispatch sys fetches
   | otherwise = defaultSequentialBatch sys fetches
 
 {- | Serve every request the engine bundled together against this instance
- with __one__ simulated round trip ('simulateRoundTrip', so one
- 'threadDelay' for the whole group instead of one per request -- at the
+ with __one__ simulated round trip ('simulateRoundTrip', so one 'c_usleep'
+ call for the whole group instead of one per request -- at the
  *worst* (largest) 'latencyForKey' among the group's keys, the realistic
  model for a batched round trip: its wall time is bounded by its slowest
  constituent, not its average) and __one__ 'readTVarIO' snapshot, then
