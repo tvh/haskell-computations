@@ -389,6 +389,7 @@ benchmark incremental-computations-bench
       Control.Computations.Demos.Bench.Hospital
       Control.Computations.Demos.Bench.Main
       Control.Computations.Demos.Bench.SystemSrc
+      Control.Computations.Demos.Bench.Tiered
       Paths_incremental_computations
   hs-source-dirs:
       bench
