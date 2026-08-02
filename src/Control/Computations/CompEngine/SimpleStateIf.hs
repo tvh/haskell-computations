@@ -128,7 +128,6 @@ import qualified Data.IntMap.Strict as IntMap
 import qualified Data.IntSet as IntSet
 import Data.IORef
 import Data.List (intercalate)
-import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Maybe
 import Data.Proxy (Proxy (..))
@@ -199,7 +198,6 @@ data SifState = SifState
   -- ^ keyed by the raw 'Int' 'SI.unSrcKeyId' of a 'SI.SrcKeyId', for the
   -- same 'IntMap'-mandates-literal-'Int' reason as 'sifs_defs'.
   , sifs_outputs :: !(IORef (OM.OutputsMap DT.DefRef))
-  , sifs_pendingOutputs :: !(IORef (Map DT.DefRef AnyCompSinkOutsMap))
   , sifs_stale :: !(IORef (Paq.PriorityAgingQueue DT.DefRef ()))
   }
 
@@ -212,7 +210,6 @@ newSifState =
     <*> SI.newKeyIntern
     <*> newIORef IntMap.empty
     <*> newIORef OM.empty
-    <*> newIORef Map.empty
     <*> newIORef Paq.empty
 
 {- | Checks invariants about the SifState: every def index referenced by
@@ -333,7 +330,6 @@ mkSimpleCompEngineStateIf sif =
     , staleQueueSize = staleQueueSizeImpl sif
     , dequeueNextCap = dequeueNextCapImpl sif
     , enqueueStaleCaps = enqueueStaleCapsImpl sif
-    , trackOutput = trackOutputImpl sif
     , getCompSinkOuts = getDataIfOutputsImpl sif
     , getQueue = getQueueImpl sif
     }
@@ -482,40 +478,26 @@ getQueueImpl sif = withSifState sif $ \st -> liftIO $ do
 staleQueueSizeImpl :: MonadIO m => SimpleStateIf m -> m Int
 staleQueueSizeImpl sif = withSifState sif $ \st -> liftIO $ Paq.size <$> readIORef (sifs_stale st)
 
-trackOutputImpl
-  :: forall m a
-   . (MonadIO m, IsCompResult a)
-  => SimpleStateIf m
-  -> CompAp a
-  -> AnyCompSinkOutsMap
-  -> m ()
-trackOutputImpl sif cap outputs
-  | nullAnyOutsMap outputs = pure ()
-  | otherwise = withSifState sif $ \st -> liftIO $
-      withRow st cap $ \defIdx _dt row _fresh -> do
-        let ref = DT.packRef defIdx row
-        logDebug (show (capId cap) ++ " produced the following outputs:\n" ++ indentedShow outputs)
-        modifyIORef' (sifs_pendingOutputs st) (Map.insertWith mappend ref outputs)
- where
-  indentedShow x = unlines (map ("  - " ++) (lines (show x)))
-
-{- | Commit a row's pending outputs into the durable outputs map, warning
- about (but not preventing) the same output being claimed by more than one
- cap, and reporting any outputs this row *previously* produced but no
- longer does (and that nothing else currently produces either) as garbage.
- This runs unconditionally on every finish, not just when there are
- pending outputs, since a row that produced outputs last time and none
- this time still needs its old ones diffed out. A row with no *current*
- outputs gets 'OM.delete'd rather than given an empty 'OM.insert':
- 'OM.lookup's 'Nothing' case already means "no outputs" without needing an
- entry to say so, so an empty entry would just be dead weight in the map.
+{- | Commit a row's newly-produced outputs (accumulated over its evaluation
+ by 'Control.Computations.CompEngine.Types.CompMEnv's 'cme_outputs' -- see
+ its haddock, and this module's own on why that accumulator is per-evaluation
+ rather than staged here) into the durable outputs map, warning about (but
+ not preventing) the same output being claimed by more than one cap, and
+ reporting any outputs this row *previously* produced but no longer does
+ (and that nothing else currently produces either) as garbage. This runs
+ unconditionally on every finish, not just when there are new outputs, since
+ a row that produced outputs last time and none this time still needs its
+ old ones diffed out. A row with no *current* outputs gets 'OM.delete'd
+ rather than given an empty 'OM.insert': 'OM.lookup's 'Nothing' case already
+ means "no outputs" without needing an entry to say so, so an empty entry
+ would just be dead weight in the map.
 -}
-commitPendingOutputsForKey :: SifState -> DefRef -> AnyCompAp -> IO Garbage
-commitPendingOutputsForKey st ref capAny = do
-  pending <- readIORef (sifs_pendingOutputs st)
+commitPendingOutputsForKey :: SifState -> DefRef -> AnyCompAp -> AnyCompSinkOutsMap -> IO Garbage
+commitPendingOutputsForKey st ref capAny newOutputs = do
+  unless (nullAnyOutsMap newOutputs) $
+    logDebug (show capAny ++ " produced the following outputs:\n" ++ indentedShow newOutputs)
   outs <- readIORef (sifs_outputs st)
-  let newOutputs = fromMaybe mempty (Map.lookup ref pending)
-      oldOutputs = fromMaybe mempty (OM.lookup ref outs)
+  let oldOutputs = fromMaybe mempty (OM.lookup ref outs)
       delOutputs = oldOutputs `diffAnyOutsMap` newOutputs
   -- The existential `s` inside each ForAnyCompFlow can't escape a shared
   -- list (different sink outputs may carry different s), so each entry's
@@ -556,12 +538,13 @@ commitPendingOutputsForKey st ref capAny = do
   -- are now strict too, see "Utils/OutputsMap.hs", so WHNF here reaches
   -- both maps).
   writeIORef (sifs_outputs st) $! outs'
-  modifyIORef' (sifs_pendingOutputs st) (Map.delete ref)
   let garbOutputs = OM.filterUnreferencedOutputs outs' delOutputs
   pure $
     if nullAnyOutsMap garbOutputs
       then mempty
       else mempty{garbage_outputs = HashMap.singleton capAny garbOutputs}
+ where
+  indentedShow x = unlines (map ("  - " ++) (lines (show x)))
 
 getDataIfOutputsImpl
   :: forall s m
@@ -1054,12 +1037,13 @@ capEvaluationFinishedImpl
   => SimpleStateIf m
   -> CompAp a
   -> DepSet
+  -> AnyCompSinkOutsMap
   -> Maybe a
   -> m (HashSet AnyCompAp, Garbage)
-capEvaluationFinishedImpl sif cap deps mres =
+capEvaluationFinishedImpl sif cap deps outputs mres =
   withSifState sif $ \st -> liftIO $
     withRow st cap $ \defIdx dt row _fresh ->
-      finishCap st cap defIdx dt row deps mres
+      finishCap st cap defIdx dt row deps outputs mres
 
 finishCap
   :: forall p a
@@ -1070,9 +1054,10 @@ finishCap
   -> DefTable p a
   -> DT.RowIdx
   -> DepSet
+  -> AnyCompSinkOutsMap
   -> Maybe a
   -> IO (HashSet AnyCompAp, Garbage)
-finishCap st cap defIdx dt row deps mres = do
+finishCap st cap defIdx dt row deps outputs mres = do
   let ref = DT.packRef defIdx row
       capIdStr = show (capId cap)
       capAny = AnyCompAp cap
@@ -1125,7 +1110,7 @@ finishCap st cap defIdx dt row deps mres = do
   -- rather than a stale one just because this run looked suspicious.
   writeFinishedRow dt row newResultState newHash mres
   edgeGarbage <- updateEdges dt st ref oldCompDepsVer newCompDepsVer oldSrcDeps newSrcDeps
-  outputGarbage <- commitPendingOutputsForKey st ref capAny
+  outputGarbage <- commitPendingOutputsForKey st ref capAny outputs
   let garbage = edgeGarbage <> outputGarbage
   removeFromStale st ref
   DT.setPending dt row False

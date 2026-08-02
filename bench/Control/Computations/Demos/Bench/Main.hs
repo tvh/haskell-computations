@@ -137,7 +137,6 @@ countingStateIf ref orig =
     , dequeueNextCap = dequeueNextCap orig
     , staleQueueSize = staleQueueSize orig
     , enqueueStaleCaps = enqueueStaleCaps orig
-    , trackOutput = trackOutput orig
     , getCompSinkOuts = getCompSinkOuts orig
     , getQueue = getQueue orig
     }

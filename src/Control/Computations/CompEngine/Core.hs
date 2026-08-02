@@ -105,7 +105,6 @@ data CompEngineStateIf m = CompEngineStateIf
   , dequeueNextCap :: m (Maybe AnyCompAp)
   , staleQueueSize :: m Int
   , enqueueStaleCaps :: forall t. Foldable t => t CompEngDep -> m EnqueueInfo
-  , trackOutput :: forall a. IsCompResult a => CompAp a -> AnyCompSinkOutsMap -> m ()
   , getCompSinkOuts :: forall s. CompSink s => s -> m (CompSinkOuts s)
   , getQueue :: m [AnyCompAp]
   -- ^ view of the queue, just for tests
@@ -114,6 +113,11 @@ data CompEngineStateIf m = CompEngineStateIf
 type CapEvaluationFinished m a =
   CompAp a
   -> DepSet
+  -> AnyCompSinkOutsMap
+  -- ^ every sink output this cap's evaluation produced -- see
+  -- 'Control.Computations.CompEngine.Types.CompMEnv's 'cme_outputs' haddock
+  -- for why this arrives as a plain argument now instead of being read back
+  -- out of shared state.
   -> Maybe a
   -> m
       ( HashSet AnyCompAp -- stale caps (only for logging purposes)

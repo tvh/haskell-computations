@@ -298,8 +298,10 @@ setupSimpleStateIf shouldValidate =
             baseCeif = mkSimpleCompEngineStateIf stateIf
         -- One 'MethodStats' per 'CompEngineStateIf' field, so
         -- 'ssif_withState's aggregate (which can't tell methods apart, see
-        -- its own haddock) can be broken down by which of the ten methods
-        -- actually did the work.
+        -- its own haddock) can be broken down by which of the nine methods
+        -- actually did the work. (Nine, not ten: 'trackOutput' is gone --
+        -- sink outputs are staged per-evaluation in 'CompMEnv' now, not in
+        -- shared state, so there is nothing left here to instrument for it.)
         msLookupCapResult <- newMethodStats
         msCapEvaluationStarted <- newMethodStats
         msCapEvaluationFinished <- newMethodStats
@@ -307,7 +309,6 @@ setupSimpleStateIf shouldValidate =
         msDequeueNextCap <- newMethodStats
         msStaleQueueSize <- newMethodStats
         msEnqueueStaleCaps <- newMethodStats
-        msTrackOutput <- newMethodStats
         msGetCompSinkOuts <- newMethodStats
         msGetQueue <- newMethodStats
         -- Written out as an explicit record rather than a record update
@@ -320,12 +321,11 @@ setupSimpleStateIf shouldValidate =
               CompEngineStateIf
                 { lookupCapResult = \cap -> timeMethod msLookupCapResult (lookupCapResult baseCeif cap)
                 , capEvaluationStarted = \cap -> timeMethod msCapEvaluationStarted (capEvaluationStarted baseCeif cap)
-                , capEvaluationFinished = \cap deps mres -> timeMethod msCapEvaluationFinished (capEvaluationFinished baseCeif cap deps mres)
+                , capEvaluationFinished = \cap deps outputs mres -> timeMethod msCapEvaluationFinished (capEvaluationFinished baseCeif cap deps outputs mres)
                 , dequeueGivenCap = \cap -> timeMethod msDequeueGivenCap (dequeueGivenCap baseCeif cap)
                 , dequeueNextCap = timeMethod msDequeueNextCap (dequeueNextCap baseCeif)
                 , staleQueueSize = timeMethod msStaleQueueSize (staleQueueSize baseCeif)
                 , enqueueStaleCaps = \deps -> timeMethod msEnqueueStaleCaps (enqueueStaleCaps baseCeif deps)
-                , trackOutput = \cap outs -> timeMethod msTrackOutput (trackOutput baseCeif cap outs)
                 , getCompSinkOuts = \s -> timeMethod msGetCompSinkOuts (getCompSinkOuts baseCeif s)
                 , getQueue = timeMethod msGetQueue (getQueue baseCeif)
                 }
@@ -337,7 +337,6 @@ setupSimpleStateIf shouldValidate =
               , ("dequeueNextCap", msDequeueNextCap)
               , ("staleQueueSize", msStaleQueueSize)
               , ("enqueueStaleCaps", msEnqueueStaleCaps)
-              , ("trackOutput", msTrackOutput)
               , ("getCompSinkOuts", msGetCompSinkOuts)
               , ("getQueue", msGetQueue)
               ]

@@ -387,7 +387,7 @@ doCompAp
 doCompAp gap =
   do
     withCompState $ \sif -> capEvaluationStarted sif gap
-    (deps, res) <- evalCompAp gap
+    (deps, outputs, res) <- evalCompAp gap
     maybeRes <-
       case res of
         CompResultFail msg -> logNote ("Cap " ++ show gap ++ " failed: " ++ msg) >> return Nothing
@@ -397,7 +397,7 @@ doCompAp gap =
             return (Just ok)
     (staleCaps, gcCaps) <-
       withCompState $ \sif ->
-        capEvaluationFinished sif gap deps (fmap cr_returnValue maybeRes)
+        capEvaluationFinished sif gap deps outputs (fmap cr_returnValue maybeRes)
     tellGarbage (maybeRes >> Just (AnyCompAp gap)) gcCaps
     logStale ("Eval of " ++ show gap) staleCaps
     return maybeRes
@@ -406,20 +406,22 @@ evalCompAp
   :: forall a
    . IsCompResult a
   => CompAp a
-  -> CompEngineM (DepSet, CompResult (CompApResult a))
+  -> CompEngineM (DepSet, AnyCompSinkOutsMap, CompResult (CompApResult a))
 evalCompAp outerCap =
   do
     logDebug ("Evaluating " ++ show outerCap)
-    -- Fresh per-cap-evaluation dependency accumulator (see CompMEnv's
-    -- haddock in Types.hs). `env` is threaded explicitly through every
-    -- helper below rather than captured via a Reader in CompEngineM: its
-    -- lifetime is scoped to exactly this one evaluation, and explicit
+    -- Fresh per-cap-evaluation dependency and sink-output accumulators (see
+    -- CompMEnv's haddock in Types.hs). `env` is threaded explicitly through
+    -- every helper below rather than captured via a Reader in CompEngineM:
+    -- its lifetime is scoped to exactly this one evaluation, and explicit
     -- threading makes that scoping visible instead of relying on someone
     -- remembering to reset a Reader-carried ref between nested cap evals.
     depsRef <- liftIO (newIORef [])
-    let env = CompMEnv{cme_compMap = r, cme_deps = depsRef}
+    outputsRef <- liftIO (newIORef mempty)
+    let env = CompMEnv{cme_compMap = r, cme_deps = depsRef, cme_outputs = outputsRef}
     finalResult <- loop env (initCompAp outerCap)
     accumulated <- liftIO (readIORef depsRef)
+    outputs <- liftIO (readIORef outputsRef)
     let !deps = HashSet.fromList accumulated
         !ev = fmap (compApResult outerCap) finalResult
     logDebug
@@ -440,7 +442,7 @@ evalCompAp outerCap =
                 CompResultFail msg -> msg
              )
       )
-    return (deps, ev)
+    return (deps, outputs, ev)
  where
   r =
     case outerCap of
@@ -610,7 +612,7 @@ evalCompAp outerCap =
           let msg = "Refusing to run request for data sink " ++ show sinkId ++ ": " ++ reason
            in pure (emptyAnyCompOutSinksMap, return (Fail msg))
     tellOutputs (AnyCompAp outerCap) outputs
-    withCompState (\sif -> trackOutput sif outerCap outputs)
+    liftIO (modifyIORef' (cme_outputs env) (<> outputs))
     loop env (action >>= contToCompM . cont)
 
   doCompSrcReq
@@ -678,10 +680,11 @@ evalCompAp outerCap =
   doCompSinkReqValue
     :: forall a s
      . CompSink s
-    => TypedCompSinkId s
+    => CompMEnv
+    -> TypedCompSinkId s
     -> CompSinkReq s a
     -> CompEngineM (CompM (Fail a))
-  doCompSinkReqValue sinkId req = do
+  doCompSinkReqValue env sinkId req = do
     let sinkFun sink = do
           (outputs, res) <- liftIO $ compSinkExecute sink req
           return (wrapCompSinkOuts sink outputs, pure res)
@@ -693,7 +696,7 @@ evalCompAp outerCap =
           let msg = "Refusing to run request for data sink " ++ show sinkId ++ ": " ++ reason
            in pure (emptyAnyCompOutSinksMap, return (Fail msg))
     tellOutputs (AnyCompAp outerCap) outputs
-    withCompState (\sif -> trackOutput sif outerCap outputs)
+    liftIO (modifyIORef' (cme_outputs env) (<> outputs))
     pure action
 
   {- | The 'CompReqLeaf' counterpart of 'prepLeaf'\'s other three branches,
@@ -788,16 +791,17 @@ evalCompAp outerCap =
   -}
   prepLeaf
     :: forall r
-     . CompFlowRegistry
+     . CompMEnv
+    -> CompFlowRegistry
     -> IORef [(CompSrcInstIx, SomeSrcGroup)]
     -> CompReqLeaf r
     -> Prep r
-  prepLeaf reg groupsRef leaf =
+  prepLeaf env reg groupsRef leaf =
     case leaf of
       CompLeafEval cap -> Prep (pure (pure <$> doAnyEvalReqValue cap))
       CompLeafCache cap -> Prep (pure (pure <$> doAnyCacheReqValue cap))
       CompLeafSrc sid req -> prepSrcLeaf reg groupsRef sid req
-      CompLeafSink sid req -> Prep (pure (doCompSinkReqValue sid req))
+      CompLeafSink sid req -> Prep (pure (doCompSinkReqValue env sid req))
 
   doSuspended
     :: forall x a
@@ -861,7 +865,7 @@ evalCompAp outerCap =
             -- prepSrcLeaf/getOrCreateGroup); by the time the traversal's IO
             -- layer finishes, every group holds its full, final fetch list.
             groupsRef <- liftIO (newIORef [])
-            enginePhase <- liftIO (unPrep (traverseCompReq (prepLeaf reg groupsRef) req))
+            enginePhase <- liftIO (unPrep (traverseCompReq (prepLeaf env reg groupsRef) req))
             groups <- liftIO (map snd <$> readIORef groupsRef)
             -- Proactively dispatch only the groups that can genuinely
             -- overlap something: FlowConcurrent instances, width > 1, and

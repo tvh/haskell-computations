@@ -331,7 +331,8 @@ test_compMApKeepsLeftErrorMessageOnBothFailure :: IO ()
 test_compMApKeepsLeftErrorMessageOnBothFailure =
   do
     depsRef <- newIORef []
-    let env = CompMEnv{cme_compMap = Map.empty, cme_deps = depsRef}
+    outputsRef <- newIORef mempty
+    let env = CompMEnv{cme_compMap = Map.empty, cme_deps = depsRef, cme_outputs = outputsRef}
         combined = (,) <$> (fail "A failed" :: CompM Int) <*> (fail "B failed" :: CompM Int)
     CompFinished result <- runCompM combined env
     assertEqual (CompResultFail "A failed") result

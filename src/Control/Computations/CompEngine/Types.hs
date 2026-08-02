@@ -235,10 +235,23 @@ instance Eq (CompCacheValue a) where
  caller's. It is scoped to exactly one top-level cap evaluation:
  "Control.Computations.CompEngine.Impl" allocates a fresh one per
  `evalCompAp` call and reads+dedupes it exactly once, at the end.
+
+ 'cme_outputs' is the same idea applied to sink outputs rather than
+ dependencies: every 'Control.Computations.CompEngine.CompSink.CompSink'
+ write a cap's evaluation performs gets unioned into it directly (via
+ 'AnyCompSinkOutsMap's own 'Monoid'), rather than staged in the engine's
+ shared, globally-visible state (as it was before this field existed --
+ see "Control.Computations.CompEngine.SimpleStateIf"'s module haddock on
+ why per-evaluation, single-threaded state belongs here and not there). Read
+ once, at the same point 'cme_deps' is, and handed to
+ 'Control.Computations.CompEngine.Core.capEvaluationFinished' so the state
+ layer can commit exactly the outputs *this* evaluation produced instead of
+ whatever a shared map happens to hold for this cap's key at commit time.
 -}
 data CompMEnv = CompMEnv
   { cme_compMap :: CompMap
   , cme_deps :: IORef [CompEngDep]
+  , cme_outputs :: IORef AnyCompSinkOutsMap
   }
 
 {- | Monad running the body of a computation.

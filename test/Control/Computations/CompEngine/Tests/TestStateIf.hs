@@ -71,18 +71,18 @@ test_capIsNotConsideredStaleAfterItHasBeenDequeuedAsNextCap =
     do
       capEvaluationStarted sif bar1
       capEvaluationStarted sif foo1
-      _ <- capEvaluationFinished sif foo1 (mkExtDeps [("ext", 1)]) jval1
-      _ <- capEvaluationFinished sif bar1 (mkCompDeps [(foo1, jval1)]) jval1
+      _ <- capEvaluationFinished sif foo1 (mkExtDeps [("ext", 1)]) mempty jval1
+      _ <- capEvaluationFinished sif bar1 (mkCompDeps [(foo1, jval1)]) mempty jval1
       -- foo is being recalculated and returns a different result that invalidates bar
       capEvaluationStarted sif foo1
-      _ <- capEvaluationFinished sif foo1 (mkExtDeps [("ext", 2)]) jval2
+      _ <- capEvaluationFinished sif foo1 (mkExtDeps [("ext", 2)]) mempty jval2
       dequeueNextCap sif >>= liftIO . assertEqual (Just (wrapCompAp bar1))
       capEvaluationStarted sif bar1
       -- now bar is being recalculated and dequeues (not stale) foo to evaluate it
       dequeueGivenCap sif foo1 >>= liftIO . assertEqual False
       capEvaluationStarted sif foo1
       -- foo produces a third result but that should not report currently calculated bar as stale
-      (staleCaps, _garbage) <- capEvaluationFinished sif foo1 (mkExtDeps [("ext", 3)]) jval3
+      (staleCaps, _garbage) <- capEvaluationFinished sif foo1 (mkExtDeps [("ext", 3)]) mempty jval3
       liftIO $ assertEqual HashSet.empty staleCaps
 
 test_capIsNotConsideredStaleAfterItHasBeenDequeuedByName :: IO ()
@@ -91,13 +91,13 @@ test_capIsNotConsideredStaleAfterItHasBeenDequeuedByName =
     do
       capEvaluationStarted sif bar1
       capEvaluationStarted sif foo1
-      _ <- capEvaluationFinished sif foo1 (mkExtDeps [("ext", 1)]) jval1
-      _ <- capEvaluationFinished sif bar1 (mkCompDeps [(foo1, jval1)]) jval1
+      _ <- capEvaluationFinished sif foo1 (mkExtDeps [("ext", 1)]) mempty jval1
+      _ <- capEvaluationFinished sif bar1 (mkCompDeps [(foo1, jval1)]) mempty jval1
       -- now bar is being recalculated and dequeues (not stale) foo to evaluate it
       capEvaluationStarted sif bar1
       capEvaluationStarted sif foo1
       -- foo produces a different result that should not report currently calculated bar as stale
-      (staleCaps, _garbage) <- capEvaluationFinished sif foo1 (mkExtDeps [("ext", 2)]) jval2
+      (staleCaps, _garbage) <- capEvaluationFinished sif foo1 (mkExtDeps [("ext", 2)]) mempty jval2
       liftIO $ assertEqual HashSet.empty staleCaps
 
 test_capBecomesStaleDuringComputationBecauseDependencyChanges :: IO ()
@@ -108,21 +108,21 @@ test_capBecomesStaleDuringComputationBecauseDependencyChanges =
       dequeueAndStartCap sif root1 >>= liftIO . assertEqual False
       dequeueAndStartCap sif bar1 >>= liftIO . assertEqual False
       dequeueAndStartCap sif foo1 >>= liftIO . assertEqual False
-      _ <- capEvaluationFinished sif foo1 (mkExtDeps [("ext", 1)]) jval1
-      _ <- capEvaluationFinished sif bar1 (mkCompDeps [(foo1, jval1)]) jval1
-      _ <- capEvaluationFinished sif root1 (mkCompDeps [(foo1, jval1), (bar1, jval1)]) jval1
+      _ <- capEvaluationFinished sif foo1 (mkExtDeps [("ext", 1)]) mempty jval1
+      _ <- capEvaluationFinished sif bar1 (mkCompDeps [(foo1, jval1)]) mempty jval1
+      _ <- capEvaluationFinished sif root1 (mkCompDeps [(foo1, jval1), (bar1, jval1)]) mempty jval1
       -- now root is recalcuated
       dequeueAndStartCap sif root1 >>= liftIO . assertEqual False
       -- ...and first calculates foo1 which returns the same result
       dequeueAndStartCap sif foo1 >>= liftIO . assertEqual False
-      _ <- capEvaluationFinished sif foo1 (mkExtDeps [("ext", 1)]) jval1
+      _ <- capEvaluationFinished sif foo1 (mkExtDeps [("ext", 1)]) mempty jval1
       -- ...now the world changes and when bar1 calculates foo1 it returns a different result
       dequeueAndStartCap sif bar1 >>= liftIO . assertEqual False
       dequeueAndStartCap sif foo1 >>= liftIO . assertEqual False
-      _ <- capEvaluationFinished sif foo1 (mkExtDeps [("ext", 2)]) jval2
+      _ <- capEvaluationFinished sif foo1 (mkExtDeps [("ext", 2)]) mempty jval2
       -- bar1 still returns the same result and doesn't invalidate root by itself
-      _ <- capEvaluationFinished sif bar1 (mkCompDeps [(foo1, jval2)]) jval1
-      _ <- capEvaluationFinished sif root1 (mkCompDeps [(foo1, jval1), (bar1, jval1)]) jval1
+      _ <- capEvaluationFinished sif bar1 (mkCompDeps [(foo1, jval2)]) mempty jval1
+      _ <- capEvaluationFinished sif root1 (mkCompDeps [(foo1, jval1), (bar1, jval1)]) mempty jval1
       -- root now indirectly depends on two versions of foo and thus SHOULD be stale after the run
       dequeueNextCap sif >>= liftIO . assertEqual (Just (wrapCompAp root1))
 
@@ -254,7 +254,7 @@ test_srcIndexInvalidatesOnlyTheMismatchedDependent =
       capEvaluation sif bar2 (mkExtDeps [("ext", 1)]) jval1
       -- bar1 catches up to "ext"@2 via a real re-run; bar2 does not
       dequeueAndStartCap sif bar1 >>= liftIO . assertEqual False
-      _ <- capEvaluationFinished sif bar1 (mkExtDeps [("ext", 2)]) jval1
+      _ <- capEvaluationFinished sif bar1 (mkExtDeps [("ext", 2)]) mempty jval1
       -- a notification for "ext"@2 must now affect only bar2 (still @1)
       affected <- enqueueStaleCaps sif (mkExtDeps [("ext", 2)])
       liftIO $ assertEqual 1 (eqiCapSize affected)
@@ -275,7 +275,7 @@ test_srcIndexReportsGarbageDepWhenLastDependentDrops =
       capEvaluationStarted sif foo1
       -- foo1 re-runs depending on nothing at all -- "ext" now has zero
       -- dependents and must be reported as garbage.
-      (_, garbage) <- capEvaluationFinished sif foo1 noDeps jval2
+      (_, garbage) <- capEvaluationFinished sif foo1 noDeps mempty jval2
       liftIO $ assertEqual (HashSet.fromList [srcKeyOf "ext"]) (garbage_deps garbage)
 
 srcKeyOf :: T.Text -> AnyCompSrcKey
@@ -291,7 +291,7 @@ test_gc =
       enqueueStaleCaps sif (mkExtDeps [("ext", 2)]) >>= liftIO . assertEqual 2 . eqiCapSize
       dequeueAndStartCap sif bar2 >>= liftIO . assertEqual True
       -- bar gets calculated but doesn't depend on bar1 anymore
-      _ <- capEvaluationFinished sif bar2 (mkExtDeps [("ext", 2)]) jval1
+      _ <- capEvaluationFinished sif bar2 (mkExtDeps [("ext", 2)]) mempty jval1
       -- check that (dead) bar1 is not considered stale anymore
       dequeueGivenCap sif bar1 >>= liftIO . assertEqual False
 
@@ -320,13 +320,13 @@ test_modifcationWhileWorkingOnQueue =
             | cap1' == AnyCompAp bar1 = bar1
             | cap1' == AnyCompAp bar2 = bar2
             | otherwise = error ("dequeueNextCap returned unexpected cap: " ++ show cap1')
-      _ <- capEvaluationFinished sif cap1 (mkExtDeps [("ext", 2)]) jval1
+      _ <- capEvaluationFinished sif cap1 (mkExtDeps [("ext", 2)]) mempty jval1
       Just cap2' <- dequeueAndStartNextCap sif
       let cap2
             | cap2' == AnyCompAp bar1 = bar1
             | cap2' == AnyCompAp bar2 = bar2
             | otherwise = error ("dequeueNextCap returned unexpected cap: " ++ show cap2')
-      _ <- capEvaluationFinished sif cap2 (mkExtDeps [("ext", 3)]) jval1
+      _ <- capEvaluationFinished sif cap2 (mkExtDeps [("ext", 3)]) mempty jval1
       -- now the queue is either empty or contains the first cap that became stale by
       -- inserting the second
       nextCap <- dequeueAndStartNextCap sif
@@ -358,20 +358,20 @@ test_olderVersionInsertedLater =
       dequeueAndStartCap sif l1 >>= liftIO . assertEqual False
       -- l1 calls c, c finishes
       dequeueAndStartCap sif c >>= liftIO . assertEqual False
-      _ <- capEvaluationFinished sif c (mkExtDeps [("ext", 1)]) jval1
+      _ <- capEvaluationFinished sif c (mkExtDeps [("ext", 1)]) mempty jval1
       -- l1 finishes
-      _ <- capEvaluationFinished sif l1 (mkCompDeps [(c, jval1)]) jval1
+      _ <- capEvaluationFinished sif l1 (mkCompDeps [(c, jval1)]) mempty jval1
       -- r calls l2
       dequeueAndStartCap sif l2 >>= liftIO . assertEqual False
       -- l2 calls c, c finishes with different result and invalidates l1
       -- this can't invalidate r because r is not in the DepMap because it's still being calculated
       dequeueAndStartCap sif c >>= liftIO . assertEqual False
-      _ <- capEvaluationFinished sif c (mkExtDeps [("ext", 2)]) jval2
+      _ <- capEvaluationFinished sif c (mkExtDeps [("ext", 2)]) mempty jval2
       getStale sif >>= liftIO . assertEqual [capId l1]
       -- l2 finishes
-      _ <- capEvaluationFinished sif l2 (mkCompDeps [(c, jval2)]) jval2
+      _ <- capEvaluationFinished sif l2 (mkCompDeps [(c, jval2)]) mempty jval2
       -- r finishes
-      _ <- capEvaluationFinished sif r (mkCompDeps [(c, jval1), (l1, jval1), (l2, jval2)]) jval1
+      _ <- capEvaluationFinished sif r (mkCompDeps [(c, jval1), (l1, jval1), (l2, jval2)]) mempty jval1
       getStale sif >>= liftIO . assertEqual [capId l1, capId r]
 
       -- now the stale l1 is evaluated
@@ -379,9 +379,9 @@ test_olderVersionInsertedLater =
       dequeueAndStartNextCap sif >>= liftIO . assertEqual (Just (AnyCompAp l1))
       getStale sif >>= liftIO . assertEqual [capId r]
       dequeueAndStartCap sif c >>= liftIO . assertEqual False
-      _ <- capEvaluationFinished sif c (mkExtDeps [("ext", 2)]) jval2
+      _ <- capEvaluationFinished sif c (mkExtDeps [("ext", 2)]) mempty jval2
       -- l1 finishes with new result, this invalidates r
-      _ <- capEvaluationFinished sif l1 (mkCompDeps [(c, jval2)]) jval2
+      _ <- capEvaluationFinished sif l1 (mkCompDeps [(c, jval2)]) mempty jval2
       getStale sif >>= liftIO . assertEqual [capId r]
 
       -- r starts...
@@ -389,23 +389,23 @@ test_olderVersionInsertedLater =
       getStale sif >>= liftIO . assertEqual []
       -- r calls c, c finishes
       dequeueAndStartCap sif c >>= liftIO . assertEqual False
-      _ <- capEvaluationFinished sif c noDeps jval2
+      _ <- capEvaluationFinished sif c noDeps mempty jval2
       -- r calls l1
       dequeueAndStartCap sif l1 >>= liftIO . assertEqual False
       -- l1 calls c, c finishes with same result as before
       dequeueAndStartCap sif c >>= liftIO . assertEqual False
-      _ <- capEvaluationFinished sif c noDeps jval2
+      _ <- capEvaluationFinished sif c noDeps mempty jval2
       -- l1 finishes with the same new result
-      _ <- capEvaluationFinished sif l1 (mkCompDeps [(c, jval2)]) jval2
+      _ <- capEvaluationFinished sif l1 (mkCompDeps [(c, jval2)]) mempty jval2
       -- r calls l2
       dequeueAndStartCap sif l2 >>= liftIO . assertEqual False
       -- l2 calls c, c finishes with same new result
       dequeueAndStartCap sif c >>= liftIO . assertEqual False
-      _ <- capEvaluationFinished sif c noDeps jval2
+      _ <- capEvaluationFinished sif c noDeps mempty jval2
       -- l2 finishes
-      _ <- capEvaluationFinished sif l2 (mkCompDeps [(c, jval2)]) jval2
+      _ <- capEvaluationFinished sif l2 (mkCompDeps [(c, jval2)]) mempty jval2
       -- r finishes
-      _ <- capEvaluationFinished sif r (mkCompDeps [(c, jval2), (l1, jval2), (l2, jval2)]) jval1
+      _ <- capEvaluationFinished sif r (mkCompDeps [(c, jval2), (l1, jval2), (l2, jval2)]) mempty jval1
       getStale sif >>= liftIO . assertEqual []
 
 noDeps :: DepSet
@@ -650,5 +650,5 @@ capEvaluation
 capEvaluation sif cap deps val =
   do
     capEvaluationStarted sif cap
-    _ <- capEvaluationFinished sif cap deps val
+    _ <- capEvaluationFinished sif cap deps mempty val
     return ()
