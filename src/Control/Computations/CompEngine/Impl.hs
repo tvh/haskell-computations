@@ -37,7 +37,9 @@ import Control.Computations.Utils.Types
 -- EXTERNAL
 ----------------------------------------
 import Control.Concurrent (rtsSupportsBoundThreads)
+import Control.Concurrent.MVar
 import Control.Exception (ErrorCall (..), SomeException, throwIO)
+import qualified Control.Exception
 import Control.Monad
 import Control.Monad.Reader
 -- Strict, not the mtl default (Control.Monad.State re-exports the Lazy
@@ -77,40 +79,79 @@ data CompEngine = CompEngine
   -- (see 'doCompAp'); at 'Nothing' nothing ever reads or extends it.
   }
 
-{- | The engine-wide marker that nested cap evaluation runs under a width
- above 1 -- built once by 'initCompEngine' when
+{- | The IVar promise table for nested cap evaluation, built once by
+ 'initCompEngine' when
  'Control.Computations.CompEngine.CompFlowRegistry.readCompEvalConcurrency'
- reports such a width, and shared (by reference, the same value) across every
- thread the engine ever forks -- see 'CompEngine'\'s 'ce_par'.
+ reports a width above 1, and shared (by reference, the same value) across
+ every thread the engine ever forks -- see 'CompEngine'\'s 'ce_par'.
 
- Empty for now: this commit's only consumer ('doCompAp') just needs to know
- *whether* parallel evaluation is enabled, not any state about it. A later
- parallel-evaluation project gives this its first real payload (an IVar
- promise table, then a permit pool) as each needs somewhere engine-lifetime
- to live -- see 'ParState'\'s call sites once those land for why a field
- that isn't read anywhere yet would be dead weight (@-Wunused-top-binds@
- catches exactly that, and this project's own acceptance bar is a clean
- @-Werror@ build at every commit).
+ 'ps_promises' is filled in by 'claimOrJoin' -- see 'EvalPromise'\/
+ 'SomeEvalPromise' and 'doAnyEvalReqValue'\'s @Just@ branch. No permit pool
+ yet: nothing forks in this commit, so there is nothing to bound the width
+ of -- a later commit adds that field when it starts consuming it (see this
+ type's own history for why a field only ever appears in the commit that
+ reads it, under this repo's @-Wunused-top-binds@\/@-Werror@ gate).
 -}
-data ParState = ParState
+newtype ParState = ParState
+  { ps_promises :: IORef (HashMap AnyCompAp SomeEvalPromise)
+  }
 
-{- | This logical thread of control's in-progress ancestors.
+{- | This logical thread of control's in-progress ancestors, plus a slot for
+ what it is currently blocked waiting on.
 
- Extended by 'doCompAp' every time a cap actually begins evaluating (not on
- a cache hit -- see 'doCompAp'\'s @Just@ branch), and checked *before*
- extending: a cap already present is a direct cycle, reported immediately
- (see 'directCycleMsg') rather than left to recurse to stack exhaustion,
- which is what happens today when 'ce_par' is 'Nothing' (a cold
- self-dependency is indistinguishable from "never evaluated" to
+ 'ec_ancestors' is extended by 'doCompAp' every time a cap actually begins
+ evaluating (not on a cache hit -- see 'doCompAp'\'s @Just@ branch), and
+ checked *before* extending: a cap already present is a direct cycle,
+ reported immediately (see 'directCycleMsg') rather than left to recurse to
+ stack exhaustion, which is what happens today when 'ce_par' is 'Nothing'
+ (a cold self-dependency is indistinguishable from "never evaluated" to
  'Control.Computations.CompEngine.Core.lookupCapResult', which maps both to
  'Control.Computations.CompEngine.Core.CapNotFound'). 'CompAp'\'s own
  identity ('AnyCompAp'\'s 'Eq', keyed on the interned param hash) is exactly
  the identity 'ec_ancestors' compares on, so this catches a cycle on the
- *value*, the same granularity the cache keys on.
+ *value*, the same granularity the cache and the promise table both key on.
+
+ 'ec_awaiting' is written (and cleared in a 'Control.Exception.finally') by
+ a *joiner* immediately around the blocking 'readMVar' in
+ 'doAnyEvalReqValue'\'s @Just@ branch. It is not consulted by any check
+ today -- see that function's haddock for the argument that makes a live
+ consultation unnecessary (the promise table's "claim on start" discipline
+ is what keeps every genuine deadlock a real dependency cycle, catchable by
+ the runtime's own indefinite-block detector) -- it exists so a future
+ diagnostic walking every live 'EvalChain' (e.g. on a
+ 'BlockedIndefinitelyOnMVar') can answer "what was this thread doing"
+ without new bookkeeping.
 -}
-newtype EvalChain = EvalChain
-  { ec_ancestors :: HashSet AnyCompAp
+data EvalChain = EvalChain
+  { ec_ancestors :: !(HashSet AnyCompAp)
+  , ec_awaiting :: !(IORef (Maybe AnyCompAp))
   }
+
+{- | A write-once result cell for one cap's in-flight evaluation, claimed by
+ exactly one caller (the "owner") and read by any number of others (the
+ "joiners") -- see 'doAnyEvalReqValue'\'s @Just@ branch, the only code that
+ creates, fills, or reads one.
+
+ 'ep_cell' holds 'Left' on a synchronous failure (so a joiner rethrows
+ exactly what the owner's evaluation itself threw, the same attribution
+ 'Async.wait' would give a genuine fork) or 'Right' on success, and is
+ filled with 'putMVar' exactly once, by the owner, always -- even on the
+ failure path -- so no joiner can block on it forever. 'ep_chain' records
+ the owner's 'EvalChain' *at the moment it claimed this cap* (before
+ 'doCompAp' extends it further); nothing reads it today (see 'EvalChain'\'s
+ haddock on 'ec_awaiting' for why an active cross-thread check is
+ unnecessary here), it is carried for the same future-diagnostic reason.
+-}
+data EvalPromise a = EvalPromise
+  { ep_cell :: !(MVar (Either SomeException (Maybe (CompApResult a))))
+  , ep_chain :: !EvalChain
+  }
+
+-- | 'EvalPromise' with its result type hidden -- what 'ParState'\'s
+-- 'ps_promises' registry actually stores one of per in-flight 'AnyCompAp',
+-- since different claimants' result types are only known once resolved
+-- back through the 'cast' in 'claimOrJoin'.
+data SomeEvalPromise = forall a. IsCompResult a => SomeEvalPromise (EvalPromise a)
 
 {- | A monotone "who touched this cap last, and how" stamp, one per
  'AnyCompAp', carried alongside a 'GenDel' accumulation so a cap's
@@ -554,6 +595,99 @@ directCycleMsg key chain =
     ++ " -- already mid-evaluation on this thread's chain: "
     ++ show (HashSet.toList (ec_ancestors chain))
 
+{- | Run @act@, turning a __synchronous__ exception into a 'Left' instead of
+ letting it propagate -- the 'CompEngineM' analogue of 'Control.Exception.try'
+ (unlike "Control.Computations.Utils.ConcUtils".'trySync', this does not
+ special-case asynchronous exceptions: see 'doAnyEvalReqValue'\'s owner
+ branch, the only caller, for why a plain 'Control.Exception.try' is
+ sufficient there). On failure the enclosing 'GenDel' is left exactly as it
+ was *before* @act@ ran -- a caught exception means @act@\'s own state
+ changes never really committed (the same "no partial state survives an
+ exception" rule an uncaught exception already enforces at the very top of
+ the engine, e.g. 'stepCompEngine'\'s caller), not that they're replaced with
+ 'mempty'.
+-}
+tryCompEngineM :: CompEngineM a -> CompEngineM (Either SomeException a)
+tryCompEngineM act = CompEngineM $ do
+  s0 <- get
+  ce <- asks id
+  outcome <- lift (lift (Control.Exception.try (runCompEngineM act ce s0)))
+  case outcome of
+    Left e -> pure (Left e)
+    Right (a, s') -> put s' >> pure (Right a)
+
+{- | The outcome of 'claimOrJoin': either this call is the first to reach
+ @cap@ (becomes its "owner", and gets the fresh, still-empty cell to fill)
+ or someone else already claimed it (this call becomes a "joiner", and gets
+ their promise to block on).
+-}
+data EvalClaim a
+  = ClaimOwner !(MVar (Either SomeException (Maybe (CompApResult a))))
+  | ClaimJoiner !(EvalPromise a)
+
+{- | Claim @cap@ in @par@\'s promise table, or discover someone else already
+ has -- one 'atomicModifyIORef'' insert-if-absent, matching this codebase's
+ established idiom for a claim that must not race (compare
+ "Control.Computations.CompEngine.Impl"'s own 'runGroupOnce', or
+ "Utils/DefTable.hs"'s row claims). A fresh, empty 'MVar' is allocated
+ speculatively on every call (unavoidable: the value to insert-if-absent has
+ to exist before the atomic step decides whether it's needed) and simply
+ discarded on the losing path -- one wasted, tiny, unfilled 'MVar' per race
+ lost is a trivial cost next to what it buys: the whole claim is a single
+ lock-free op, not a read-then-maybe-insert two-step that could let two
+ callers both believe they won.
+
+ __This is where "claim on start, never in the collect phase" actually
+ happens__ -- see 'doAnyEvalReqValue'\'s haddock for why that timing is what
+ keeps every wait-for edge a genuine dependency edge.
+-}
+claimOrJoin
+  :: forall a
+   . IsCompResult a
+  => ParState
+  -> CompAp a
+  -> EvalChain
+  -> IO (EvalClaim a)
+claimOrJoin par cap chain = do
+  cell <- newEmptyMVar
+  let key = AnyCompAp cap
+      mine = SomeEvalPromise (EvalPromise cell chain)
+  claimed <-
+    atomicModifyIORef' (ps_promises par) $ \m ->
+      case HashMap.lookup key m of
+        Just existing -> (m, Left existing)
+        Nothing -> (HashMap.insert key mine m, Right cell)
+  case claimed of
+    Right ownCell -> pure (ClaimOwner ownCell)
+    Left (SomeEvalPromise existing) ->
+      -- Cannot fail: 'AnyCompAp'\'s 'Eq' already performs the 'eqT' check
+      -- that a 'HashMap.lookup' hit implies (see "Types.hs"), and
+      -- 'IsCompResult' supplies the 'Typeable' this 'cast' needs -- a key
+      -- match *is* a type match. Handled with a loud 'error' rather than a
+      -- partial pattern match only so a future change breaking that
+      -- invariant fails with a pointed message instead of a bare
+      -- non-exhaustive-patterns crash.
+      case cast existing of
+        Just typed -> pure (ClaimJoiner typed)
+        Nothing ->
+          error
+            ( "claimOrJoin: type mismatch resolving promise for "
+                ++ show key
+                ++ " -- should be impossible, see this function's haddock"
+            )
+
+-- | Remove @key@\'s entry from @par@\'s promise table once its owner has
+-- filled the cell -- the registry only ever needs to answer "is this cap
+-- being evaluated *right now*", not "was it ever", so an entry that
+-- outlived its evaluation would wrongly turn a later, unrelated
+-- re-evaluation of the same cap into a joiner on a stale result. Called
+-- from 'doAnyEvalReqValue'\'s owner branch only *after* 'putMVar' has
+-- already published the result -- a joiner that resolved this promise from
+-- the table before this call can still safely block on its own copy of the
+-- (by-reference) 'MVar' regardless of when the registry entry disappears.
+releaseClaim :: ParState -> AnyCompAp -> IO ()
+releaseClaim par key = atomicModifyIORef' (ps_promises par) (\m -> (HashMap.delete key m, ()))
+
 initCompAp
   :: CompAp a
   -> CompM a
@@ -882,12 +1016,90 @@ evalCompAp outerCap =
   -- leaf's compSrcExecute runs inline or as a queued job -- see its own
   -- haddock.
 
+  {- | The single evaluate-or-look-up site for a cap: every nested eval,
+   suspended CPS ('doAnyEvalReq') or a value prepared for a non-batch
+   'CompReqEval' alike, routes through here -- precisely so a
+   parallel-evaluation project only has to wrap one function to cover both
+   (and, in a later commit, a forked batch leaf too).
+
+   At 'ce_par' = 'Nothing' this is exactly 'evalWithCacheValue False innerCap
+   (doCompAp innerCap)', the whole of what this function used to be. At
+   'Just', every reference to @innerCap@ -- cache hit or miss alike -- goes
+   through the promise table first (see 'claimOrJoin'): the first caller to
+   reach a given cap becomes its "owner" and does the real
+   'evalWithCacheValue' call (so a cache hit is still just a cache hit, only
+   now published to any concurrent joiner too); every other caller for the
+   *same* cap while that's in flight becomes a "joiner" and blocks on the
+   owner's cell instead of re-entering the cache/state-if layer at all.
+
+   __Claim on start, never in the collect phase.__ This function runs
+   exactly when a leaf's 'CompEngineM' action is actually reached (the "run
+   phase", in 'Prep'\'s own terms), never during a batch's IO-layer
+   traversal. If a batch instead claimed every eval leaf up front,
+   @[eval A, eval B]@ where A's body needs B would deadlock with no
+   dependency cycle anywhere in the graph: A would already own itself
+   before it even started, and B's evaluation (needing A) would have no
+   owner to wait on. Claiming only when a thread genuinely begins
+   evaluating keeps every wait-for edge (a joiner blocking on `readMVar`) a
+   real "joiner depends on owner" dependency edge -- so the wait-for graph
+   is always a subgraph of the dependency graph, and __any deadlock is
+   therefore a genuine cycle__, not an artifact of this scheduling choice.
+   That is also why no separate cross-thread cycle detector exists here: a
+   genuine cycle manifests as a set of threads mutually blocked on each
+   other's 'MVar's with no path to being unblocked, which GHC's own
+   indefinite-block detector already turns into a
+   'Control.Exception.BlockedIndefinitelyOnMVar' rather than a silent hang
+   -- 'doCompAp'\'s same-thread 'EvalChain' check (see its haddock) catches
+   the common, single-threaded case immediately and with a precise message;
+   this argument is what makes leaving the rarer cross-thread case to the
+   runtime safe rather than merely convenient.
+
+   No forking happens in this commit -- nothing yet claims a cap
+   concurrently with anything else on the *same* batch, so at width > 1
+   this only changes behaviour when the *same* cap is referenced more than
+   once within one batch's engine-thread phase (still strictly sequential):
+   the second reference finds the first's entry already released (the
+   owner completed synchronously before the second reference's turn came
+   up), so it re-claims and re-evaluates, same count as today. A later
+   commit that forks eval leaves is what turns this into an actual
+   dedup -- see that commit's own test.
+  -}
   doAnyEvalReqValue
     :: forall x
      . IsCompResult x
     => CompAp x
     -> CompEngineM (Maybe (CompApResult x))
-  doAnyEvalReqValue innerCap = evalWithCacheValue False innerCap (doCompAp innerCap)
+  doAnyEvalReqValue innerCap =
+    CompEngineM (asks ce_par) >>= \case
+      Nothing -> plainEval
+      Just par -> doAnyEvalReqValuePar par
+   where
+    plainEval = evalWithCacheValue False innerCap (doCompAp innerCap)
+
+    doAnyEvalReqValuePar :: ParState -> CompEngineM (Maybe (CompApResult x))
+    doAnyEvalReqValuePar par = do
+      chain <- CompEngineM (asks ce_chain)
+      let key = AnyCompAp innerCap
+      claim <- liftIO (claimOrJoin par innerCap chain)
+      case claim of
+        ClaimOwner cell -> do
+          outcome <- tryCompEngineM plainEval
+          liftIO (putMVar cell outcome)
+          liftIO (releaseClaim par key)
+          either (liftIO . throwIO) pure outcome
+        ClaimJoiner promise -> do
+          logDebug
+            ( "doAnyEvalReqValue: joining promise for "
+                ++ show key
+                ++ ", owner claimed it under chain "
+                ++ show (HashSet.toList (ec_ancestors (ep_chain promise)))
+            )
+          liftIO (writeIORef (ec_awaiting chain) (Just key))
+          outcome <-
+            liftIO $
+              readMVar (ep_cell promise)
+                `Control.Exception.finally` writeIORef (ec_awaiting chain) Nothing
+          either (liftIO . throwIO) pure outcome
 
   doAnyCacheReqValue
     :: forall x
@@ -1163,8 +1375,14 @@ initCompEngine :: CompEngineIfs -> IO CompEngine
 initCompEngine compEngineIfs = do
   counter <- newIORef 0
   width <- unCompFlowConcurrency <$> readCompEvalConcurrency (ce_compFlowRegistry compEngineIfs)
-  let mPar = if width <= 1 then Nothing else Just ParState
-      chain = EvalChain{ec_ancestors = HashSet.empty}
+  mPar <-
+    if width <= 1
+      then pure Nothing
+      else do
+        promises <- newIORef HashMap.empty
+        pure (Just (ParState promises))
+  awaitingRoot <- newIORef Nothing
+  let chain = EvalChain{ec_ancestors = HashSet.empty, ec_awaiting = awaitingRoot}
   return (CompEngine compEngineIfs counter mPar chain)
 
 startCompEngine

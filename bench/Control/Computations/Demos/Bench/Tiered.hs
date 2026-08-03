@@ -748,9 +748,18 @@ rerunMutationTarget srcs patientCount n =
   p = fromIntegral ((n * 9973) `mod` patientCount) :: PatId
   subId = fromIntegral (n `div` 5) :: Word32
 
-withTieredFlows :: TieredSrcs -> HashMapFlow -> Int -> CompFlowRegistry -> IO () -> IO ()
-withTieredFlows srcs sink width reg action = do
+-- | @evalWidth@ sets 'setCompEvalConcurrency' -- the *eval*-side width knob
+-- (nested cap evaluation forking, see
+-- "Control.Computations.CompEngine.Impl"'s @ParState@\/@prepEvalLeaf@) --
+-- alongside @width@'s existing 'setCompFlowConcurrency' (the *source*-side
+-- knob this benchmark has always exposed). Both must be set before
+-- 'runCompEngine' starts: the eval knob is read exactly once, by
+-- @initCompEngine@, so setting it any later than this has no effect (see
+-- 'setCompEvalConcurrency'\'s own haddock).
+withTieredFlows :: TieredSrcs -> HashMapFlow -> Int -> Int -> CompFlowRegistry -> IO () -> IO ()
+withTieredFlows srcs sink width evalWidth reg action = do
   setCompFlowConcurrency reg (mkCompFlowConcurrency width)
+  setCompEvalConcurrency reg (mkCompFlowConcurrency evalWidth)
   forM_ (namedSrcs srcs) (registerCompSrc reg . snd)
   registerCompSink reg sink
   action
@@ -867,6 +876,7 @@ tieredBenchMain = do
   jitterEnabled <- readEnvBool "TIERED_BENCH_JITTER" False
   batchingEnabled <- readEnvBool "TIERED_BENCH_BUNDLING" True
   width <- readEnvIntAtLeast 1 "TIERED_BENCH_CONCURRENCY" 1
+  evalWidth <- readEnvIntAtLeast 1 "TIERED_BENCH_EVAL_CONCURRENCY" 1
   let patientCount = scaledPatientCount scale
       wardCount = scaledWardCount scale patientCount
       histogram = depthHistogram wardCount patientCount
@@ -881,12 +891,13 @@ tieredBenchMain = do
   -- Stage 12's grid in docs/benchmark-notes.md was partly (and silently)
   -- run on.
   printf
-    "TIERED_BENCH_SCALE=%.4f TIERED_BENCH_LATENCY_MULT=%.4f TIERED_BENCH_JITTER=%s TIERED_BENCH_BUNDLING=%s TIERED_BENCH_CONCURRENCY=%d capabilities: %d\n"
+    "TIERED_BENCH_SCALE=%.4f TIERED_BENCH_LATENCY_MULT=%.4f TIERED_BENCH_JITTER=%s TIERED_BENCH_BUNDLING=%s TIERED_BENCH_CONCURRENCY=%d TIERED_BENCH_EVAL_CONCURRENCY=%d capabilities: %d\n"
     scale
     latencyMult
     (show jitterEnabled)
     (show batchingEnabled)
     width
+    evalWidth
     caps
   printf
     "patients: %d, wards: %d (avg %.1f patients/ward), target instances (analytic): %d\n"
@@ -917,7 +928,7 @@ tieredBenchMain = do
       ( tieredBenchDriver
           counterRef
           runVar
-          (withTieredFlows srcs sink width)
+          (withTieredFlows srcs sink width evalWidth)
           (wireTieredComps patientCount wardCount)
       )
 
