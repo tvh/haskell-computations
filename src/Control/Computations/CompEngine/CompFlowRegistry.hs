@@ -9,6 +9,8 @@ module Control.Computations.CompEngine.CompFlowRegistry (
   unCompFlowConcurrency,
   setCompFlowConcurrency,
   readCompFlowConcurrency,
+  setCompEvalConcurrency,
+  readCompEvalConcurrency,
   withCompSinkId,
   withTypedCompSinkId,
   withTypedCompSrcId,
@@ -132,6 +134,21 @@ mkCompFlowConcurrency = CompFlowConcurrency . max 1
 data CompFlowRegistry = CompFlowRegistry
   { cfr_state :: TVar RegState
   , cfr_concurrency :: TVar CompFlowConcurrency
+  , cfr_evalConcurrency :: TVar CompFlowConcurrency
+  -- ^ see 'setCompEvalConcurrency' -- a *separate* knob from
+  -- 'cfr_concurrency', deliberately: Stage 12/12a of
+  -- @docs\/benchmark-notes.md@ measured the source-side width knob flat on
+  -- two realistic graph shapes, and sharing one knob between "how many
+  -- source jobs a batch may dispatch" and "how many nested cap evaluations
+  -- the engine may run concurrently" would make any future win on the
+  -- latter unattributable -- a change in the shared number couldn't tell you
+  -- which mechanism actually moved. The two knobs also take effect at
+  -- different times: 'cfr_concurrency' is read fresh every batch (see
+  -- "Control.Computations.CompEngine.Impl"'s @doSuspended@), so a caller can
+  -- change it mid-run and the next batch picks it up immediately;
+  -- 'cfr_evalConcurrency' is read exactly once, by
+  -- "Control.Computations.CompEngine.Impl".'Control.Computations.CompEngine.Impl.initCompEngine',
+  -- at engine start -- see 'readCompEvalConcurrency's haddock for why.
   }
 
 newCompFlowRegistry :: IO CompFlowRegistry
@@ -139,7 +156,8 @@ newCompFlowRegistry = do
   let state = RegState HashMap.empty HashMap.empty firstCompSrcInstIx
   v <- newTVarIO state
   concVar <- newTVarIO (mkCompFlowConcurrency 1)
-  pure (CompFlowRegistry v concVar)
+  evalConcVar <- newTVarIO (mkCompFlowConcurrency 1)
+  pure (CompFlowRegistry v concVar evalConcVar)
 
 {- | Set the width of @reg@'s fixed worker pool for source leaves prepared
  from now on (see 'CompFlowConcurrency'). Takes effect for the next
@@ -167,6 +185,31 @@ setCompFlowConcurrency reg = atomically . writeTVar (cfr_concurrency reg)
 
 readCompFlowConcurrency :: CompFlowRegistry -> IO CompFlowConcurrency
 readCompFlowConcurrency = readTVarIO . cfr_concurrency
+
+{- | Set the width 'Control.Computations.CompEngine.Impl.initCompEngine' will
+ use for @reg@'s nested-eval fork pool (see
+ 'Control.Computations.CompEngine.Impl.ParState') -- the eval-side sibling of
+ 'setCompFlowConcurrency', kept on a genuinely separate 'TVar' rather than
+ sharing 'cfr_concurrency' (see that field's haddock for why).
+
+ __Must be called before the engine that reads @reg@ starts__: unlike
+ 'setCompFlowConcurrency' (read fresh every batch), this is read exactly
+ once, by @initCompEngine@, at engine construction -- a call after that point
+ has no effect on the already-running engine. That's a deliberate,
+ documented difference, not an oversight: the fork pool
+ (@ParState@'s permit 'Control.Concurrent.STM.TVar' and promise registry) is
+ sized and allocated once, at engine start, rather than re-checked on every
+ batch the way source dispatch width is -- the batch-granularity dynamism
+ 'setCompFlowConcurrency' offers has no equivalent cost on the eval side to
+ justify paying for it, since a batch's eval leaves fork against one shared,
+ engine-lifetime pool rather than a per-batch worker count.
+-}
+setCompEvalConcurrency :: CompFlowRegistry -> CompFlowConcurrency -> IO ()
+setCompEvalConcurrency reg = atomically . writeTVar (cfr_evalConcurrency reg)
+
+-- | Read back @reg@'s eval-concurrency width -- see 'setCompEvalConcurrency'.
+readCompEvalConcurrency :: CompFlowRegistry -> IO CompFlowConcurrency
+readCompEvalConcurrency = readTVarIO . cfr_evalConcurrency
 
 withTypedCompSrcId
   :: forall m a s

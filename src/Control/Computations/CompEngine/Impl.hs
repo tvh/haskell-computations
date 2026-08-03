@@ -37,7 +37,7 @@ import Control.Computations.Utils.Types
 -- EXTERNAL
 ----------------------------------------
 import Control.Concurrent (rtsSupportsBoundThreads)
-import Control.Exception (SomeException, throwIO)
+import Control.Exception (ErrorCall (..), SomeException, throwIO)
 import Control.Monad
 import Control.Monad.Reader
 -- Strict, not the mtl default (Control.Monad.State re-exports the Lazy
@@ -47,6 +47,7 @@ import Control.Monad.State.Strict
 import qualified Data.Foldable as F
 import Data.HashMap.Strict (HashMap)
 import qualified Data.HashMap.Strict as HashMap
+import Data.HashSet (HashSet)
 import qualified Data.HashSet as HashSet
 import Data.IORef
 import Data.Map.Strict (Map)
@@ -60,6 +61,55 @@ data CompEngine = CompEngine
   -- ^ see 'CapSeq'\'s haddock -- one monotone counter, shared by every
   -- 'tellGarbage' call for the lifetime of this engine, so stamps compare
   -- correctly across every accumulation window, not just within one.
+  , ce_par :: Maybe ParState
+  -- ^ 'Nothing' unless 'CompFlowRegistry.readCompEvalConcurrency' reported a
+  -- width above 1 at 'initCompEngine' time -- see 'ParState'\'s haddock.
+  -- __Every code path touching this is a @case@ on this pointer, and the
+  -- 'Nothing' branch is always exactly the code that existed before this
+  -- field did.__ That is not a style preference: this project's own
+  -- acceptance bar is that a default (width-1) engine produces bit-identical
+  -- @allocated_bytes@\/@max_live_bytes@ to the unmodified engine, and the
+  -- only way to promise that honestly is for the width-1 path to literally
+  -- be the old code, not a parameterised generalisation of it.
+  , ce_chain :: EvalChain
+  -- ^ this __logical thread of control__\'s in-progress ancestors -- see
+  -- 'EvalChain'. Only ever meaningfully populated when 'ce_par' is 'Just'
+  -- (see 'doCompAp'); at 'Nothing' nothing ever reads or extends it.
+  }
+
+{- | The engine-wide marker that nested cap evaluation runs under a width
+ above 1 -- built once by 'initCompEngine' when
+ 'Control.Computations.CompEngine.CompFlowRegistry.readCompEvalConcurrency'
+ reports such a width, and shared (by reference, the same value) across every
+ thread the engine ever forks -- see 'CompEngine'\'s 'ce_par'.
+
+ Empty for now: this commit's only consumer ('doCompAp') just needs to know
+ *whether* parallel evaluation is enabled, not any state about it. A later
+ parallel-evaluation project gives this its first real payload (an IVar
+ promise table, then a permit pool) as each needs somewhere engine-lifetime
+ to live -- see 'ParState'\'s call sites once those land for why a field
+ that isn't read anywhere yet would be dead weight (@-Wunused-top-binds@
+ catches exactly that, and this project's own acceptance bar is a clean
+ @-Werror@ build at every commit).
+-}
+data ParState = ParState
+
+{- | This logical thread of control's in-progress ancestors.
+
+ Extended by 'doCompAp' every time a cap actually begins evaluating (not on
+ a cache hit -- see 'doCompAp'\'s @Just@ branch), and checked *before*
+ extending: a cap already present is a direct cycle, reported immediately
+ (see 'directCycleMsg') rather than left to recurse to stack exhaustion,
+ which is what happens today when 'ce_par' is 'Nothing' (a cold
+ self-dependency is indistinguishable from "never evaluated" to
+ 'Control.Computations.CompEngine.Core.lookupCapResult', which maps both to
+ 'Control.Computations.CompEngine.Core.CapNotFound'). 'CompAp'\'s own
+ identity ('AnyCompAp'\'s 'Eq', keyed on the interned param hash) is exactly
+ the identity 'ec_ancestors' compares on, so this catches a cycle on the
+ *value*, the same granularity the cache keys on.
+-}
+newtype EvalChain = EvalChain
+  { ec_ancestors :: HashSet AnyCompAp
   }
 
 {- | A monotone "who touched this cap last, and how" stamp, one per
@@ -468,6 +518,42 @@ evalCompEngineM cet env =
     return x
 {-# INLINE evalCompEngineM #-}
 
+----------------------------------------------------------------------------
+-- Parallel-evaluation plumbing: EvalChain scoping, exception-safe wrappers,
+-- and the promise-table claim/join dance. Every one of these is gated on
+-- 'ce_par' by its only callers ('doCompAp', 'doAnyEvalReqValue') -- nothing
+-- here runs at all when 'ce_par' is 'Nothing'.
+----------------------------------------------------------------------------
+
+{- | Run @act@ against @f@'s modification of the current 'CompEngine' (most
+ callers: swap in an extended 'ce_chain'), restoring the ambient environment
+ once @act@ returns -- 'CompEngineM'\'s own analogue of
+ 'Control.Monad.Reader.local', built on 'runCompEngineM'/'CompEngine' rather
+ than a real 'Control.Monad.Reader.MonadReader' instance (this newtype
+ deliberately has none -- see its haddock) so nesting composes correctly:
+ @act@ runs with @f@ applied, and whatever it threads back through 'GenDel'
+ is exactly what the caller's own state becomes next, same as an ordinary
+ monadic bind.
+-}
+localCompEngine :: (CompEngine -> CompEngine) -> CompEngineM a -> CompEngineM a
+localCompEngine f act = CompEngineM $ do
+  s0 <- get
+  ce <- asks f
+  (a, s') <- lift (lift (runCompEngineM act ce s0))
+  put s'
+  pure a
+
+-- | The error 'doCompAp' raises when @key@ is already one of @chain@\'s own
+-- ancestors -- a direct, same-logical-thread cycle. Unordered (a 'HashSet'
+-- has no call order to render), but still names every cap on the chain,
+-- which is enough to diagnose the cycle by hand.
+directCycleMsg :: AnyCompAp -> EvalChain -> String
+directCycleMsg key chain =
+  "doCompAp: direct cycle detected evaluating "
+    ++ show key
+    ++ " -- already mid-evaluation on this thread's chain: "
+    ++ show (HashSet.toList (ec_ancestors chain))
+
 initCompAp
   :: CompAp a
   -> CompM a
@@ -488,27 +574,53 @@ withCompState mkAction =
       lift (lift action)
 {-# INLINE withCompState #-}
 
+{- | Actually run @gap@\'s body (cache lookup/state-if bookkeeping aside --
+ those already happened, or are about to, in whichever caller reached this:
+ 'evalWithCacheValue'\'s cache-miss branch for a nested eval, or 'execAp'
+ directly for a top-level dequeue). This is also the single place that
+ extends 'ce_chain' -- both of those callers reach a real cap evaluation
+ exclusively through here, so scoping the chain at this one entry point
+ covers a top-level dequeue calling back into itself just as much as an
+ ordinary nested cycle (see 'EvalChain'\'s haddock) -- there is no second
+ site that needs its own copy of this check.
+
+ Gated on 'ce_par' being 'Just', per 'CompEngine'\'s own haddock: at
+ 'Nothing' this is 'doCompApBody' with zero extra work, byte for byte what
+ this function was before 'EvalChain' existed.
+-}
 doCompAp
   :: IsCompResult a
   => CompAp a
   -> CompEngineM (Maybe (CompApResult a))
 doCompAp gap =
-  do
-    withCompState $ \sif -> capEvaluationStarted sif gap
-    (deps, outputs, res) <- evalCompAp gap
-    maybeRes <-
-      case res of
-        CompResultFail msg -> logNote ("Cap " ++ show gap ++ " failed: " ++ msg) >> return Nothing
-        CompResultOk ok ->
-          do
-            logDebug ("Cap " ++ show gap ++ " succeeded.")
-            return (Just ok)
-    (staleCaps, gcCaps) <-
-      withCompState $ \sif ->
-        capEvaluationFinished sif gap deps outputs (fmap cr_returnValue maybeRes)
-    tellGarbage (maybeRes >> Just (AnyCompAp gap)) gcCaps
-    logStale ("Eval of " ++ show gap) staleCaps
-    return maybeRes
+  CompEngineM ask >>= \ce ->
+    case ce_par ce of
+      Nothing -> doCompApBody
+      Just _ -> do
+        let chain = ce_chain ce
+            key = AnyCompAp gap
+        when (key `HashSet.member` ec_ancestors chain) $
+          liftIO (throwIO (ErrorCall (directCycleMsg key chain)))
+        let chain' = chain{ec_ancestors = HashSet.insert key (ec_ancestors chain)}
+        localCompEngine (\ce' -> ce'{ce_chain = chain'}) doCompApBody
+ where
+  doCompApBody =
+    do
+      withCompState $ \sif -> capEvaluationStarted sif gap
+      (deps, outputs, res) <- evalCompAp gap
+      maybeRes <-
+        case res of
+          CompResultFail msg -> logNote ("Cap " ++ show gap ++ " failed: " ++ msg) >> return Nothing
+          CompResultOk ok ->
+            do
+              logDebug ("Cap " ++ show gap ++ " succeeded.")
+              return (Just ok)
+      (staleCaps, gcCaps) <-
+        withCompState $ \sif ->
+          capEvaluationFinished sif gap deps outputs (fmap cr_returnValue maybeRes)
+      tellGarbage (maybeRes >> Just (AnyCompAp gap)) gcCaps
+      logStale ("Eval of " ++ show gap) staleCaps
+      return maybeRes
 
 evalCompAp
   :: forall a
@@ -1037,10 +1149,23 @@ evalCompAp outerCap =
 execAp :: AnyCompAp -> CompEngineM ()
 execAp (AnyCompAp cap) = void $ doCompAp cap
 
+{- | Build a fresh 'CompEngine', including reading
+ 'CompFlowRegistry.readCompEvalConcurrency' __exactly once__ to decide
+ 'ce_par' -- see that function's haddock for why a later
+ 'CompFlowRegistry.setCompEvalConcurrency' call has no effect on an
+ already-initialised engine, unlike the source-side width knob. A width of 1
+ (the registry's own default, and every pre-existing caller's behaviour)
+ gives 'Nothing', and every gated code path this project added takes its
+ old, unmodified branch -- see 'CompEngine'\'s own haddock on 'ce_par' for
+ why that is the acceptance bar this function exists to guarantee.
+-}
 initCompEngine :: CompEngineIfs -> IO CompEngine
 initCompEngine compEngineIfs = do
   counter <- newIORef 0
-  return (CompEngine compEngineIfs counter)
+  width <- unCompFlowConcurrency <$> readCompEvalConcurrency (ce_compFlowRegistry compEngineIfs)
+  let mPar = if width <= 1 then Nothing else Just ParState
+      chain = EvalChain{ec_ancestors = HashSet.empty}
+  return (CompEngine compEngineIfs counter mPar chain)
 
 startCompEngine
   :: (F.Foldable t)
