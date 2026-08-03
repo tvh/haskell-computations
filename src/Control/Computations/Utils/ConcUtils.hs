@@ -5,6 +5,8 @@ module Control.Computations.Utils.ConcUtils (
   timeoutFail,
   trySync,
   dispatchJobs,
+  forkTracked,
+  cancelAllTracked,
 ) where
 
 ----------------------------------------
@@ -25,6 +27,7 @@ import Control.Exception
 import Control.Monad.Catch
 import qualified Control.Monad.Catch as Catch
 import Control.Monad.IO.Class
+import Data.Functor (void)
 import Data.IORef
 import qualified System.Timeout as Sys
 
@@ -115,3 +118,38 @@ dispatchJobs width jobs = do
       pop (x : xs) = (xs, Just x)
       worker = atomicModifyIORef' ref pop >>= maybe (pure ()) (\j -> j >> worker)
   Async.replicateConcurrently_ (min width (length jobs)) worker
+
+{- | Fork @action@ onto its own 'Async.Async', appending an existentially
+ result-erased copy of the handle to @pendingRef@ so a caller can guarantee
+ -- via 'cancelAllTracked' -- that every fork it ever started during some
+ dynamic-width unit of work (a batch's eval-leaf forks, in
+ "Control.Computations.CompEngine.Impl"'s @doSuspended@, the only current
+ caller) is accounted for even if the caller never gets around to
+ individually joining it (e.g. an earlier sibling leaf's exception means the
+ run phase never reaches this one at all -- see 'cancelAllTracked').
+
+ The returned handle keeps its real result type @a@, for the caller's own
+ individual 'Control.Concurrent.Async.wait'; only the copy filed into
+ @pendingRef@ is erased to @()@ (via 'Async.Async'\'s own 'Functor'
+ instance, not a new thread or a new action -- @void h@ is the same
+ underlying 'Async.Async' with a different phantom result type), which is
+ all blanket cancellation ever needs to know about it.
+-}
+forkTracked :: IORef [Async.Async ()] -> IO a -> IO (Async.Async a)
+forkTracked pendingRef action = do
+  h <- Async.async action
+  atomicModifyIORef' pendingRef (\hs -> (void h : hs, ()))
+  pure h
+
+{- | Cancel every fork accumulated in @pendingRef@ by 'forkTracked' -- correct
+ whether or not each one was already individually joined:
+ 'Async.cancel' on an 'Async.Async' whose action has already completed (or
+ already been cancelled) is a documented no-op. Meant to run in a 'finally'
+ around a batch's engine-thread phase, so it fires on both the success path
+ (every fork already joined by its own leaf, so this is a no-op sweep) and
+ the exception path (some forks never reached by the run phase at all, so
+ this is what actually tears them down) -- see
+ "Control.Computations.CompEngine.Impl"'s @doSuspended@, the only caller.
+-}
+cancelAllTracked :: IORef [Async.Async ()] -> IO ()
+cancelAllTracked pendingRef = readIORef pendingRef >>= mapM_ Async.cancel

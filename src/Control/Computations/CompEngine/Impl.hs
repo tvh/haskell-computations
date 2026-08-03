@@ -29,7 +29,7 @@ import Control.Computations.CompEngine.CompSink
 import Control.Computations.CompEngine.CompSrc
 import Control.Computations.CompEngine.Core
 import Control.Computations.CompEngine.Types
-import Control.Computations.Utils.ConcUtils (dispatchJobs, trySync)
+import Control.Computations.Utils.ConcUtils (cancelAllTracked, dispatchJobs, forkTracked, trySync)
 import Control.Computations.Utils.Logging
 import Control.Computations.Utils.Types
 
@@ -37,7 +37,9 @@ import Control.Computations.Utils.Types
 -- EXTERNAL
 ----------------------------------------
 import Control.Concurrent (rtsSupportsBoundThreads)
+import qualified Control.Concurrent.Async as Async
 import Control.Concurrent.MVar
+import Control.Concurrent.STM
 import Control.Exception (ErrorCall (..), SomeException, throwIO)
 import qualified Control.Exception
 import Control.Monad
@@ -79,21 +81,27 @@ data CompEngine = CompEngine
   -- (see 'doCompAp'); at 'Nothing' nothing ever reads or extends it.
   }
 
-{- | The IVar promise table for nested cap evaluation, built once by
- 'initCompEngine' when
+{- | A permit pool plus a promise registry for nested cap evaluation, built
+ once by 'initCompEngine' when
  'Control.Computations.CompEngine.CompFlowRegistry.readCompEvalConcurrency'
  reports a width above 1, and shared (by reference, the same value) across
  every thread the engine ever forks -- see 'CompEngine'\'s 'ce_par'.
 
- 'ps_promises' is filled in by 'claimOrJoin' -- see 'EvalPromise'\/
- 'SomeEvalPromise' and 'doAnyEvalReqValue'\'s @Just@ branch. No permit pool
- yet: nothing forks in this commit, so there is nothing to bound the width
- of -- a later commit adds that field when it starts consuming it (see this
- type's own history for why a field only ever appears in the commit that
- reads it, under this repo's @-Wunused-top-binds@\/@-Werror@ gate).
+ * 'ps_promises' is filled in by 'claimOrJoin' -- see 'EvalPromise'\/
+   'SomeEvalPromise' and 'doAnyEvalReqValue'\'s @Just@ branch.
+ * 'ps_permits' is a counting permit pool of size @width - 1@ (the batch's
+   own calling thread always keeps at least one leaf's work for itself --
+   see 'prepEvalLeaf'), decremented by a successful 'tryAcquirePermit' and
+   incremented back by 'releasePermit' once the forked leaf's
+   'Async.Async' has been joined, whatever the outcome.
+ * 'ps_width' is the raw width, kept alongside the derived permit count
+   purely so a diagnostic doesn't have to reconstruct it from
+   @width - 1@ backwards.
 -}
-newtype ParState = ParState
-  { ps_promises :: IORef (HashMap AnyCompAp SomeEvalPromise)
+data ParState = ParState
+  { ps_promises :: !(IORef (HashMap AnyCompAp SomeEvalPromise))
+  , ps_permits :: !(TVar Int)
+  , ps_width :: !Int
   }
 
 {- | This logical thread of control's in-progress ancestors, plus a slot for
@@ -110,6 +118,15 @@ newtype ParState = ParState
  identity ('AnyCompAp'\'s 'Eq', keyed on the interned param hash) is exactly
  the identity 'ec_ancestors' compares on, so this catches a cycle on the
  *value*, the same granularity the cache and the promise table both key on.
+
+ A __fresh__ 'EvalChain' is built for every forked eval leaf (see
+ 'prepEvalLeaf'): its 'ec_ancestors' seeds from the forking thread's own (the
+ fork is still, logically, a descendant of everything its parent was already
+ evaluating), but it gets its own fresh 'ec_awaiting' -- a real OS/green
+ thread can only ever be blocked on one thing at a time, so that slot is
+ per-thread, not per-nesting-level, and stays the same 'IORef' across every
+ 'doCompAp'-driven descent within one thread (only 'ec_ancestors' changes as
+ the chain grows).
 
  'ec_awaiting' is written (and cleared in a 'Control.Exception.finally') by
  a *joiner* immediately around the blocking 'readMVar' in
@@ -542,6 +559,16 @@ tellOutputs key outputs =
       logFun ("Outputs generated " ++ show outputs)
 {-# INLINE tellOutputs #-}
 
+-- | Merge a forked eval leaf's own 'GenDel' (accumulated on its own thread,
+-- against its own fresh 'runCompEngineM'' state -- see 'prepEvalLeaf') into
+-- the calling thread's, once the fork has been joined. Exactly the
+-- commutative union every other 'GenDel' merge in this module already uses
+-- ('Semigroup GenDel' above) -- see 'CapSeq'\'s haddock for why that union
+-- was made merge-safe specifically to support this.
+mergeGenDel :: GenDel -> CompEngineM ()
+mergeGenDel gd = CompEngineM (modify' (<> gd))
+{-# INLINE mergeGenDel #-}
+
 runCompEngineM :: CompEngineM a -> CompEngine -> GenDel -> IO (a, GenDel)
 runCompEngineM cet ce g = runReaderT (runStateT (unCompEngineM cet) g) ce
 {-# INLINE runCompEngineM #-}
@@ -584,16 +611,21 @@ localCompEngine f act = CompEngineM $ do
   put s'
   pure a
 
--- | The error 'doCompAp' raises when @key@ is already one of @chain@\'s own
--- ancestors -- a direct, same-logical-thread cycle. Unordered (a 'HashSet'
--- has no call order to render), but still names every cap on the chain,
--- which is enough to diagnose the cycle by hand.
-directCycleMsg :: AnyCompAp -> EvalChain -> String
-directCycleMsg key chain =
-  "doCompAp: direct cycle detected evaluating "
-    ++ show key
-    ++ " -- already mid-evaluation on this thread's chain: "
-    ++ show (HashSet.toList (ec_ancestors chain))
+{- | Run @act@, then @cleanup@ unconditionally (success, synchronous failure,
+ or asynchronous cancellation alike) -- the 'CompEngineM' analogue of
+ 'Control.Exception.finally', for the same reason 'localCompEngine' exists:
+ there is no 'Control.Monad.Catch.MonadMask' instance for this newtype, and
+ building one isn't worth it for the two call sites ('prepEvalLeaf' cancelling
+ the batch's still-pending forks and 'doAnyEvalReqValue'\'s joiner clearing
+ 'ec_awaiting') that need this shape.
+-}
+finallyCompEngineM :: CompEngineM a -> IO () -> CompEngineM a
+finallyCompEngineM act cleanup = CompEngineM $ do
+  s0 <- get
+  ce <- asks id
+  (a, s') <- lift (lift (runCompEngineM act ce s0 `Control.Exception.finally` cleanup))
+  put s'
+  pure a
 
 {- | Run @act@, turning a __synchronous__ exception into a 'Left' instead of
  letting it propagate -- the 'CompEngineM' analogue of 'Control.Exception.try'
@@ -615,6 +647,35 @@ tryCompEngineM act = CompEngineM $ do
   case outcome of
     Left e -> pure (Left e)
     Right (a, s') -> put s' >> pure (Right a)
+
+-- | The error 'doCompAp' raises when @key@ is already one of @chain@\'s own
+-- ancestors -- a direct, same-logical-thread cycle. Unordered (a 'HashSet'
+-- has no call order to render), but still names every cap on the chain,
+-- which is enough to diagnose the cycle by hand.
+directCycleMsg :: AnyCompAp -> EvalChain -> String
+directCycleMsg key chain =
+  "doCompAp: direct cycle detected evaluating "
+    ++ show key
+    ++ " -- already mid-evaluation on this thread's chain: "
+    ++ show (HashSet.toList (ec_ancestors chain))
+
+-- | 'True' iff @0 < n@ and a permit was taken (@n - 1@ committed) --
+-- 'STM'\'s own compare-and-swap, no blocking: a caller that loses the race
+-- always falls back to running its work inline (see 'prepEvalLeaf'), never
+-- retries or waits, which is what keeps a permit out of the wait-for graph
+-- entirely (Cilk's work-first principle -- see 'prepEvalLeaf'\'s haddock).
+tryAcquirePermit :: TVar Int -> IO Bool
+tryAcquirePermit permits = atomically $ do
+  n <- readTVar permits
+  if n > 0
+    then writeTVar permits (n - 1) >> pure True
+    else pure False
+
+-- | Give a permit taken by 'tryAcquirePermit' back to the pool -- called
+-- once per successful acquire, unconditionally (success, failure, or
+-- cancellation of the forked leaf that acquired it), from 'prepEvalLeaf'.
+releasePermit :: TVar Int -> IO ()
+releasePermit permits = atomically (modifyTVar' permits (+ 1))
 
 {- | The outcome of 'claimOrJoin': either this call is the first to reach
  @cap@ (becomes its "owner", and gets the fresh, still-empty cell to fill)
@@ -727,16 +788,15 @@ doCompAp
   => CompAp a
   -> CompEngineM (Maybe (CompApResult a))
 doCompAp gap =
-  CompEngineM ask >>= \ce ->
-    case ce_par ce of
-      Nothing -> doCompApBody
-      Just _ -> do
-        let chain = ce_chain ce
-            key = AnyCompAp gap
-        when (key `HashSet.member` ec_ancestors chain) $
-          liftIO (throwIO (ErrorCall (directCycleMsg key chain)))
-        let chain' = chain{ec_ancestors = HashSet.insert key (ec_ancestors chain)}
-        localCompEngine (\ce' -> ce'{ce_chain = chain'}) doCompApBody
+  CompEngineM (asks ce_par) >>= \case
+    Nothing -> doCompApBody
+    Just _ -> do
+      chain <- CompEngineM (asks ce_chain)
+      let key = AnyCompAp gap
+      when (key `HashSet.member` ec_ancestors chain) $
+        liftIO (throwIO (ErrorCall (directCycleMsg key chain)))
+      let chain' = chain{ec_ancestors = HashSet.insert key (ec_ancestors chain)}
+      localCompEngine (\ce -> ce{ce_chain = chain'}) doCompApBody
  where
   doCompApBody =
     do
@@ -1016,11 +1076,11 @@ evalCompAp outerCap =
   -- leaf's compSrcExecute runs inline or as a queued job -- see its own
   -- haddock.
 
-  {- | The single evaluate-or-look-up site for a cap: every nested eval,
-   suspended CPS ('doAnyEvalReq') or a value prepared for a non-batch
-   'CompReqEval' alike, routes through here -- precisely so a
-   parallel-evaluation project only has to wrap one function to cover both
-   (and, in a later commit, a forked batch leaf too).
+  {- | The single evaluate-or-look-up site for a cap: every one of a nested
+   eval's three shapes -- suspended CPS ('doAnyEvalReq'), a forked batch leaf
+   ('prepEvalLeaf'), and a value prepared for a non-batch 'CompReqEval' -- all
+   route through here, precisely so a parallel-evaluation project only has
+   to wrap one function to cover all three.
 
    At 'ce_par' = 'Nothing' this is exactly 'evalWithCacheValue False innerCap
    (doCompAp innerCap)', the whole of what this function used to be. At
@@ -1030,39 +1090,32 @@ evalCompAp outerCap =
    'evalWithCacheValue' call (so a cache hit is still just a cache hit, only
    now published to any concurrent joiner too); every other caller for the
    *same* cap while that's in flight becomes a "joiner" and blocks on the
-   owner's cell instead of re-entering the cache/state-if layer at all.
+   owner's cell instead of re-entering the cache/state-if layer at all -- see
+   'prepEvalLeaf's own note on why this turns a repeated 'hashCaching'
+   reference within one batch from two evaluations into one, now that leaves
+   can actually run concurrently.
 
    __Claim on start, never in the collect phase.__ This function runs
    exactly when a leaf's 'CompEngineM' action is actually reached (the "run
-   phase", in 'Prep'\'s own terms), never during a batch's IO-layer
-   traversal. If a batch instead claimed every eval leaf up front,
-   @[eval A, eval B]@ where A's body needs B would deadlock with no
-   dependency cycle anywhere in the graph: A would already own itself
-   before it even started, and B's evaluation (needing A) would have no
-   owner to wait on. Claiming only when a thread genuinely begins
-   evaluating keeps every wait-for edge (a joiner blocking on `readMVar`) a
-   real "joiner depends on owner" dependency edge -- so the wait-for graph
-   is always a subgraph of the dependency graph, and __any deadlock is
-   therefore a genuine cycle__, not an artifact of this scheduling choice.
-   That is also why no separate cross-thread cycle detector exists here: a
-   genuine cycle manifests as a set of threads mutually blocked on each
-   other's 'MVar's with no path to being unblocked, which GHC's own
-   indefinite-block detector already turns into a
-   'Control.Exception.BlockedIndefinitelyOnMVar' rather than a silent hang
-   -- 'doCompAp'\'s same-thread 'EvalChain' check (see its haddock) catches
-   the common, single-threaded case immediately and with a precise message;
-   this argument is what makes leaving the rarer cross-thread case to the
-   runtime safe rather than merely convenient.
-
-   No forking happens in this commit -- nothing yet claims a cap
-   concurrently with anything else on the *same* batch, so at width > 1
-   this only changes behaviour when the *same* cap is referenced more than
-   once within one batch's engine-thread phase (still strictly sequential):
-   the second reference finds the first's entry already released (the
-   owner completed synchronously before the second reference's turn came
-   up), so it re-claims and re-evaluates, same count as today. A later
-   commit that forks eval leaves is what turns this into an actual
-   dedup -- see that commit's own test.
+   phase", in 'Prep'\'s own terms) -- never during 'prepLeaf'\'s IO-layer
+   traversal, which only *decides* whether to fork (see 'prepEvalLeaf'). If a
+   batch instead claimed every eval leaf up front, @[eval A, eval B]@ where
+   A's body needs B would deadlock with no dependency cycle anywhere in the
+   graph: A would already own itself before it even started, and B's
+   evaluation (needing A) would have no owner to wait on. Claiming only when
+   a thread genuinely begins evaluating keeps every wait-for edge (a joiner
+   blocking on `readMVar`) a real "joiner depends on owner" dependency edge
+   -- so the wait-for graph is always a subgraph of the dependency graph, and
+   __any deadlock is therefore a genuine cycle__, not an artifact of this
+   scheduling choice. That is also why no separate cross-thread cycle
+   detector exists here: a genuine cycle manifests as a set of threads
+   mutually blocked on each other's 'MVar's with no path to being unblocked,
+   which GHC's own indefinite-block detector already turns into a
+   'Control.Exception.BlockedIndefinitelyOnMVar' rather than a silent hang --
+   'doCompAp'\'s same-thread 'EvalChain' check (see its haddock) catches the
+   common, single-threaded case immediately and with a precise message; this
+   argument is what makes leaving the rarer cross-thread case to the runtime
+   safe rather than merely convenient.
   -}
   doAnyEvalReqValue
     :: forall x
@@ -1083,6 +1136,7 @@ evalCompAp outerCap =
       claim <- liftIO (claimOrJoin par innerCap chain)
       case claim of
         ClaimOwner cell -> do
+          logDebug ("doAnyEvalReqValue: claimed " ++ show key ++ " as owner (pool width " ++ show (ps_width par) ++ ")")
           outcome <- tryCompEngineM plainEval
           liftIO (putMVar cell outcome)
           liftIO (releaseClaim par key)
@@ -1217,20 +1271,104 @@ evalCompAp outerCap =
     unTypedCompSrcId sidA == unTypedCompSrcId sidB
   sameSrcInstance _ _ = False
 
+  {- | 'prepLeaf'\'s 'CompLeafEval' branch: the collect-phase decision of
+   whether to fork this leaf's evaluation onto its own thread, mirroring
+   'prepSrcLeaf'\'s own collect\/run split (see 'Prep'\'s haddock) but
+   simpler -- there is no grouping concept for eval leaves, each is its own
+   independent unit of work, so the decision is made (and, on success, acted
+   on) the moment this leaf is reached during 'traverseCompReq'\'s
+   left-to-right IO walk, not deferred to a later trigger the way
+   'runGroupOnce' is.
+
+   __Never forks the batch's first eval leaf__ (tracked via
+   @firstEvalSeenRef@, a plain per-batch flag -- the traversal that calls
+   this is itself sequential IO, so nothing here races another call to this
+   same function): the calling thread always keeps at least one leaf's work
+   for itself, so a single-eval-leaf batch never forks at all -- pure loss
+   for a leaf with no sibling to overlap with. This is also what makes the
+   'doAnyEvalReqValue' dedup real, not theoretical: a batch referencing the
+   same 'hashCaching' cap twice has its first reference stay inline (never
+   forked, so it starts owning immediately) while the second, now eligible
+   to fork, can genuinely begin -- and claim as a joiner -- concurrently
+   with the first still running, rather than always finding the table
+   already empty by its turn.
+
+   __'tryAcquirePermit' only, never block.__ On failure this returns exactly
+   'doAnyEvalReqValue'\'s own un-forked expression -- the serial elision
+   always available, per Cilk's work-first principle: the *space* bound this
+   buys comes from that elision always being there to fall back to, not from
+   work-stealing, and it is also what keeps a permit out of the wait-for
+   graph (see 'doAnyEvalReqValue'\'s haddock on why that graph being a
+   dependency subgraph is what makes a genuine deadlock always a genuine
+   cycle) -- a permit that could block would add an edge with no dependency
+   behind it.
+
+   On success, the forked action runs under
+   "Control.Computations.Utils.ConcUtils".'trySync' (so an asynchronous
+   cancellation -- e.g. this whole batch being torn down because an earlier
+   sibling leaf failed, see 'doSuspended'\'s use of 'finallyCompEngineM' --
+   is rethrown rather than swallowed, letting 'Async.cancel' actually stop
+   this thread instead of leaving it to keep running the cap's body
+   regardless) and a __fresh__ chain (this leaf's own ancestors seeded from
+   the forking thread's, but its own 'ec_awaiting' slot -- see
+   'EvalChain'\'s haddock). The run phase (the returned 'CompEngineM' action)
+   joins it via 'Async.wait', merges whatever 'GenDel' the fork accumulated
+   into its own via 'mergeGenDel' (the commutative-merge machinery
+   'CapSeq'\'s haddock documents, built for exactly this), and rethrows the
+   fork's own exception unchanged on failure -- 'Async.wait'\'s own
+   semantics, so the leftmost failing leaf (composed left to right by
+   'Prep'\'s 'Applicative', same as always) is what a caller sees.
+  -}
+  prepEvalLeaf
+    :: forall x
+     . IsCompResult x
+    => CompEngine
+    -> IORef Bool
+    -> IORef [Async.Async ()]
+    -> CompAp x
+    -> Prep (Maybe (CompApResult x))
+  prepEvalLeaf ce firstEvalSeenRef forksRef cap = Prep $ do
+    seenBefore <- atomicModifyIORef' firstEvalSeenRef (\seen -> (True, seen))
+    let inline = pure <$> doAnyEvalReqValue cap
+    case ce_par ce of
+      Just par | seenBefore && rtsSupportsBoundThreads -> do
+        acquired <- tryAcquirePermit (ps_permits par)
+        if acquired
+          then do
+            awaitingRef <- newIORef Nothing
+            let forkEngine = ce{ce_chain = (ce_chain ce){ec_awaiting = awaitingRef}}
+            asyncHandle <-
+              forkTracked forksRef (trySync (runCompEngineM' (doAnyEvalReqValue cap) forkEngine))
+            pure $ do
+              outcome <-
+                liftIO
+                  ( Async.wait asyncHandle
+                      `Control.Exception.finally` releasePermit (ps_permits par)
+                  )
+              case outcome of
+                Left ex -> liftIO (throwIO ex)
+                Right (mres, genDel) -> mergeGenDel genDel >> pure (pure mres)
+          else pure inline
+      _ -> pure inline
+
   {- | Prepare one leaf of a 'CompReqCombined' batch as a 'Prep' value.
-   'CompLeafSrc' is the only leaf kind that ever joins a 'SrcGroup'; every
+   'CompLeafSrc' is the only leaf kind that ever joins a 'SrcGroup';
+   'CompLeafEval' is the only kind that may fork (see 'prepEvalLeaf'); every
    other kind always runs inline, exactly as before batching existed.
   -}
   prepLeaf
     :: forall r
      . CompMEnv
+    -> CompEngine
     -> CompFlowRegistry
     -> IORef [(CompSrcInstIx, SomeSrcGroup)]
+    -> IORef Bool
+    -> IORef [Async.Async ()]
     -> CompReqLeaf r
     -> Prep r
-  prepLeaf env reg groupsRef leaf =
+  prepLeaf env ce reg groupsRef firstEvalSeenRef forksRef leaf =
     case leaf of
-      CompLeafEval cap -> Prep (pure (pure <$> doAnyEvalReqValue cap))
+      CompLeafEval cap -> prepEvalLeaf ce firstEvalSeenRef forksRef cap
       CompLeafCache cap -> Prep (pure (pure <$> doAnyCacheReqValue cap))
       CompLeafSrc sid req -> prepSrcLeaf reg groupsRef sid req
       CompLeafSink sid req -> Prep (pure (doCompSinkReqValue env sid req))
@@ -1297,7 +1435,17 @@ evalCompAp outerCap =
             -- prepSrcLeaf/getOrCreateGroup); by the time the traversal's IO
             -- layer finishes, every group holds its full, final fetch list.
             groupsRef <- liftIO (newIORef [])
-            enginePhase <- liftIO (unPrep (traverseCompReq (prepLeaf env reg groupsRef) req))
+            -- firstEvalSeenRef/forksRef: per-batch bookkeeping for eval-leaf
+            -- forking (see 'prepEvalLeaf'). @ce@ is fetched once here
+            -- (rather than re-'asks' per leaf) so every forked leaf shares
+            -- the exact same 'ce_par'/'ce_compEngineIfs'/'ce_capSeqCounter'
+            -- by reference, only ever varying 'ce_chain'.
+            firstEvalSeenRef <- liftIO (newIORef False)
+            forksRef <- liftIO (newIORef [])
+            ce <- CompEngineM (asks id)
+            enginePhase <-
+              liftIO
+                (unPrep (traverseCompReq (prepLeaf env ce reg groupsRef firstEvalSeenRef forksRef) req))
             groups <- liftIO (map snd <$> readIORef groupsRef)
             -- Proactively dispatch only the groups that can genuinely
             -- overlap something: FlowConcurrent instances, width > 1, and
@@ -1344,7 +1492,16 @@ evalCompAp outerCap =
                   , sg_conc g == FlowConcurrent
                   ]
             liftIO (dispatchJobs (unCompFlowConcurrency width) jobs)
-            inner <- enginePhase
+            -- Join every eval-leaf fork this batch started before returning,
+            -- including on the exception path -- 'cancelAllTracked' is a
+            -- no-op for any fork already individually joined by its own
+            -- leaf (see 'prepEvalLeaf') and tears down the rest, the same
+            -- guarantee 'Async.withAsync' gives for a *fixed* fork count,
+            -- reconstructed here for a dynamic one. This is also what keeps
+            -- a fork from outliving the batch and racing 'allCompSrcChanges'
+            -- (Impl.hs's own three-reason note above) the same way a
+            -- dispatched source job already can't.
+            inner <- finallyCompEngineM enginePhase (cancelAllTracked forksRef)
             loop env (inner >>= contToCompM . cont)
 
   loop
@@ -1367,9 +1524,10 @@ execAp (AnyCompAp cap) = void $ doCompAp cap
  'CompFlowRegistry.setCompEvalConcurrency' call has no effect on an
  already-initialised engine, unlike the source-side width knob. A width of 1
  (the registry's own default, and every pre-existing caller's behaviour)
- gives 'Nothing', and every gated code path this project added takes its
- old, unmodified branch -- see 'CompEngine'\'s own haddock on 'ce_par' for
- why that is the acceptance bar this function exists to guarantee.
+ gives 'Nothing': no promise table, no permit pool, allocated for nothing,
+ and every gated code path this project added takes its old, unmodified
+ branch -- see 'CompEngine'\'s own haddock on 'ce_par' for why that is the
+ acceptance bar this function exists to guarantee.
 -}
 initCompEngine :: CompEngineIfs -> IO CompEngine
 initCompEngine compEngineIfs = do
@@ -1380,7 +1538,8 @@ initCompEngine compEngineIfs = do
       then pure Nothing
       else do
         promises <- newIORef HashMap.empty
-        pure (Just (ParState promises))
+        permits <- newTVarIO (width - 1)
+        pure (Just (ParState promises permits width))
   awaitingRoot <- newIORef Nothing
   let chain = EvalChain{ec_ancestors = HashSet.empty, ec_awaiting = awaitingRoot}
   return (CompEngine compEngineIfs counter mPar chain)
