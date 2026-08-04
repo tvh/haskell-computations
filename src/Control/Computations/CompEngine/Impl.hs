@@ -943,11 +943,11 @@ evalCompAp outerCap =
     evalWithCache env True innerCap (k . fmap cr_returnValue) (return Nothing)
 
   -- | Re-expressed in terms of 'evalWithCacheValue': by the monad laws,
-  -- @withCapLookup cap f pure (evalWithCapCached cap f pure staleOk)
-  -- capLookup >>= cont@ is the same computation as
-  -- @withCapLookup cap f cont (evalWithCapCached cap f cont staleOk)
-  -- capLookup@ for any @cont@ -- every branch of both either calls @cont@
-  -- (resp. @pure >=> cont@, which is just @cont@) directly, or calls
+  -- @withCapLookup cap f pure dequeued (evalWithCapCached cap f pure staleOk
+  -- dequeued) capLookup >>= cont@ is the same computation as
+  -- @withCapLookup cap f cont dequeued (evalWithCapCached cap f cont staleOk
+  -- dequeued) capLookup@ for any @cont@ -- every branch of both either calls
+  -- @cont@ (resp. @pure >=> cont@, which is just @cont@) directly, or calls
   -- @f >>= cont@ (resp. @(f >>= pure) >>= cont@, which associativity and
   -- the left-identity law collapse to the same @f >>= cont@). So this is
   -- exactly today's code, just with the "evaluate-or-look-up" step and the
@@ -971,6 +971,16 @@ evalCompAp outerCap =
   -- resuming a suspended caller's continuation through 'loop'. This is what
   -- lets a 'CompReqCombined' leaf be prepared as a value (see 'Prep')
   -- rather than as a CPS step.
+  -- | Looks up @cap@ and, in the same state-if round trip, dequeues it from
+  -- the stale queue when the branch reached below calls for that -- see
+  -- 'Control.Computations.CompEngine.Core.lookupCapResultDequeueIfStale's
+  -- haddock for the fused contract and exactly which branches dequeue.
+  -- 'withCapLookup'\/'evalWithCapCached' below used to each make their own
+  -- 'dequeueGivenCap' call once they knew which branch they were in; now
+  -- that decision has already been made (by the same policy, replicated in
+  -- the state layer -- see that haddock again), so both just consume the
+  -- @dequeued@ flag this returns instead of asking the state-if a second
+  -- time.
   evalWithCacheValue
     :: forall x
      . IsCompResult x
@@ -978,33 +988,37 @@ evalCompAp outerCap =
     -> CompAp x
     -> CompEngineM (Maybe (CompApResult x))
     -> CompEngineM (Maybe (CompApResult x))
-  evalWithCacheValue staleOk cap f =
-    withCompState (flip lookupCapResult cap)
-      >>= withCapLookup cap f pure (evalWithCapCached cap f pure staleOk)
+  evalWithCacheValue staleOk cap f = do
+    (capLookup, dequeued) <- withCompState (\sif -> lookupCapResultDequeueIfStale sif staleOk cap)
+    withCapLookup cap f pure dequeued (evalWithCapCached cap f pure staleOk dequeued) capLookup
 
   evalWithCapCached
     :: forall a b
-     . IsCompResult a
-    => CompAp a
+     . CompAp a
     -> CompEngineM (Maybe (CompApResult a))
     -> (Maybe (CompApResult a) -> CompEngineM b)
     -> Bool
+    -> Bool
+    -- ^ whether the state-if lookup (see 'evalWithCacheValue') already
+    -- dequeued @cap@ from the stale queue -- replaces the second
+    -- 'dequeueGivenCap' round trip this branch used to make itself.
+    -- 'CapMetaCached' never consults it: that branch recomputes
+    -- unconditionally either way, and the fused lookup's policy guarantees
+    -- it is 'False' there regardless.
     -> CapResult (CapCached a)
     -> CompEngineM b
-  evalWithCapCached cap f cont staleOk capCached =
+  evalWithCapCached cap f cont staleOk dequeued capCached =
     case capCached of
       CapSuccess (CapValueCached a)
         | staleOk -> cont (Just a)
+        | dequeued ->
+            do
+              logInfo ("Recalculating stale cap now " ++ capName)
+              f >>= cont
         | otherwise ->
-            withCompState (flip dequeueGivenCap cap) >>= \case
-              True ->
-                do
-                  logInfo ("Recalculating stale cap now " ++ capName)
-                  f >>= cont
-              False ->
-                do
-                  logDebug ("Found valid cached result for " ++ capName ++ ".")
-                  cont (Just a)
+            do
+              logDebug ("Found valid cached result for " ++ capName ++ ".")
+              cont (Just a)
       CapSuccess (CapMetaCached _meta) ->
         do
           logDebug $ capName ++ " is not cached. Recalculating..."
@@ -1014,47 +1028,49 @@ evalCompAp outerCap =
             do
               logDebug ("Found failed result for " ++ capName ++ ".")
               cont Nothing
+        | dequeued -> do
+            logInfo ("Recalculating previously failing, stale cap now " ++ capName)
+            f >>= cont
         | otherwise ->
-            withCompState (flip dequeueGivenCap cap) >>= \case
-              True -> do
-                logInfo ("Recalculating previously failing, stale cap now " ++ capName)
-                f >>= cont
-              False ->
-                do
-                  logDebug ("Found valid cached failure for " ++ capName ++ ".")
-                  cont Nothing
+            do
+              logDebug ("Found valid cached failure for " ++ capName ++ ".")
+              cont Nothing
    where
     capName = show cap
 
   withCapLookup
     :: forall a b c
-     . IsCompResult a
-    => CompAp a
+     . CompAp a
     -> CompEngineM (Maybe (CompApResult a))
     -> (Maybe (CompApResult a) -> CompEngineM c)
+    -> Bool
+    -- ^ whether the state-if lookup (see 'evalWithCacheValue') already
+    -- dequeued @cap@ -- always 'True' here in practice (a 'CapNotFound'
+    -- lookup dequeues unconditionally, see that field's haddock), kept as a
+    -- parameter rather than hardcoded so this function still says only what
+    -- it's told, the same as before this fusion.
     -> (b -> CompEngineM c)
     -> CapLookup b
     -> CompEngineM c
-  withCapLookup cap f cont withFound capLookup =
+  withCapLookup cap f cont dequeued withFound capLookup =
     case capLookup of
       CapFound found -> withFound found
       CapNotFound ->
         --  comp was never evaluated or was removed from cache
-        -- NOTE: `f` runs here regardless of what `dequeueGivenCap` reports --
-        -- `isStale` only picks which string the log line below uses. This is
-        -- therefore *not* a mutual-exclusion point: nothing here stops two
-        -- callers from both reaching `f` for the same cap. What actually
-        -- prevents duplicate evaluation is that cap evaluation stays on one
-        -- (the engine) thread; `f`'s result gets recorded in the cache
-        -- before any other cap evaluation on that thread can observe it.
-        withCompState (flip dequeueGivenCap cap) >>= \isStale ->
-          do
-            logDebug
-              ( (if isStale then "Stale " else "Needed ")
-                  ++ show (capId cap)
-                  ++ " not cached.  Evaluating!"
-              )
-            f >>= cont
+        -- NOTE: `f` runs here regardless of `dequeued` -- it only picks
+        -- which string the log line below uses. This is therefore *not* a
+        -- mutual-exclusion point: nothing here stops two callers from both
+        -- reaching `f` for the same cap. What actually prevents duplicate
+        -- evaluation is that cap evaluation stays on one (the engine)
+        -- thread; `f`'s result gets recorded in the cache before any other
+        -- cap evaluation on that thread can observe it.
+        do
+          logDebug
+            ( (if dequeued then "Stale " else "Needed ")
+                ++ show (capId cap)
+                ++ " not cached.  Evaluating!"
+            )
+          f >>= cont
 
   {- | __Locking and why it can't deadlock__: @sinkFun@'s single
    'compSinkExecute' call below runs under @sinkId@'s dedicated lock

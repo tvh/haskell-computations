@@ -324,6 +324,7 @@ mkSimpleCompEngineStateIf
 mkSimpleCompEngineStateIf sif =
   CompEngineStateIf
     { lookupCapResult = lookupCapResultImpl sif
+    , lookupCapResultDequeueIfStale = lookupCapResultDequeueIfStaleImpl sif
     , capEvaluationStarted = capEvaluationStartedImpl sif
     , capEvaluationFinished = capEvaluationFinishedImpl sif
     , dequeueGivenCap = dequeueGivenCapImpl sif
@@ -565,6 +566,24 @@ getDataIfOutputsImpl sif s = withSifState sif $ \st -> liftIO $ do
   unionOuts Nothing set = set
   unionOuts (Just set1) set2 = set1 `HashSet.union` set2
 
+-- | Read a row's cached-result state, without touching the stale queue --
+-- shared by 'lookupCapResultImpl' and 'lookupCapResultDequeueIfStaleImpl' so
+-- the two don't drift on what counts as "cached".
+readCapLookup :: DefTable p a -> DT.RowIdx -> IO (CapLookup (CapResult (CapCached a)))
+readCapLookup dt row = do
+  flags <- DT.readFlags dt row
+  case DT.flagsResultState flags of
+    NoResult -> pure CapNotFound
+    ResultFailure -> pure (CapFound CapFailure)
+    ResultMetaOnly -> do
+      h <- DT.readResultHash dt row
+      pure (CapFound (CapSuccess (CapMetaCached (CompCacheMeta h))))
+    ResultValue -> do
+      h <- DT.readResultHash dt row
+      v <- DT.readValue dt row
+      let ccv = CompCacheValue (Some v) (CompCacheMeta h)
+      pure (CapFound (CapSuccess (CapValueCached (CompApResult v ccv))))
+
 lookupCapResultImpl
   :: forall m a
    . (MonadIO m, IsCompResult a)
@@ -572,40 +591,70 @@ lookupCapResultImpl
   -> CompAp a
   -> m (CapLookup (CapResult (CapCached a)))
 lookupCapResultImpl sif cap = withSifState sif $ \st -> liftIO $
-  withRow st cap $ \_defIdx dt row _fresh -> do
-    flags <- DT.readFlags dt row
-    case DT.flagsResultState flags of
-      NoResult -> pure CapNotFound
-      ResultFailure -> pure (CapFound CapFailure)
-      ResultMetaOnly -> do
-        h <- DT.readResultHash dt row
-        pure (CapFound (CapSuccess (CapMetaCached (CompCacheMeta h))))
-      ResultValue -> do
-        h <- DT.readResultHash dt row
-        v <- DT.readValue dt row
-        let ccv = CompCacheValue (Some v) (CompCacheMeta h)
-        pure (CapFound (CapSuccess (CapValueCached (CompApResult v ccv))))
+  withRow st cap $ \_defIdx dt row _fresh -> readCapLookup dt row
 
 capEvaluationStartedImpl :: (MonadIO m, IsCompResult a) => SimpleStateIf m -> CompAp a -> m ()
 capEvaluationStartedImpl sif cap = withSifState sif $ \st -> liftIO $
   withRow st cap $ \_defIdx dt row _fresh -> DT.setPending dt row True
 
+-- | Remove an already-resolved row from the stale queue if present,
+-- reporting whether anything was actually removed -- the shared tail end of
+-- 'dequeueGivenCapImpl' (which resolves @cap@'s row itself) and
+-- 'lookupCapResultDequeueIfStaleImpl' (which hands in the row its own
+-- 'withRow' call already resolved, rather than resolving it a second time).
+dequeueRowIfPresent :: String -> SifState -> DT.DefIdx -> DT.RowIdx -> IO Bool
+dequeueRowIfPresent capIdStr st defIdx row = do
+  let ref = DT.packRef defIdx row
+  q <- readIORef (sifs_stale st)
+  case Paq.deleteView ref q of
+    Some (_ :!: q') -> do
+      writeIORef (sifs_stale st) q'
+      logDebug
+        ( capIdStr
+            ++ " dequeued, "
+            ++ show (Paq.size q')
+            ++ " stale caps remaining."
+        )
+      pure True
+    None -> pure False
+
 dequeueGivenCapImpl :: (MonadIO m, IsCompResult a) => SimpleStateIf m -> CompAp a -> m Bool
 dequeueGivenCapImpl sif cap = withSifState sif $ \st -> liftIO $
-  withRow st cap $ \defIdx _dt row _fresh -> do
-    let ref = DT.packRef defIdx row
-    q <- readIORef (sifs_stale st)
-    case Paq.deleteView ref q of
-      Some (_ :!: q') -> do
-        writeIORef (sifs_stale st) q'
-        logDebug
-          ( show (capId cap)
-              ++ " dequeued, "
-              ++ show (Paq.size q')
-              ++ " stale caps remaining."
-          )
-        pure True
-      None -> pure False
+  withRow st cap $ \defIdx _dt row _fresh -> dequeueRowIfPresent (show (capId cap)) st defIdx row
+
+{- | The fused implementation behind 'Control.Computations.CompEngine.Core.lookupCapResultDequeueIfStale'
+ -- see that field's haddock for the contract. Resolves @cap@'s row exactly
+ once (one 'withRow' call, inside one 'withSifState' acquisition) and reuses
+ it for both the lookup and, when the policy below calls for it, the
+ dequeue -- where the two-call version paid a second lock acquisition purely
+ to re-resolve the same row it had already found.
+
+ The dequeue policy is a direct transcription of 'dequeueGivenCap'\'s three
+ call sites in "Control.Computations.CompEngine.Impl" (@withCapLookup@\'s
+ 'CapNotFound' branch, and @evalWithCapCached@\'s 'CapValueCached'\/'CapFailure'
+ branches under @not staleOk@) -- see the field's own haddock for why moving
+ exactly this much, and no more, into the state layer is what avoiding the
+ second round trip requires.
+-}
+lookupCapResultDequeueIfStaleImpl
+  :: forall m a
+   . (MonadIO m, IsCompResult a)
+  => SimpleStateIf m
+  -> Bool
+  -> CompAp a
+  -> m (CapLookup (CapResult (CapCached a)), Bool)
+lookupCapResultDequeueIfStaleImpl sif staleOk cap = withSifState sif $ \st -> liftIO $
+  withRow st cap $ \defIdx dt row _fresh -> do
+    result <- readCapLookup dt row
+    let shouldDequeue = case result of
+          CapNotFound -> True
+          CapFound (CapSuccess (CapMetaCached _)) -> False
+          CapFound _ -> not staleOk
+    dequeued <-
+      if shouldDequeue
+        then dequeueRowIfPresent (show (capId cap)) st defIdx row
+        else pure False
+    pure (result, dequeued)
 
 dequeueNextCapImpl :: MonadIO m => SimpleStateIf m -> m (Maybe AnyCompAp)
 dequeueNextCapImpl sif = withSifState sif $ \st -> liftIO $ do

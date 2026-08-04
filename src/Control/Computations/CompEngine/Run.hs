@@ -331,11 +331,16 @@ setupSimpleStateIf shouldValidate =
             baseCeif = mkSimpleCompEngineStateIf stateIf
         -- One 'MethodStats' per 'CompEngineStateIf' field, so
         -- 'ssif_withState's aggregate (which can't tell methods apart, see
-        -- its own haddock) can be broken down by which of the nine methods
-        -- actually did the work. (Nine, not ten: 'trackOutput' is gone --
+        -- its own haddock) can be broken down by which of the ten methods
+        -- actually did the work. (Ten, not eleven: 'trackOutput' is gone --
         -- sink outputs are staged per-evaluation in 'CompMEnv' now, not in
-        -- shared state, so there is nothing left here to instrument for it.)
+        -- shared state, so there is nothing left here to instrument for it.
+        -- 'lookupCapResultDequeueIfStale' is the newest addition, fusing
+        -- what used to be two separate 'lookupCapResult'/'dequeueGivenCap'
+        -- acquisitions on the hot path into one -- see its haddock in
+        -- "Core.hs".)
         msLookupCapResult <- newMethodStats
+        msLookupCapResultDequeueIfStale <- newMethodStats
         msCapEvaluationStarted <- newMethodStats
         msCapEvaluationFinished <- newMethodStats
         msDequeueGivenCap <- newMethodStats
@@ -353,6 +358,7 @@ setupSimpleStateIf shouldValidate =
         let instrumentedCeif =
               CompEngineStateIf
                 { lookupCapResult = \cap -> timeMethod msLookupCapResult (lookupCapResult baseCeif cap)
+                , lookupCapResultDequeueIfStale = \staleOk cap -> timeMethod msLookupCapResultDequeueIfStale (lookupCapResultDequeueIfStale baseCeif staleOk cap)
                 , capEvaluationStarted = \cap -> timeMethod msCapEvaluationStarted (capEvaluationStarted baseCeif cap)
                 , capEvaluationFinished = \cap deps outputs mres -> timeMethod msCapEvaluationFinished (capEvaluationFinished baseCeif cap deps outputs mres)
                 , dequeueGivenCap = \cap -> timeMethod msDequeueGivenCap (dequeueGivenCap baseCeif cap)
@@ -364,6 +370,7 @@ setupSimpleStateIf shouldValidate =
                 }
             methodStatsTable =
               [ ("lookupCapResult", msLookupCapResult)
+              , ("lookupCapResultDequeueIfStale", msLookupCapResultDequeueIfStale)
               , ("capEvaluationStarted", msCapEvaluationStarted)
               , ("capEvaluationFinished", msCapEvaluationFinished)
               , ("dequeueGivenCap", msDequeueGivenCap)

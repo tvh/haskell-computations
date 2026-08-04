@@ -846,6 +846,7 @@ countingStateIf :: IORef Int -> CompEngineStateIf IO -> CompEngineStateIf IO
 countingStateIf ref orig =
   CompEngineStateIf
     { lookupCapResult = lookupCapResult orig
+    , lookupCapResultDequeueIfStale = lookupCapResultDequeueIfStale orig
     , capEvaluationStarted = \cap -> do
         atomicModifyIORef' ref (\n -> (n + 1, ()))
         capEvaluationStarted orig cap

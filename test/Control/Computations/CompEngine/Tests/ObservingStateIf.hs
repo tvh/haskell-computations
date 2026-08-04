@@ -43,6 +43,7 @@ observingStateIf
 observingStateIf onEval orig =
   CompEngineStateIf
     { lookupCapResult = lookupCapResult orig
+    , lookupCapResultDequeueIfStale = lookupCapResultDequeueIfStale orig
     , capEvaluationStarted = \cap -> do
         onEval cap
         capEvaluationStarted orig cap

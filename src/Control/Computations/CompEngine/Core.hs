@@ -99,9 +99,48 @@ data CompEngineStateIf m = CompEngineStateIf
        . IsCompResult a
       => CompAp a
       -> m (CapLookup (CapResult (CapCached a)))
+  , lookupCapResultDequeueIfStale
+      :: forall a
+       . IsCompResult a
+      => Bool
+      -- ^ @staleOk@ -- 'True' iff the caller is happy with a cached result
+      -- even when it's stale (e.g. 'Control.Computations.CompEngine.Types.CompReqCache'),
+      -- so no dequeue should happen at all.
+      -> CompAp a
+      -> m (CapLookup (CapResult (CapCached a)), Bool)
+      -- ^ the lookup, exactly as 'lookupCapResult' would return it, paired
+      -- with whether this call *also* removed @cap@ from the stale queue.
+      --
+      -- Fuses 'lookupCapResult' and 'dequeueGivenCap' into one round trip:
+      -- the stale queue is already the authoritative dirty bit consulted on
+      -- every cache lookup ('dequeueGivenCap' both asks "is this stale" and
+      -- removes it in the same step), so splitting "is this cached" and "is
+      -- it stale" across two separate state-if calls -- two lock
+      -- acquisitions to answer one logical question -- was always
+      -- artificial. See 'Control.Computations.CompEngine.Impl'\'s
+      -- @evalWithCacheValue@, the only caller, for how the pair below is
+      -- used.
+      --
+      -- The dequeue decision replicates 'dequeueGivenCap'\'s call sites in
+      -- @Impl.hs@ exactly (this is the one piece of caller policy pulled
+      -- into the state layer, and only as far as avoiding the second round
+      -- trip requires -- everything else, e.g. what to log or whether to
+      -- recompute, still lives in @Impl.hs@):
+      --
+      --   * a cache miss ('CapNotFound') always dequeues, regardless of
+      --     @staleOk@ -- matching @withCapLookup@\'s unconditional
+      --     'dequeueGivenCap' call today;
+      --   * a metadata-only hit ('CapMetaCached') never dequeues -- it
+      --     recomputes unconditionally either way, so there is nothing to
+      --     ask the queue;
+      --   * any other hit ('CapValueCached' or a cached failure) dequeues
+      --     iff @staleOk@ is 'False'.
   , capEvaluationStarted :: forall a. IsCompResult a => CompAp a -> m ()
   , capEvaluationFinished :: forall a. IsCompResult a => CapEvaluationFinished m a
   , dequeueGivenCap :: forall a. IsCompResult a => CompAp a -> m Bool
+  -- ^ kept standalone (not folded away once 'lookupCapResultDequeueIfStale'
+  -- existed) because "Tests/TestStateIf.hs" drives it directly, as a
+  -- dequeue-only operation with no accompanying lookup.
   , dequeueNextCap :: m (Maybe AnyCompAp)
   , staleQueueSize :: m Int
   , enqueueStaleCaps :: forall t. Foldable t => t CompEngDep -> m EnqueueInfo
