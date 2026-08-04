@@ -137,15 +137,24 @@ newMethodStats :: IO MethodStats
 newMethodStats = MethodStats <$> newIORef 0 <*> newIORef 0
 
 -- | Time one call, bumping @stats@'s counters around it. Unlike the
--- aggregate instrumentation in 'ssif_withState' (which only sees time spent
--- *inside* the 'withMVar' body), this wraps the whole method call as seen
--- from 'Impl.hs' -- lock wait included, not just lock hold -- because that is
--- the only boundary a per-method wrapper *can* sit at without threading a
+-- aggregate instrumentation in 'ssif_withState' (which now separates lock
+-- wait from lock hold -- see its own haddock), this wraps the whole method
+-- call as seen from 'Impl.hs': wait *and* hold together, because that is the
+-- only boundary a per-method wrapper *can* sit at without threading a
 -- method tag down into 'ssif_withState' itself (see this module's own
 -- haddock on why the flag-off path must stay a single baked-in closure, and
 -- "Tests/ObservingStateIf.hs" for the same per-field wrapping shape used
--- here). See 'reportLockStats'\'s haddock for why that makes these numbers
--- not directly comparable to the aggregate hold-time line.
+-- here).
+--
+-- That makes this table's own grand total (see 'printMethodStatsTable')
+-- directly useful under contention, not just a curiosity: __table TOTAL
+-- minus the aggregate's hold time is per-method wait time__, the same
+-- quantity 'ssif_withState's own 'waitNsRef' measures directly, just
+-- decomposed by which method actually waited. The two are not expected to
+-- match exactly (nine extra 'getMonotonicTimeNSec' calls and 'IORef' bumps
+-- here, over and above the aggregate's own three), only to agree closely
+-- enough to cross-check one against the other -- 'printMethodStatsTable'
+-- prints both numbers side by side for exactly that comparison.
 timeMethod :: MethodStats -> IO a -> IO a
 timeMethod stats act = do
   t0 <- getMonotonicTimeNSec
@@ -155,12 +164,17 @@ timeMethod stats act = do
   modifyIORef' (ms_ns stats) (+ (t1 - t0))
   return x
 
--- | Print the ten methods' stats as one table, sorted by total time
+-- | Print the nine methods' stats as one table, sorted by total time
 -- descending, alongside how much of the *instrumented* total (sum of the
--- ten methods' own totals, not the aggregate hold-time line) each accounts
--- for.
-printMethodStatsTable :: [(String, MethodStats)] -> IO ()
-printMethodStatsTable methods = do
+-- nine methods' own totals, not the aggregate hold-time line) each accounts
+-- for. @aggregateHoldS@\/@aggregateWaitS@ are 'ssif_withState's own
+-- directly-measured totals (in seconds), printed alongside the table's own
+-- TOTAL row purely so the "table TOTAL minus aggregate hold is per-method
+-- wait" identity 'timeMethod'\'s haddock describes can be read off directly,
+-- instead of requiring the reader to go compute it by hand from two
+-- separately-printed numbers.
+printMethodStatsTable :: Double -> Double -> [(String, MethodStats)] -> IO ()
+printMethodStatsTable aggregateHoldS aggregateWaitS methods = do
   rows <- forM methods $ \(name, stats) -> do
     calls <- readIORef (ms_calls stats)
     ns <- readIORef (ms_ns stats)
@@ -198,6 +212,12 @@ printMethodStatsTable methods = do
     ("TOTAL" :: String)
     totalCalls
     (fromIntegral totalNs / (1e9 :: Double))
+  let tableTotalS = fromIntegral totalNs / (1e9 :: Double)
+      impliedWaitS = tableTotalS - aggregateHoldS
+  printf
+    "implied per-method wait (table TOTAL - aggregate hold): %.6f s -- directly measured aggregate wait: %.6f s\n"
+    impliedWaitS
+    aggregateWaitS
 
 -- | Print the edge-arena compaction breakdown: one row per (def, arena
 -- kind) pair that has compacted at least once (see 'debugCompactionStats'),
@@ -282,10 +302,22 @@ setupSimpleStateIf shouldValidate =
       then do
         callsRef <- newIORef (0 :: Word64)
         holdNsRef <- newIORef (0 :: Word64)
+        -- Total time every 'ssif_withState' caller spent waiting to acquire
+        -- @lock@ (blocked inside 'withMVar' before its body got to run),
+        -- summed the same way 'holdNsRef' sums time spent *holding* it once
+        -- acquired -- see 'reportLockStats' below for how the two are
+        -- reported and cross-checked against the per-method table.
+        waitNsRef <- newIORef (0 :: Word64)
         let stateIf =
               SimpleStateIf
                 { ssif_withState =
-                    \f ->
+                    \f -> do
+                      -- tWaitStart is taken *before* the MVar is even
+                      -- attempted, so @t0 - tWaitStart@ (below) is genuinely
+                      -- "time spent waiting for the lock" and nothing else
+                      -- -- not, e.g., any time this closure's own caller
+                      -- spent before reaching this point.
+                      tWaitStart <- getMonotonicTimeNSec
                       withMVar lock $ \() -> do
                         t0 <- getMonotonicTimeNSec
                         x <- f st
@@ -293,6 +325,7 @@ setupSimpleStateIf shouldValidate =
                         t1 <- getMonotonicTimeNSec
                         modifyIORef' callsRef (+ 1)
                         modifyIORef' holdNsRef (+ (t1 - t0))
+                        modifyIORef' waitNsRef (+ (t0 - tWaitStart))
                         return x
                 }
             baseCeif = mkSimpleCompEngineStateIf stateIf
@@ -342,33 +375,53 @@ setupSimpleStateIf shouldValidate =
               ]
             -- Reports how long the engine-state lock was actually *held*
             -- (time inside this 'withMVar' body, from just before @f st@ to
-            -- just after @validateSifState@), not how long any caller spent
-            -- *waiting* for it. 'ssif_withState' is only ever called under
-            -- this single 'MVar', one caller at a time, so wait time is
-            -- definitionally zero today ('stepCompEngine' is sequential --
-            -- see this module's own haddock) and hold time is the whole
-            -- story. That stops being true the moment something makes
-            -- concurrent calls into the same 'CompEngineStateIf' (e.g. a
-            -- future parallel-engine-threads project) -- at that point this
-            -- number alone would understate actual lock cost and a wait-time
-            -- counter would need adding alongside it.
+            -- just after @validateSifState@) *and*, separately, how long any
+            -- caller spent *waiting* for it (from just before 'withMVar' is
+            -- even attempted to the moment its body actually starts running
+            -- -- see 'waitNsRef' above).
+            --
+            -- This module's own haddock used to predict this exact moment:
+            -- at width 1, 'ssif_withState' is only ever called under this
+            -- single 'MVar' one caller at a time, so wait time was
+            -- definitionally zero and hold time was the whole story --
+            -- true right up until parallel eval (see
+            -- "Control.Computations.CompEngine.Impl"'s @ce_par@) started
+            -- making genuinely concurrent calls into the same
+            -- 'CompEngineStateIf' from forked eval leaves. 'waitNsRef' is
+            -- what turns "this number alone would understate actual lock
+            -- cost" from a predicted risk into something actually measured,
+            -- without disturbing 'holdNsRef' itself: hold time is still
+            -- computed exactly as before, from the same @t0@/@t1@ pair,
+            -- just with the lock's own wait now recorded alongside it
+            -- instead of being invisible.
             --
             -- The per-method table printed alongside it measures a
             -- *different* quantity (see 'timeMethod's haddock): whole-call
-            -- time (wait + hold) per method, not hold time alone. The two
-            -- numbers are related but not equal, and are not expected to
-            -- match exactly -- only to be in the same ballpark, since on
-            -- this single-writer sequential driver wait time is ~0 and the
-            -- per-method overhead (two extra 'getMonotonicTimeNSec' calls
-            -- and two 'IORef' bumps per call, over and above the aggregate's
-            -- own) is the only structural difference between them.
+            -- time (wait + hold) per method, not hold time alone -- so under
+            -- contention, that table's own TOTAL row minus this function's
+            -- @holdS@ *is* per-method wait time, and 'printMethodStatsTable'
+            -- prints that alongside 'waitS' (this line's own direct
+            -- measurement) as a cross-check between the two. At width 1
+            -- (wait ~= 0) the two numbers are expected to be close to zero
+            -- and to each other; they are not expected to match exactly --
+            -- structurally different instrumentation (three
+            -- 'getMonotonicTimeNSec' calls and three 'IORef' bumps here per
+            -- acquisition, versus two of each per method call there).
             reportLockStats = do
               calls <- readIORef callsRef
               holdNs <- readIORef holdNsRef
+              waitNs <- readIORef waitNsRef
               let holdS = fromIntegral holdNs / (1e9 :: Double)
+                  waitS = fromIntegral waitNs / (1e9 :: Double)
               putStrLn "=== COMP_ENGINE_LOCK_STATS ==="
-              printf "engine-state lock: %d calls, %d ns total hold time (%.6f s)\n" calls holdNs holdS
-              printMethodStatsTable methodStatsTable
+              printf
+                "engine-state lock: %d calls, %d ns total hold time (%.6f s), %d ns total wait time (%.6f s)\n"
+                calls
+                holdNs
+                holdS
+                waitNs
+                waitS
+              printMethodStatsTable holdS waitS methodStatsTable
               debugCompactionStats st >>= printCompactionStatsTable
         return (instrumentedCeif, reportLockStats)
       else do
