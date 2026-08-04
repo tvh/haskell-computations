@@ -59,6 +59,9 @@ import qualified Data.Map.Strict as Map
 import Data.Maybe (isJust)
 import Data.Typeable (Proxy (..), cast)
 import Data.Word (Word64)
+import GHC.Clock (getMonotonicTimeNSec)
+import System.Environment (lookupEnv)
+import Text.Printf (printf)
 
 data CompEngine = CompEngine
   { ce_compEngineIfs :: CompEngineIfs
@@ -80,6 +83,14 @@ data CompEngine = CompEngine
   -- ^ this __logical thread of control__\'s in-progress ancestors -- see
   -- 'EvalChain'. Only ever meaningfully populated when 'ce_par' is 'Just'
   -- (see 'doCompAp'); at 'Nothing' nothing ever reads or extends it.
+  , ce_diag :: Maybe EngineDiag
+  -- ^ 'Nothing' unless @COMP_ENGINE_LOCK_STATS@ was set at 'initCompEngine'
+  -- time -- see 'EngineDiag'\'s haddock. Deliberately independent of
+  -- 'ce_par': the eval-leaf-per-batch histogram (see 'countEvalLeaves') is a
+  -- structural property of the graph, not of forking, and is exactly as
+  -- worth measuring at width 1 (no permit pool at all) as at any other
+  -- width -- so this field is set purely from the env var, never from
+  -- whether 'ce_par' happens to be 'Just'.
   }
 
 {- | A permit pool plus a promise registry for nested cap evaluation, built
@@ -700,6 +711,206 @@ directCycleMsg key chain =
     ++ show key
     ++ " -- already mid-evaluation on this thread's chain: "
     ++ show (HashSet.toList (ec_ancestors chain))
+
+----------------------------------------------------------------------------
+-- Fork\/occupancy\/shape diagnostics -- gated on @COMP_ENGINE_LOCK_STATS@
+-- (see 'CompEngine'\'s 'ce_diag' haddock for why this reuses that flag
+-- rather than adding a second one, and
+-- "Control.Computations.CompEngine.Run"'s @setupSimpleStateIf@ for the
+-- state-if half of the same flag). Answers a different question than that
+-- module's lock-wait\/hold instrumentation does -- "where does the
+-- fork-eligible parallelism actually go", not "how much does the state-if
+-- lock cost" -- but is reported at the same teardown moment (see
+-- 'reportEngineDiag' and 'stopCompEngine') and gated by the same flag, so
+-- there is exactly one on/off switch for "am I paying to measure the
+-- engine".
+----------------------------------------------------------------------------
+
+{- | Time-weighted permit occupancy, folded by 'bumpOccupancy' on every
+ acquire and release. 'os_lastTs'\/'os_integralNs' together let a
+ teardown-time read compute a genuine time-weighted __mean__ (the integral
+ of permits-in-use over elapsed time, divided by elapsed time) rather than
+ a peak -- the per-source concurrency high-water marks
+ ("Demos.Bench.SystemSrc") already show the peak, and this project's own
+ measurement notes found a high-water mark of 16 misleading on its own
+ (reached briefly, not sustained) -- see @docs\/benchmark-notes.md@'s
+ tiered-plateau stage.
+-}
+data OccupancyState = OccupancyState
+  { os_lastTs :: !Word64
+  , os_inUse :: !Int
+  , os_integralNs :: !Word64
+  }
+
+{- | One instance per engine, built by 'initCompEngine' only when
+ @COMP_ENGINE_LOCK_STATS@ is set (see 'ce_diag').
+
+ * 'ed_forkAttempts'\/'ed_forkSuccesses'\/'ed_forkFailures': every call
+   'prepEvalLeaf' makes to 'tryAcquirePermit' bumps @attempts@, then
+   exactly one of @successes@\/@failures@. @failures@ is 'prepEvalLeaf's
+   Cilk-style serial elision (the leaf ran inline instead of forking), not
+   an error -- see that function's own haddock.
+ * 'ed_occupancy': see 'OccupancyState'.
+ * 'ed_depthHist': keyed by 'ec_ancestors'\'s size (the *forking* thread's
+   own chain depth -- the forked child sits one level deeper) at every
+   *successful* fork. A starved attempt never reaches a depth worth
+   recording, since it ran inline instead.
+ * 'ed_leafHist': keyed by a batch's total 'CompReqEval' leaf count (see
+   'countEvalLeaves'), one entry per 'CompReqCombined' batch reaching
+   'doSuspended' -- independent of 'ce_par' entirely, since this is a
+   structural property of the graph, not of forking, and is exactly as
+   interesting at width 1 (see 'CompEngine'\'s 'ce_diag' haddock).
+
+ 'ed_windowStart' fixes the mean-occupancy denominator's start; see
+ 'reportEngineDiag'.
+-}
+data EngineDiag = EngineDiag
+  { ed_windowStart :: !Word64
+  , ed_forkAttempts :: !(IORef Word64)
+  , ed_forkSuccesses :: !(IORef Word64)
+  , ed_forkFailures :: !(IORef Word64)
+  , ed_occupancy :: !(TVar OccupancyState)
+  , ed_depthHist :: !(IORef (Map Int Word64))
+  , ed_leafHist :: !(IORef (Map Int Word64))
+  }
+
+newEngineDiag :: IO EngineDiag
+newEngineDiag = do
+  t0 <- getMonotonicTimeNSec
+  EngineDiag t0
+    <$> newIORef 0
+    <*> newIORef 0
+    <*> newIORef 0
+    <*> newTVarIO (OccupancyState t0 0 0)
+    <*> newIORef Map.empty
+    <*> newIORef Map.empty
+
+{- | Parses @COMP_ENGINE_LOCK_STATS@ exactly as
+ "Control.Computations.CompEngine.Run"'s @setupSimpleStateIf@ does --
+ duplicated, not imported, because this module sits *below* @Run.hs@ in the
+ dependency graph (@Run.hs@ imports @Impl.hs@, not the reverse), the same
+ reason "Demos.Bench.Hospital"\/"Demos.Bench.Tiered"\/"Demos.Bench.Main"
+ each carry their own copy of their counting driver rather than importing
+ one another's.
+-}
+lockStatsEnabled :: IO Bool
+lockStatsEnabled = do
+  mEnv <- lookupEnv "COMP_ENGINE_LOCK_STATS"
+  pure $ case mEnv of
+    Nothing -> False
+    Just "" -> False
+    Just "0" -> False
+    Just _ -> True
+
+-- | Run @act@ against this engine's 'EngineDiag' iff diagnostics are on --
+-- a no-op, and @act@ never even forced, when 'ce_diag' is 'Nothing' (see
+-- 'CompEngine'\'s own haddock on why that field exists independently of
+-- 'ce_par').
+whenDiag :: CompEngine -> (EngineDiag -> IO ()) -> IO ()
+whenDiag ce act = case ce_diag ce of
+  Nothing -> pure ()
+  Just diag -> act diag
+{-# INLINE whenDiag #-}
+
+recordForkAttempt :: EngineDiag -> IO ()
+recordForkAttempt diag = modifyIORef' (ed_forkAttempts diag) (+ 1)
+{-# INLINE recordForkAttempt #-}
+
+recordForkOutcome :: EngineDiag -> Bool -> IO ()
+recordForkOutcome diag True = modifyIORef' (ed_forkSuccesses diag) (+ 1)
+recordForkOutcome diag False = modifyIORef' (ed_forkFailures diag) (+ 1)
+{-# INLINE recordForkOutcome #-}
+
+{- | Fold one occupancy transition (@+1@ on a successful acquire, @-1@ on
+ the matching release, once the forked leaf's 'Async.Async' has been
+ joined -- see 'prepEvalLeaf') into 'ed_occupancy's running integral. The
+ timestamp is read *outside* the 'atomically' block (an 'IO' action cannot
+ run inside one); the transaction itself only does arithmetic on
+ already-read values, so it stays a cheap, always-committing STM step.
+
+ NOTE: @elapsed@ is clamped at 0 rather than left to underflow. Two
+ concurrent callers each capture their own @now@ *before* entering
+ 'atomically'; if caller A's transaction retries after caller B's commits
+ (using a later timestamp as the new @os_lastTs@), A's own, earlier @now@
+ could be smaller than the @lastTs@ it reads on retry. This can only
+ undercount a race's own sliver of elapsed time (nanoseconds, at STM
+ retry rates), never blow up into the huge 'Word64' wraparound an
+ unclamped subtraction would produce -- an acceptable, documented
+ imprecision for a diagnostic, not worth a heavier-weight fix.
+-}
+bumpOccupancy :: EngineDiag -> Int -> IO ()
+bumpOccupancy diag delta = do
+  now <- getMonotonicTimeNSec
+  atomically $ do
+    st <- readTVar (ed_occupancy diag)
+    let lastTs = os_lastTs st
+        inUse = os_inUse st
+        elapsed = if now >= lastTs then now - lastTs else 0
+        integralNs' = os_integralNs st + fromIntegral inUse * elapsed
+    writeTVar (ed_occupancy diag) (OccupancyState now (inUse + delta) integralNs')
+
+recordDepth :: EngineDiag -> Int -> IO ()
+recordDepth diag depth =
+  atomicModifyIORef' (ed_depthHist diag) (\m -> (Map.insertWith (+) depth 1 m, ()))
+
+recordLeafCount :: EngineDiag -> Int -> IO ()
+recordLeafCount diag n =
+  atomicModifyIORef' (ed_leafHist diag) (\m -> (Map.insertWith (+) n 1 m, ()))
+
+-- | Count how many 'CompReqEval' leaves a 'CompReq' tree contains -- a pure
+-- structural walk (no 'IO', no 'Prep') needed only for 'ed_leafHist', so it
+-- costs nothing when diagnostics are off (never called -- 'whenDiag' never
+-- forces its argument in the 'Nothing' case) and nothing beyond the tree's
+-- own size when they are on.
+countEvalLeaves :: forall r. CompReq r -> Int
+countEvalLeaves (CompReqCombined x y) = countEvalLeaves x + countEvalLeaves y
+countEvalLeaves (CompReqEval _) = 1
+countEvalLeaves _ = 0
+
+{- | Print every 'EngineDiag' table, called once at teardown from
+ 'stopCompEngine' -- see that function's haddock for the 'finally' that
+ guarantees this runs even when the engine is torn down by
+ 'Async.cancel' rather than by exhausting its run loop, the same
+ guarantee @docs\/benchmark-notes.md@ relies on for @reportLockStats@. A
+ no-op when @COMP_ENGINE_LOCK_STATS@ was off ('ce_diag' is 'Nothing').
+-}
+reportEngineDiag :: CompEngine -> IO ()
+reportEngineDiag ce = case ce_diag ce of
+  Nothing -> pure ()
+  Just diag -> do
+    attempts <- readIORef (ed_forkAttempts diag)
+    successes <- readIORef (ed_forkSuccesses diag)
+    failures <- readIORef (ed_forkFailures diag)
+    now <- getMonotonicTimeNSec
+    occ <- readTVarIO (ed_occupancy diag)
+    let lastTs = os_lastTs occ
+        finalIntegral =
+          os_integralNs occ + fromIntegral (os_inUse occ) * (if now >= lastTs then now - lastTs else 0)
+        elapsedNs = if now >= ed_windowStart diag then now - ed_windowStart diag else 0
+        meanOccupancy
+          | elapsedNs == 0 = 0
+          | otherwise = fromIntegral finalIntegral / fromIntegral elapsedNs :: Double
+        pct part whole
+          | whole == (0 :: Word64) = 0
+          | otherwise = 100 * fromIntegral part / fromIntegral whole :: Double
+    depthHist <- readIORef (ed_depthHist diag)
+    leafHist <- readIORef (ed_leafHist diag)
+    putStrLn "=== COMP_ENGINE_LOCK_STATS: eval-fork diagnostics ==="
+    printf
+      "fork attempts: %d, successes: %d (%.1f%%), permit-starved failures: %d (%.1f%%)\n"
+      attempts
+      successes
+      (pct successes attempts)
+      failures
+      (pct failures attempts)
+    printf
+      "time-weighted mean permits in use: %.3f (window %.3f s, ending at teardown)\n"
+      meanOccupancy
+      (fromIntegral elapsedNs / (1e9 :: Double))
+    putStrLn "fork-depth histogram (forking thread's ancestor-chain depth -> successful forks):"
+    forM_ (Map.toAscList depthHist) $ \(depth, n) -> printf "  depth %3d: %d\n" depth n
+    putStrLn "eval-leaf-count-per-batch histogram (eval leaves in a CompReqCombined batch -> batch count):"
+    forM_ (Map.toAscList leafHist) $ \(n, batches) -> printf "  %4d eval leaves: %d batches\n" n batches
 
 -- | 'True' iff @0 < n@ and a permit was taken (@n - 1@ committed) --
 -- 'STM'\'s own compare-and-swap, no blocking: a caller that loses the race
@@ -1427,9 +1638,21 @@ evalCompAp outerCap =
     let inline = pure <$> doAnyEvalReqValue cap
     case ce_par ce of
       Just par | seenBefore && rtsSupportsBoundThreads -> do
+        whenDiag ce recordForkAttempt
         acquired <- tryAcquirePermit (ps_permits par)
+        whenDiag ce (\d -> recordForkOutcome d acquired)
         if acquired
           then do
+            -- Depth is the *forking* thread's own chain size (the forked
+            -- child sits one level deeper) -- see 'EngineDiag'\'s haddock.
+            -- Occupancy is bumped here, at the moment the permit is
+            -- actually taken (matching 'tryAcquirePermit' itself, just
+            -- above), and unwound below in the same 'finally' that already
+            -- releases the permit -- one timestamp per acquire, one per
+            -- release, nothing allocated beyond that on this path.
+            whenDiag ce $ \d -> do
+              recordDepth d (HashSet.size (ec_ancestors (ce_chain ce)))
+              bumpOccupancy d 1
             awaitingRef <- newIORef Nothing
             let forkEngine = ce{ce_chain = (ce_chain ce){ec_awaiting = awaitingRef}}
             asyncHandle <-
@@ -1438,7 +1661,9 @@ evalCompAp outerCap =
               outcome <-
                 liftIO
                   ( Async.wait asyncHandle
-                      `Control.Exception.finally` releasePermit (ps_permits par)
+                      `Control.Exception.finally` ( releasePermit (ps_permits par)
+                                                       >> whenDiag ce (\d -> bumpOccupancy d (-1))
+                                                   )
                   )
               case outcome of
                 Left ex -> liftIO (throwIO ex)
@@ -1482,6 +1707,21 @@ evalCompAp outerCap =
       CompReqCache compAp -> doAnyCacheReq env compAp cont
       CompReqCombined reqA reqB -> do
         reg <- CompEngineM (asks (ce_compFlowRegistry . ce_compEngineIfs))
+        -- Fetched here, before the fast-path/general-path fork below, so
+        -- both branches can share it: the fast path needs it only for the
+        -- leaf-count histogram just below (never for forking -- see its own
+        -- comment), the general path for the same reasons it always did
+        -- (see its own comment on 'firstEvalSeenRef'/'forksRef').
+        ce <- CompEngineM (asks id)
+        -- 'req' here is still this whole 'CompReqCombined' node (the case
+        -- match below only destructures it, doesn't shadow it) -- this is
+        -- the single site every batch, fast-path or general, passes through
+        -- exactly once, so counting here counts every batch exactly once,
+        -- fast path included, regardless of 'ce_par' entirely (see
+        -- 'EngineDiag'\'s haddock on why this histogram doesn't gate on
+        -- it). 'countEvalLeaves' is a pure walk and 'whenDiag' never forces
+        -- it when diagnostics are off, so this costs nothing then.
+        liftIO (whenDiag ce (\d -> recordLeafCount d (countEvalLeaves req)))
         width <- liftIO (readCompFlowConcurrency reg)
         if not (isCompReqCombined reqA)
           && not (isCompReqCombined reqB)
@@ -1537,7 +1777,6 @@ evalCompAp outerCap =
             -- by reference, only ever varying 'ce_chain'.
             firstEvalSeenRef <- liftIO (newIORef False)
             forksRef <- liftIO (newIORef [])
-            ce <- CompEngineM (asks id)
             enginePhase <-
               liftIO
                 (unPrep (traverseCompReq (prepLeaf env ce reg groupsRef firstEvalSeenRef forksRef) req))
@@ -1637,7 +1876,11 @@ initCompEngine compEngineIfs = do
         pure (Just (ParState promises permits width))
   awaitingRoot <- newIORef Nothing
   let chain = EvalChain{ec_ancestors = HashSet.empty, ec_awaiting = awaitingRoot}
-  return (CompEngine compEngineIfs counter mPar chain)
+  -- See 'EngineDiag'\'s haddock: read independently of 'width' above, so
+  -- 'ce_diag' is set purely by the env var, never coupled to 'ce_par'.
+  diagOn <- lockStatsEnabled
+  mDiag <- if diagOn then Just <$> newEngineDiag else pure Nothing
+  return (CompEngine compEngineIfs counter mPar chain mDiag)
 
 startCompEngine
   :: (F.Foldable t)
@@ -1696,7 +1939,17 @@ stepCompEngine compEngine g =
             withCompState staleQueueSize
         Nothing -> return (-1)
 
+{- | Logs, then prints this engine's 'EngineDiag' tables (a no-op when
+ @COMP_ENGINE_LOCK_STATS@ was off -- see 'reportEngineDiag'). This
+ module's only caller ("Control.Computations.CompEngine.Run"'s @main@)
+ wraps its call to this function in a 'Control.Exception.finally' around
+ the run loop, so this runs on every teardown path, including
+ 'Control.Concurrent.Async.cancel' -- the same guarantee
+ 'Run.setupSimpleStateIf's @reportLockStats@ already relies on (see its
+ own haddock in "Run.hs"), extended here to cover this function too.
+-}
 stopCompEngine :: CompEngine -> IO ()
-stopCompEngine compEngine =
+stopCompEngine compEngine = do
   flip evalCompEngineM compEngine $
     logNote "CompEngine stopped."
+  reportEngineDiag compEngine

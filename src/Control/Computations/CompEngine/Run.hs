@@ -475,9 +475,16 @@ runCompEngine ceIfs comps rcif startState =
   main ifs =
     do
       ce <- Impl.startCompEngine ifs comps
+      -- 'finally', not a plain sequential call: 'loop' only returns on
+      -- 'NoNextRun', which none of this project's benchmarks ever signal --
+      -- every one of them tears its engine down via
+      -- 'Control.Concurrent.Async.cancel' instead (see 'initStateIf's own
+      -- haddock, which already relies on exactly this guarantee for
+      -- 'reportLockStats'). Without 'finally' here, 'Impl.stopCompEngine'
+      -- -- and the 'Impl.reportEngineDiag' call it now makes internally --
+      -- would silently never run on that path.
       loop ce 1 startState True 0 mempty
-      Impl.stopCompEngine ce
-      return ()
+        `Control.Exception.finally` Impl.stopCompEngine ce
   loop
     :: Impl.CompEngine
     -> Int
