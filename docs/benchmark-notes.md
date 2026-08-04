@@ -2624,3 +2624,215 @@ Wall time improved on both from parallel GC: persist cold 6.5 -> 5.7 s, hospital
 14.5 -> 10.5 s. An earlier `-N` sweep also showed hospital's very short
 live-update phase getting ~4x *worse* (0.0062 -> 0.0268 s), where parallel GC's
 fixed per-collection sync cost dominates.
+
+## Stage 13 — the tiered plateau: measuring where the parallelism goes
+
+The tiered benchmark's cold eval goes 60.5 s at eval-concurrency width 1 to
+18.4 s at width 8, then plateaus (width 16 measures 18.34 s -- statistically
+identical to width 8). Two explanations were already ruled out by
+measurement before this stage: **not permits** (width 16 offers double the
+pool, per-source concurrency high-water marks do reach 16, wall time does
+not move), and **not the state lock** (commit `b47306e` cut lock wait time
+31% with zero wall-time effect, and 5.8 s of aggregate wait across 8
+threads is ~4% of aggregate thread-time). The remaining hypothesis was that
+the constraint is the *shape* of the traversal -- specifically, that most
+batches contain too few eval leaves to fork at all. This stage instruments
+the engine to measure that directly rather than argue it.
+
+### What was instrumented
+
+Four counters, gated behind the existing `COMP_ENGINE_LOCK_STATS` env var
+(read once at `initCompEngine`, exactly like `Run.hs`'s own lock-stats
+flag, so the flag-off path adds no per-call branch beyond a `Maybe` case
+already accepted for `ce_par`) and reported at teardown from
+`Impl.stopCompEngine`, immediately before `Run.hs`'s own
+`reportLockStats` tables print:
+
+1. **Fork attempts/successes/permit-starved failures**, bumped around
+   `prepEvalLeaf`'s existing `tryAcquirePermit` call.
+2. **Time-weighted mean permits in use** -- an integral of occupancy over
+   elapsed time, folded into a running sum on every acquire and release
+   (one `getMonotonicTimeNSec` and one small STM transaction each), not a
+   peak (the per-source high-water marks already show peaks, and this
+   project's own numbers above show why a peak is misleading here).
+3. **Fork-depth histogram**, keyed by the *forking* thread's own
+   `EvalChain` ancestor-chain size (the forked child sits one level
+   deeper), recorded on every successful fork.
+4. **Eval-leaf-count-per-batch histogram**, keyed by a pure structural
+   walk (`countEvalLeaves`) over the `CompReq` tree -- counting
+   `CompReqEval` leaves, not running anything -- recorded once per
+   `CompReqCombined` batch reaching `doSuspended`, *independent of
+   `ce_par` entirely* (unlike the first three, this is a property of the
+   graph, not of forking, and is exactly as interesting at width 1, where
+   no permit pool even exists).
+
+`Impl.stopCompEngine` is now called from `Run.hs`'s `main` via
+`Control.Exception.finally` rather than a bare sequential call, so the
+report is guaranteed to run on every teardown path, including
+`Async.cancel` (every benchmark's own shutdown mechanism) -- the same
+guarantee `reportLockStats` already relies on, extended to cover this new
+report too.
+
+**Cost.** Persist (`allocated_bytes` cold: 22,987,773,984 B, target
+~22,988 MB) and Hospital (4,005.3 B/instance) both reproduce their
+documented baselines exactly with the flag off -- expected, since neither
+benchmark ever calls `setCompEvalConcurrency`, so `ce_par` is `Nothing`
+throughout and every new counter in items 1-3 sits behind that `Just`
+branch regardless of the flag. Item 4 does run at width 1 (it doesn't gate
+on `ce_par`), but `whenDiag` never forces its argument when diagnostics
+are off, so `countEvalLeaves` is never evaluated either. On the tiered
+benchmark itself, flag-on and flag-off runs at width 8 measured 17.944 s
+and 18.308 s respectively -- flag-on was *faster*, i.e. the difference is
+inside this benchmark's own run-to-run noise band, not a measurable cost.
+
+### The four metrics, widths 1/8/16 (`TIERED_BENCH_RERUN_KEYS=0`, default scale, same session)
+
+Batch-call counts (and therefore the leaf histogram) were bit-identical
+across all three widths, confirming metric 4 is structural, not a function
+of concurrency:
+
+| | width 1 | width 8 | width 16 |
+|---|---|---|---|
+| cold eval wall time | 59.220 s | 17.944 s | 18.414 s |
+| fork attempts | 0 | 158,712 | 155,370 |
+| fork successes | 0 | 34,371 (21.7%) | 55,335 (35.6%) |
+| permit-starved failures | 0 | 124,343 (**78.3%**) | 99,939 (**64.3%**) |
+| time-weighted mean permits in use | 0.000 | 4.681 / 7 (66.9%) | 8.296 / 15 (55.3%) |
+| lock wait time (existing metric, for reference) | 0.039 s | 6.380 s | 14.591 s |
+
+Fork-depth histogram, both widths dominated by one depth:
+
+| depth | width 8 | width 16 |
+|---|---|---|
+| 1 | 29 | 53 |
+| 2 | 14 | 26 |
+| 3 | 372 | 332 |
+| 4 | 1,032 | 2,296 |
+| 5 | 180 | 477 |
+| **6** | **32,747** | **52,163** |
+
+Eval-leaf-count-per-batch histogram (identical at every width):
+
+| eval leaves | batches | comp shape |
+|---|---|---|
+| 0 | 105,841 | `vitalComp`/`medOrderComp` -- source-only |
+| 2 | 27,722 | `interactionComp` -- 1 src + 2 evals |
+| 3 | 182 | `labResultComp`-like, source-only |
+| 5 | 9,001 | `vitalWindowComp` -- 1 src + 5 `vitalComp` evals |
+| 12 | 1 | (one-off, cold-start shape) |
+| 45 | 12 | `wardCensusComp`/`wardOccupancyComp`/`wardRiskBoardComp` -- per-ward fan-in, 4 wards x 3 comps |
+| 140 | 180 | (per-patient, unidentified exactly; scales with patient count) |
+| 360 | 3 | `transferCandidatesComp` -- two 180-patient traverses combined |
+| **383** | **181** | **`riskScoreComp` -- 50 `vitalWindowComp` + 180 `labTrendComp` + 153 `interactionComp` evals, one per patient** |
+
+(143,123 of 143,477 total batch calls accounted for; the remainder are
+bare single-request leaves like `admissionComp`'s lone source read, which
+never reach `CompReqCombined` at all and so are outside this histogram by
+construction, not missing data.)
+
+### Cross-check: source-seconds / wall against metric 2
+
+Using this session's own measured per-tier `usleep` costs (vitals 47 us,
+notes 133 us, labs 319 us, adt 636 us, pharmacy 1288 us) against the
+batch-call counts above (identical at every width): total source-seconds =
+(186 * 636) + (54184 * 47) + (32763 * 319) + (30962 * 1288) + (25382 * 133)
+microseconds = **56.37 source-seconds**, matching the 56.4 s figure this
+stage was framed against.
+
+| | width 1 | width 8 | width 16 |
+|---|---|---|---|
+| source-seconds / wall | 0.952x | **3.142x** | **3.062x** |
+| metric 2 (mean permits in use) | 0.000 | 4.681 | 8.296 |
+| metric 2 + 1 (calling thread) | 1.000 | 5.681 | 9.296 |
+
+The two independent measurements corroborate the headline number (~3.1x
+at both width 8 and width 16, confirming the plateau is real and not a
+measurement artifact) but disagree on magnitude: metric 2 implies ~5.7-9.3
+threads doing *something* concurrently on average, well above the ~3.1x
+of that work that is actually latency-bound overlap. The gap widens with
+width (5.7 vs 3.14 at width 8; 9.3 vs 3.06 at width 16) and tracks lock
+wait time growing from 6.4 s to 14.6 s over the same step -- consistent
+with a growing share of *held* permits going to threads contending for the
+state-if lock rather than doing overlapping I/O, on top of (not instead
+of) the fan-out ceiling below. This is a secondary drag, not the primary
+one: it is still a small fraction of aggregate thread-time (14.6 s over
+16 x 18.4 s = 294.6 s of aggregate thread-time is ~5%), the same order of
+magnitude Stage 12's lock investigation already measured and ruled out as
+insufficient on its own.
+
+### Verdict: fork failures are common, and the fan-out ceiling is the answer
+
+**Permit-starved failures are the majority outcome at every width tested**
+(78.3% at width 8, 64.3% at width 16) -- the opposite of "rare," and
+exactly the result flagged in advance as the one that would contradict the
+width-16 result. It doesn't contradict it; it explains it. The
+eval-leaf-count-per-batch histogram shows why: wall time here is dominated
+by pharmacy (39.9 of the 56.4 total source-seconds, 71%), and pharmacy is
+paid almost entirely inside `riskScoreComp`'s 181 per-patient batches --
+each one **383 eval leaves wide**. `prepEvalLeaf` never forks a batch's
+first leaf, so each of those batches offers up to 382 fork attempts, made
+during a fast, non-blocking, strictly sequential IO collect phase (see
+`prepLeaf`/`traverseCompReq`): whichever leaves are visited before the
+shared, engine-global permit pool empties get forked; every leaf visited
+afterward -- for that entire batch's remaining lifetime, since a starved
+attempt never retries -- runs serially, inline, on the one thread that
+owns the batch. A pool of 7 (width 8) or 15 (width 16) against a fan-out
+of 382 forks at most 1.8-3.9% of it concurrently; the rest, however wide
+the pool, is paid serially on one thread. The fork-depth histogram
+confirms this is where nearly every successful fork actually happens too:
+depth 6 -- `riskScoreComp`'s own evaluation depth, one level above its
+`interactionComp`/`vitalWindowComp`/`labTrendComp` children -- accounts
+for 96-97% of all successful forks at both widths measured.
+
+This also explains why doubling the pool (width 8 to 16) barely moves
+wall time (17.944 s to 18.414 s, flat within noise) even though mean
+occupancy nearly doubles (4.681 to 8.296) and successes nearly double
+(34,371 to 55,335): doubling a small slice of a 382-wide fan-out is still
+a small slice, and the *nested* batches competing for the same shared
+pool (`interactionComp`'s own 2-eval-leaf sub-batches, one per pharmacy
+read) inherit the same starvation, since a hot outer batch can and does
+exhaust the pool before any inner batch gets a turn.
+
+The eval-leaf-count-per-batch histogram also shows the milder form of the
+same story structurally, independent of any of this: 93% of all
+`CompReqCombined` batches (133,563 of 143,123) carry 0 or 2 eval leaves --
+trivial or barely-forkable on their own. But those are not the batches
+wall time is spent in; the 181 batches with 383 eval leaves each are, and
+those are exactly the ones the fixed-size global permit pool cannot come
+close to servicing.
+
+### What a fix would have to change
+
+Not the width knob -- this graph's dominant batch already asks for a
+fan-out (382) an order of magnitude past even the widest pool tested
+(15 permits at width 16), so further raising width chases a ceiling that
+recedes at the same rate for any width small enough to be practical.
+Raising it substantially might help *this* graph, but shifts the same
+problem to whatever graph has a still-wider single batch -- it does not
+generalize. Two changes that would: **(a)** let a starved leaf retry once
+a permit frees up later in the *same* batch's run phase, rather than
+permanently falling back to inline the moment its own collect-phase visit
+finds the pool empty -- today's policy only lets the first
+`permits`-many-eligible leaves in traversal order ever get a chance,
+regardless of how long the batch's own run phase (and thus the window
+during which permits free up) actually lasts; **(b)** give each batch (or
+each top-level fork site) its own bounded sub-reservation of the shared
+pool, so one 382-wide batch cannot starve every sibling and nested batch
+competing for the same global `TVar`. Both are policy changes at the
+fork/permit layer, not resource increases -- consistent with this stage's
+own finding that the bottleneck is how forking is *rationed* under a wide
+fan-out, not how many permits exist.
+
+### Disposition
+
+Measurement only, per this investigation's own charter -- no fix applied.
+Instrumentation added: `Control.Computations.CompEngine.Impl`'s
+`EngineDiag` (fork attempts/successes/failures, time-weighted occupancy,
+fork-depth histogram, eval-leaf-per-batch histogram), gated on
+`COMP_ENGINE_LOCK_STATS`, reported at teardown via `stopCompEngine`
+(now guaranteed to run under `Async.cancel` via a `finally` in `Run.hs`'s
+`main`, matching `reportLockStats`'s own guarantee). `stack test --flag
+incremental-computations:werror` -- 158 tests, run twice, both clean;
+`TestCompEvalConcurrency`'s character is unchanged (no flakiness observed
+in either run). `TestCompReqCombined.hs`'s golden ordering trace was not
+touched.
