@@ -56,6 +56,7 @@ import qualified Data.HashSet as HashSet
 import Data.IORef
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
+import Data.Maybe (isJust)
 import Data.Typeable (Proxy (..), cast)
 import Data.Word (Word64)
 
@@ -400,6 +401,16 @@ data SrcGroup s = SrcGroup
   , sg_conc :: FlowConcurrency
   , sg_fetches :: IORef ([SrcFetch s] -> [SrcFetch s])
   , sg_triggered :: IORef Bool
+  , sg_lock :: Option (MVar ())
+  -- ^ 'Some' iff this group's instance actually needs 'runGroupOnce' to
+  -- serialize against a concurrently-forked sibling -- i.e. iff parallel
+  -- eval is enabled *and* @sg_conc@ is 'FlowSerial' -- resolved once, here,
+  -- at group-creation time (see 'getOrCreateGroup'), rather than
+  -- re-checked on every 'runGroupOnce' call: the group is only ever
+  -- triggered once anyway (see 'sg_triggered'), so there is nothing to
+  -- gain from deferring the lookup, and doing it once keeps 'runGroupOnce'
+  -- itself a plain 'SrcGroup' consumer with no registry\/'ce_par' access of
+  -- its own to thread through.
   }
 
 -- | A 'SrcGroup' with its instance type hidden -- what
@@ -429,12 +440,16 @@ data SomeSrcGroup = forall s. CompSrc s => SomeSrcGroup (SrcGroup s)
 getOrCreateGroup
   :: forall s
    . CompSrc s
-  => IORef [(CompSrcInstIx, SomeSrcGroup)]
+  => CompFlowRegistry
+  -> Bool
+  -- ^ whether this engine has parallel eval enabled (@ce_par@ is 'Just') --
+  -- see 'sg_lock'.
+  -> IORef [(CompSrcInstIx, SomeSrcGroup)]
   -> CompSrcInstIx
   -> s
   -> FlowConcurrency
   -> IO (SrcGroup s)
-getOrCreateGroup groupsRef ix src conc = do
+getOrCreateGroup reg parEnabled groupsRef ix src conc = do
   groups <- readIORef groupsRef
   case lookup ix groups of
     Just (SomeSrcGroup g) ->
@@ -450,7 +465,11 @@ getOrCreateGroup groupsRef ix src conc = do
     Nothing -> do
       fetchesRef <- newIORef id
       triggeredRef <- newIORef False
-      let g = SrcGroup src conc fetchesRef triggeredRef
+      lock <-
+        if parEnabled && conc == FlowSerial
+          then Some <$> lookupSrcLock reg ix
+          else pure None
+      let g = SrcGroup src conc fetchesRef triggeredRef lock
       writeIORef groupsRef ((ix, SomeSrcGroup g) : groups)
       pure g
 
@@ -487,16 +506,39 @@ getOrCreateGroup groupsRef ix src conc = do
  written to it, so whichever leaf 'enginePhase' reaches first still gets to
  report it, preserving the leftmost-failing-leaf guarantee at the group
  level too.
+
+ __Locking and why it can't deadlock__: when 'sg_lock' is 'Some' (parallel
+ eval enabled, this instance 'FlowSerial' -- see 'getOrCreateGroup'), the
+ whole 'compSrcExecuteBatch' call below runs under that lock, restoring
+ 'Control.Computations.CompEngine.CompSrc.compSrcConcurrency's documented
+ guarantee ("the engine runs this source's requests one at a time") for a
+ 'FlowSerial' instance even when two different eval leaves, forked onto two
+ different threads by "Control.Computations.CompEngine.Impl"'s
+ @prepEvalLeaf@, each build their own nested batch against it -- exactly
+ the scenario 'FlowSerial'\'s own haddock now has to account for. This
+ can't deadlock: the lock is held only across this one call, during which
+ the holding thread evaluates no cap and joins no promise (@fetches@'
+ callbacks just 'writeIORef' a slot -- see 'prepSrcLeaf'), so it never
+ appears in the promise table's wait-for graph. A thread blocked here is
+ always blocked on another thread doing real, bounded I\/O against the same
+ source instance, never on a thread that is itself waiting on this one --
+ the same "claim on start, only while doing real work" argument
+ 'claimOrJoin'\'s haddock makes for why a genuine deadlock there is always a
+ real dependency cycle.
 -}
 runGroupOnce :: forall s. CompSrc s => SrcGroup s -> IO ()
 runGroupOnce g = do
   alreadyRan <- atomicModifyIORef' (sg_triggered g) (\ran -> (True, ran))
   unless alreadyRan $ do
     fetches <- ($ []) <$> readIORef (sg_fetches g)
-    result <- trySync (compSrcExecuteBatch (sg_src g) fetches)
+    result <- trySync (withGroupLock (sg_lock g) (compSrcExecuteBatch (sg_src g) fetches))
     case result of
       Right () -> pure ()
       Left ex -> forM_ fetches $ \(SrcFetch _ write) -> write (Left ex)
+ where
+  withGroupLock :: Option (MVar ()) -> IO a -> IO a
+  withGroupLock None act = act
+  withGroupLock (Some lock) act = withMVar lock (const act)
 
 {- | Record @g@ as garbage collected while finishing @mKey@\'s evaluation
  (@mKey@ is 'Nothing' when that evaluation failed), and, if @mKey@ is a
@@ -769,6 +811,14 @@ withCompState mkAction =
       lift (lift action)
 {-# INLINE withCompState #-}
 
+-- | Whether this engine has parallel eval enabled ('ce_par' is 'Just') --
+-- the same condition 'getOrCreateGroup' consults for 'sg_lock', reused
+-- here by 'doCompSinkReq'\/'doCompSinkReqValue' so a sink's lock is, like a
+-- source's, never even looked at when nothing could possibly be forking.
+parEnabledM :: CompEngineM Bool
+parEnabledM = CompEngineM (asks (isJust . ce_par))
+{-# INLINE parEnabledM #-}
+
 {- | Actually run @gap@\'s body (cache lookup/state-if bookkeeping aside --
  those already happened, or are about to, in whichever caller reached this:
  'evalWithCacheValue'\'s cache-miss branch for a nested eval, or 'execAp'
@@ -1006,6 +1056,19 @@ evalCompAp outerCap =
               )
             f >>= cont
 
+  {- | __Locking and why it can't deadlock__: @sinkFun@'s single
+   'compSinkExecute' call below runs under @sinkId@'s dedicated lock
+   whenever 'withSinkInstLock' decides one is needed (parallel eval enabled,
+   this sink 'FlowSerial' -- see that function's haddock, which is where the
+   actual deadlock-freedom argument lives: this lock is held only across
+   that one call, during which no cap is evaluated and no promise is
+   joined, so it never enters the promise table's wait-for graph). This is
+   the CPS\/suspended sink path -- reached whenever a comp body's
+   'Control.Computations.CompEngine.Types.compSinkReq' isn't part of a wider
+   'CompReqCombined' batch; 'doCompSinkReqValue' just below is its
+   'CompReqCombined'\/value-preparation counterpart, and needs the identical
+   lock for the identical reason.
+  -}
   doCompSinkReq
     :: forall x a s
      . (CompSink s)
@@ -1015,10 +1078,14 @@ evalCompAp outerCap =
     -> CompCont (Fail a) x
     -> CompEngineM (CompResult x)
   doCompSinkReq env sinkId req cont = do
-    let sinkFun sink = do
-          (outputs, res) <- liftIO $ compSinkExecute sink req
-          return (wrapCompSinkOuts sink outputs, pure res)
     reg <- CompEngineM (asks (ce_compFlowRegistry . ce_compEngineIfs))
+    parEnabled <- parEnabledM
+    let sinkFun sink = do
+          (outputs, res) <-
+            liftIO $
+              withSinkInstLock reg parEnabled (unTypedCompSinkId sinkId) (compSinkConcurrency sink) $
+                compSinkExecute sink req
+          return (wrapCompSinkOuts sink outputs, pure res)
     (outputs, action) <-
       withTypedCompSinkId reg sinkId sinkFun >>= \case
         Ok y -> pure y
@@ -1163,6 +1230,11 @@ evalCompAp outerCap =
   doAnyCacheReqValue innerCap =
     fmap (fmap cr_returnValue) (evalWithCacheValue True innerCap (return Nothing))
 
+  -- | The 'CompReqCombined'\/value-preparation counterpart of
+  -- 'doCompSinkReq' -- same body, minus the trailing 'loop', per this
+  -- module's usual "Value" convention (see the note above
+  -- 'doAnyEvalReqValue'). See 'doCompSinkReq'\'s own haddock for the
+  -- locking\/deadlock-freedom argument, which applies here unchanged.
   doCompSinkReqValue
     :: forall a s
      . CompSink s
@@ -1171,10 +1243,14 @@ evalCompAp outerCap =
     -> CompSinkReq s a
     -> CompEngineM (CompM (Fail a))
   doCompSinkReqValue env sinkId req = do
-    let sinkFun sink = do
-          (outputs, res) <- liftIO $ compSinkExecute sink req
-          return (wrapCompSinkOuts sink outputs, pure res)
     reg <- CompEngineM (asks (ce_compFlowRegistry . ce_compEngineIfs))
+    parEnabled <- parEnabledM
+    let sinkFun sink = do
+          (outputs, res) <-
+            liftIO $
+              withSinkInstLock reg parEnabled (unTypedCompSinkId sinkId) (compSinkConcurrency sink) $
+                compSinkExecute sink req
+          return (wrapCompSinkOuts sink outputs, pure res)
     (outputs, action) <-
       withTypedCompSinkId reg sinkId sinkFun >>= \case
         Ok y -> pure y
@@ -1205,11 +1281,14 @@ evalCompAp outerCap =
     :: forall s a
      . CompSrc s
     => CompFlowRegistry
+    -> Bool
+    -- ^ whether this engine has parallel eval enabled -- threaded straight
+    -- through to 'getOrCreateGroup' (see 'sg_lock').
     -> IORef [(CompSrcInstIx, SomeSrcGroup)]
     -> TypedCompSrcId s
     -> CompSrcReq s a
     -> Prep (Fail a)
-  prepSrcLeaf reg groupsRef sid req =
+  prepSrcLeaf reg parEnabled groupsRef sid req =
     Prep $
       withTypedCompSrcIdIndexed reg sid (\ix src -> pure (ix, src, compSrcConcurrency src)) >>= \case
         Fail reason ->
@@ -1217,7 +1296,7 @@ evalCompAp outerCap =
            in pure (pure (return (Fail msg)))
         Ok (ix, src, conc) -> do
           slot <- newIORef Nothing
-          g <- getOrCreateGroup groupsRef ix src conc
+          g <- getOrCreateGroup reg parEnabled groupsRef ix src conc
           modifyIORef' (sg_fetches g) (\fs -> fs . (SrcFetch req (writeIORef slot . Just) :))
           pure (readMySlot g slot)
    where
@@ -1370,7 +1449,7 @@ evalCompAp outerCap =
     case leaf of
       CompLeafEval cap -> prepEvalLeaf ce firstEvalSeenRef forksRef cap
       CompLeafCache cap -> Prep (pure (pure <$> doAnyCacheReqValue cap))
-      CompLeafSrc sid req -> prepSrcLeaf reg groupsRef sid req
+      CompLeafSrc sid req -> prepSrcLeaf reg (isJust (ce_par ce)) groupsRef sid req
       CompLeafSink sid req -> Prep (pure (doCompSinkReqValue env sid req))
 
   doSuspended

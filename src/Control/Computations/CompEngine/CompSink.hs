@@ -41,6 +41,7 @@ module Control.Computations.CompEngine.CompSink (
 ---------------------------------------
 
 import Control.Computations.CompEngine.CompFlow
+import Control.Computations.CompEngine.CompSrc (FlowConcurrency (..))
 import Control.Computations.Utils.Types
 
 ----------------------------------------
@@ -82,6 +83,25 @@ class (Typeable s, IsCompFlowData (CompSinkOut s)) => CompSink s where
 
   -- not all sinks support listing the existing outputs
   compSinkListExistingOutputs :: s -> Option (IO (CompSinkOuts s))
+
+  {- | Whether the engine may have several 'compSinkExecute' calls to this
+   instance in flight at once. Defaults to 'FlowSerial', mirroring
+   'Control.Computations.CompEngine.CompSrc.compSrcConcurrency'\'s own
+   default exactly (see that method's haddock): under it, the engine runs
+   this sink's requests one at a time. A defaulted method, so no existing
+   'CompSink' instance defined outside this repo needs to know this exists
+   in order to keep compiling and keep behaving exactly as it always has.
+
+   Unlike 'Control.Computations.CompEngine.CompSrc.CompSrc', there is no
+   batching concept for sinks -- every 'compSinkExecute' call is its own
+   round trip -- so this is the only concurrency knob a 'CompSink' instance
+   has to declare. See "Control.Computations.CompEngine.CompFlowRegistry"'s
+   @withSinkInstLock@ for where this is actually consulted, and only when
+   parallel eval is enabled at all (a width-1 engine never even looks at
+   this).
+  -}
+  compSinkConcurrency :: s -> FlowConcurrency
+  compSinkConcurrency _ = FlowSerial
 
 data CompSinkId = CompSinkId
   { csi_type :: TypeId

@@ -40,6 +40,7 @@ import Control.Computations.CompEngine.CacheBehaviors
 import Control.Computations.CompEngine.CompDef
 import Control.Computations.CompEngine.CompEval
 import Control.Computations.CompEngine.CompFlowRegistry
+import Control.Computations.CompEngine.CompSink
 import Control.Computations.CompEngine.CompSrc
 import Control.Computations.CompEngine.Core
 import Control.Computations.CompEngine.Run
@@ -48,6 +49,7 @@ import Control.Computations.CompEngine.Types
 import Control.Computations.Utils.ConcUtils (timeout, trySync)
 import Control.Computations.Utils.Fail
 import Control.Computations.Utils.TimeSpan
+import Control.Computations.Utils.Types (Option (..))
 
 ----------------------------------------
 -- EXTERNAL
@@ -246,6 +248,181 @@ test_flowConcurrentSourceGenuinelyOverlapsAtWidth8 =
       runOnce reg (mutexConcurrentMainCompDef (typedCompSrcIdOf src))
       hw <- readTVarIO highWater
       assertBool (hw > 1)
+
+----------------------------------------------------------------------------
+-- 1b: the FlowSerial guarantee across two DIFFERENT comps' bodies, each
+-- forming its own nested batch against the same instance, when both bodies
+-- are themselves forked onto separate threads by eval-width > 1 (see
+-- Impl.hs's prepEvalLeaf). Tests 1/1a above only ever put every request
+-- against one instance into a single shared batch/SrcGroup, so they would
+-- keep passing even if the per-instance locks this module's own
+-- CompFlowRegistry now takes (lookupSrcLock, consulted from runGroupOnce)
+-- were removed entirely -- there is only ever one SrcGroup object in play
+-- there, so its own sg_triggered guard alone is enough to prevent a second
+-- 'compSrcExecuteBatch' call. Here, compA and compB are different comps, so
+-- each gets its OWN groupsRef (fresh per top-level batch -- see doSuspended's
+-- CompReqCombined case) and therefore its own SrcGroup object, both
+-- resolving to the *same* registered 'ScriptedSrc' instance underneath.
+-- Without the registry-level lock, nothing stops compA's runGroupOnce call
+-- (running on its own forked thread) from overlapping compB's.
+----------------------------------------------------------------------------
+
+-- | A comp whose body issues its own nested batch of 8 requests against the
+-- same 'FlowSerial' instance -- mirroring 'mutexMainCompDef' above, just
+-- nested one level deeper inside a cap body that is itself a candidate for
+-- 'prepEvalLeaf' forking.
+crossBodyLeafCompDef :: String -> TypedCompSrcId ScriptedSrc -> CompDef () Int
+crossBodyLeafCompDef name srcId =
+  defineComp name inMemoryShowCaching $ \() ->
+    sum <$> traverse (\_ -> compSrcReq srcId ScriptedReq) [1 .. 8 :: Int]
+
+-- | Exactly two eval leaves (compA, compB) combined via `<*>` -- the shape
+-- test 6's own comment identifies as needing width > 1 to escape the
+-- two-leaf fast path (see doSuspended) and reach prepEvalLeaf at all; the
+-- source-side width set in 'runCrossBodyOverlapCase' below takes care of
+-- that here.
+crossBodyMainCompDef :: Comp () Int -> Comp () Int -> CompDef () (Int, Int)
+crossBodyMainCompDef compA compB =
+  defineComp "cross-body-main" inMemoryShowCaching $ \() ->
+    (,) <$> evalCompOrFail compA () <*> evalCompOrFail compB ()
+
+-- | Wired by hand, like test_noCapEvaluatedTwiceAtWidth8 below, rather than
+-- through 'runOnce': compA/compB must be wired *before* crossBodyMainCompDef
+-- is built, since it closes over them as already-wired 'Comp' values (the
+-- same reason dedupMainCompDef above takes its leaf as a parameter instead
+-- of wiring it internally).
+runCrossBodyOverlapCase :: IO Int
+runCrossBodyOverlapCase =
+  do
+    inFlight <- newTVarIO 0
+    highWater <- newTVarIO 0
+    let src = ScriptedSrc "cross-body-src" FlowSerial (mkOverlapAction inFlight highWater)
+    reg <- newCompFlowRegistry
+    setCompFlowConcurrency reg (mkCompFlowConcurrency 8)
+    setCompEvalConcurrency reg (mkCompFlowConcurrency 8)
+    registerCompSrc reg src
+    (rawStateIf, closeSif) <- initStateIf True
+    (_compMap, mainComp) <-
+      failInM $
+        runCompWireM $
+          do
+            compA <- wireComp (crossBodyLeafCompDef "cross-body-leaf-a" (typedCompSrcIdOf src))
+            compB <- wireComp (crossBodyLeafCompDef "cross-body-leaf-b" (typedCompSrcIdOf src))
+            wireComp (crossBodyMainCompDef compA compB)
+    let ifs = CompEngineIfs{ce_compFlowRegistry = reg, ce_stateIf = rawStateIf}
+        caps = [wrapCompAp (mkCompAp mainComp ())]
+        rifs =
+          RunCompEngineIf
+            { rcif_shouldStartWithRun = \_ _ _ s -> pure (noNextRun, s)
+            , rcif_emptyChangesMode = DontBlock
+            , rcif_getTime = getCurrentTime
+            , rcif_maxLoopRunTime = seconds 10
+            , rcif_maxRunIterations = CompRunUnlimitedIterations
+            , rcif_reportGarbage = \_ -> pure ()
+            }
+    runCompEngine ifs caps rifs () `finally` closeSif
+    readTVarIO highWater
+
+-- | Guarded on 'rtsSupportsBoundThreads' for the same reason as
+-- test_flowConcurrentSourceGenuinelyOverlapsAtWidth8 above: without real
+-- OS-thread concurrency, no eval leaf ever forks, so this would trivially
+-- pass (both bodies would run sequentially on the same thread) whether or
+-- not the fix under test exists.
+test_flowSerialSourceNeverOverlapsAcrossForkedBodiesAtWidth8 :: IO ()
+test_flowSerialSourceNeverOverlapsAcrossForkedBodiesAtWidth8 =
+  when rtsSupportsBoundThreads $
+    do
+      hw <- runCrossBodyOverlapCase
+      assertEqual 1 hw
+
+----------------------------------------------------------------------------
+-- 1c: the analogous guarantee for a 'FlowSerial' *sink* -- see
+-- "Control.Computations.CompEngine.CompSink"'s @compSinkConcurrency@ and
+-- "Control.Computations.CompEngine.Impl"'s @withSinkInstLock@, taken around
+-- every 'compSinkExecute' call (@doCompSinkReq@\/@doCompSinkReqValue@)
+-- unconditionally, unlike the source side's lock, which only guards
+-- 'runGroupOnce' (see 1b's own comment) -- so, unlike 1b, a single
+-- (non-batched) 'compSinkReq' per body is already enough to reach the
+-- locked path; no nested batch is needed to force it.
+----------------------------------------------------------------------------
+
+data ScriptedWriteReq a where
+  ScriptedWriteReq :: ScriptedWriteReq ()
+
+data ScriptedSink = ScriptedSink
+  { sks_name :: T.Text
+  , sks_conc :: FlowConcurrency
+  , sks_action :: IO ()
+  }
+  deriving (Typeable)
+
+instance CompSink ScriptedSink where
+  type CompSinkReq ScriptedSink = ScriptedWriteReq
+  type CompSinkOut ScriptedSink = Int
+  compSinkInstanceId = CompSinkInstanceId . sks_name
+  compSinkExecute sink ScriptedWriteReq =
+    do
+      sks_action sink
+      pure (HashSet.empty, Ok ())
+  compSinkDeleteOutputs _ _ = pure ()
+  compSinkListExistingOutputs _ = None
+  compSinkConcurrency = sks_conc
+
+-- | A single, non-batched sink write -- see this section's own header
+-- comment for why that's already enough here, unlike the source-side
+-- 1b, which needs its leaf wrapped in a nested 'traverse' batch to reach
+-- 'runGroupOnce' at all.
+crossBodySinkLeafCompDef :: String -> TypedCompSinkId ScriptedSink -> CompDef () ()
+crossBodySinkLeafCompDef name sinkId =
+  defineComp name inMemoryShowCaching $ \() ->
+    compSinkReq sinkId ScriptedWriteReq
+
+crossBodySinkMainCompDef :: Comp () () -> Comp () () -> CompDef () ((), ())
+crossBodySinkMainCompDef compA compB =
+  defineComp "cross-body-sink-main" inMemoryShowCaching $ \() ->
+    (,) <$> evalCompOrFail compA () <*> evalCompOrFail compB ()
+
+-- | Wired by hand for the same reason 'runCrossBodyOverlapCase' above is.
+runCrossBodySinkOverlapCase :: IO Int
+runCrossBodySinkOverlapCase =
+  do
+    inFlight <- newTVarIO 0
+    highWater <- newTVarIO 0
+    let sink = ScriptedSink "cross-body-sink" FlowSerial (void (mkOverlapAction inFlight highWater))
+    reg <- newCompFlowRegistry
+    setCompFlowConcurrency reg (mkCompFlowConcurrency 8)
+    setCompEvalConcurrency reg (mkCompFlowConcurrency 8)
+    registerCompSink reg sink
+    (rawStateIf, closeSif) <- initStateIf True
+    (_compMap, mainComp) <-
+      failInM $
+        runCompWireM $
+          do
+            compA <- wireComp (crossBodySinkLeafCompDef "cross-body-sink-leaf-a" (typedCompSinkIdOf sink))
+            compB <- wireComp (crossBodySinkLeafCompDef "cross-body-sink-leaf-b" (typedCompSinkIdOf sink))
+            wireComp (crossBodySinkMainCompDef compA compB)
+    let ifs = CompEngineIfs{ce_compFlowRegistry = reg, ce_stateIf = rawStateIf}
+        caps = [wrapCompAp (mkCompAp mainComp ())]
+        rifs =
+          RunCompEngineIf
+            { rcif_shouldStartWithRun = \_ _ _ s -> pure (noNextRun, s)
+            , rcif_emptyChangesMode = DontBlock
+            , rcif_getTime = getCurrentTime
+            , rcif_maxLoopRunTime = seconds 10
+            , rcif_maxRunIterations = CompRunUnlimitedIterations
+            , rcif_reportGarbage = \_ -> pure ()
+            }
+    runCompEngine ifs caps rifs () `finally` closeSif
+    readTVarIO highWater
+
+-- | Guarded on 'rtsSupportsBoundThreads' for the same reason 1b's own
+-- test is.
+test_flowSerialSinkNeverOverlapsAcrossForkedBodiesAtWidth8 :: IO ()
+test_flowSerialSinkNeverOverlapsAcrossForkedBodiesAtWidth8 =
+  when rtsSupportsBoundThreads $
+    do
+      hw <- runCrossBodySinkOverlapCase
+      assertEqual 1 hw
 
 ----------------------------------------------------------------------------
 -- 3: no cap gets evaluated twice at width 8, even when the same batch also

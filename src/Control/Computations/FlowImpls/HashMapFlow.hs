@@ -182,6 +182,16 @@ instance CompSink HashMapFlow where
   -- not all sinks support listing the existing outputs
   compSinkListExistingOutputs _ = None
 
+  -- 'executeWriteImpl' is 'hmfInsert', which does its entire read-modify-write
+  -- (updating both 'hmf_hashMapVar' and 'hmf_changesVar') inside one
+  -- 'atomically' block -- STM already serializes concurrent transactions
+  -- against each other with no torn writes, the same reason the 'CompSrc'
+  -- instance above declares 'FlowConcurrent' for its own (read-only)
+  -- 'readTVarIO'-based path. There is no *additional* invariant across
+  -- separate writes (e.g. "insert then read back the same key") that two
+  -- concurrent 'compSinkExecute' calls against different keys could violate.
+  compSinkConcurrency _ = FlowConcurrent
+
 executeWriteImpl :: HashMapFlow -> HashMapWriteReq a -> IO (HashSet Key, Fail a)
 executeWriteImpl hmf (HashMapStoreReq k v) = do
   hmfInsert hmf k v

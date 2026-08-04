@@ -24,6 +24,8 @@ module Control.Computations.CompEngine.CompFlowRegistry (
   unregisterCompSink,
   allCompSrcChanges,
   Blocking (..),
+  lookupSrcLock,
+  withSinkInstLock,
 )
 where
 
@@ -39,6 +41,7 @@ import Control.Computations.Utils.Logging
 -- EXTERNAL
 ----------------------------------------
 
+import Control.Concurrent.MVar
 import Control.Concurrent.STM
 import Control.Monad
 import Control.Monad.IO.Class
@@ -48,6 +51,7 @@ import qualified Data.HashMap.Strict as HashMap
 import qualified Data.HashMap.Strict as Map
 import Data.HashSet (HashSet)
 import qualified Data.HashSet as HashSet
+import Data.Hashable (Hashable (..))
 import Data.Proxy
 import Data.Typeable
 
@@ -67,7 +71,15 @@ import Data.Typeable
  or its caller ever needs to know exists.
 -}
 newtype CompSrcInstIx = CompSrcInstIx Int
-  deriving (Eq)
+  deriving (Eq, Show)
+
+-- | Hand-rolled rather than derived: this newtype is defined without
+-- 'GeneralizedNewtypeDeriving' in scope (see this module's own pragma
+-- list), and a manual instance is one line either way. Needed so
+-- 'rs_srcLocks' below can key a 'HashMap' on this type directly, the same
+-- way 'rs_srcs' keys one on 'CompSrcId'.
+instance Hashable CompSrcInstIx where
+  hashWithSalt s (CompSrcInstIx n) = hashWithSalt s n
 
 firstCompSrcInstIx :: CompSrcInstIx
 firstCompSrcInstIx = CompSrcInstIx 0
@@ -79,6 +91,25 @@ data RegState = RegState
   { rs_srcs :: HashMap CompSrcId (CompSrcInstIx, AnyCompSrc)
   , rs_sinks :: HashMap CompSinkId AnyCompSink
   , rs_nextSrcIx :: CompSrcInstIx
+  , rs_srcLocks :: HashMap CompSrcInstIx (MVar ())
+  -- ^ One dedicated lock per registered source instance, created in
+  -- 'registerCompSrc' and never removed (mirrors 'CompSrcInstIx' itself
+  -- never being reused across an unregister\/re-register cycle -- see its
+  -- haddock). Consulted only via 'lookupSrcLock', and only when parallel
+  -- eval is enabled and the instance is 'Control.Computations.CompEngine.CompSrc.FlowSerial'
+  -- -- see "Control.Computations.CompEngine.Impl"'s @getOrCreateGroup@,
+  -- the only caller, and 'Control.Computations.CompEngine.CompSrc.compSrcConcurrency's
+  -- own haddock for the guarantee this restores now that a
+  -- 'Control.Computations.CompEngine.CompSrc.FlowSerial' source can be
+  -- reached from two concurrently-forked eval-leaf threads at once.
+  , rs_sinkLocks :: HashMap CompSinkId (MVar ())
+  -- ^ The sink-side sibling of 'rs_srcLocks' -- see 'withSinkInstLock', the
+  -- only place this is read. Keyed on 'CompSinkId' directly rather than a
+  -- dense index the way 'rs_srcLocks' is keyed on 'CompSrcInstIx': there is
+  -- no existing per-batch hot path hashing a sink id the way
+  -- "Control.Computations.CompEngine.Impl"'s @CompReqCombined@ preparation
+  -- does for sources (see 'CompSrcInstIx'\'s own haddock), so there is
+  -- nothing here for a dense index to save.
   }
 
 {- | Width of the fixed worker pool a wide 'CompReqCombined' batch (see
@@ -153,7 +184,7 @@ data CompFlowRegistry = CompFlowRegistry
 
 newCompFlowRegistry :: IO CompFlowRegistry
 newCompFlowRegistry = do
-  let state = RegState HashMap.empty HashMap.empty firstCompSrcInstIx
+  let state = RegState HashMap.empty HashMap.empty firstCompSrcInstIx HashMap.empty HashMap.empty
   v <- newTVarIO state
   concVar <- newTVarIO (mkCompFlowConcurrency 1)
   evalConcVar <- newTVarIO (mkCompFlowConcurrency 1)
@@ -327,16 +358,29 @@ registerCompSrc :: CompSrc s => CompFlowRegistry -> s -> IO ()
 registerCompSrc reg src =
   do
     logInfo ("Registering " ++ show (compSrcId src))
+    -- The lock is allocated here, in IO, rather than inside the atomically
+    -- block below: STM transactions may retry, and a retried 'newMVar ()'
+    -- would allocate (and discard) a fresh lock every retry -- fine for
+    -- correctness (only the MVar committed by the winning attempt is ever
+    -- looked up again), but pointless churn next to just building it once,
+    -- outside the transaction, the same way 'registerCompSink' below does.
+    lock <- newMVar ()
     atomically $ modifyTVar' (cfr_state reg) $ \state ->
       state
         { rs_srcs = HashMap.insert (compSrcId src) (rs_nextSrcIx state, AnyCompSrc src) (rs_srcs state)
         , rs_nextSrcIx = nextCompSrcInstIx (rs_nextSrcIx state)
+        , rs_srcLocks = HashMap.insert (rs_nextSrcIx state) lock (rs_srcLocks state)
         }
 
 unregisterCompSrc :: CompSrc s => CompFlowRegistry -> s -> IO ()
 unregisterCompSrc reg src =
   do
     logInfo ("Unregistering " ++ show (compSrcId src))
+    -- NOTE: rs_srcLocks is deliberately left untouched here -- see its own
+    -- haddock. The ix this src held is never reused (CompSrcInstIx's own
+    -- invariant), so the orphaned lock entry can never be mistaken for a
+    -- different, later instance's lock; it simply outlives the src that
+    -- last used it, the same way the ix itself does.
     atomically $ modifyTVar' (cfr_state reg) $ \state ->
       state{rs_srcs = HashMap.delete (compSrcId src) (rs_srcs state)}
 
@@ -345,15 +389,75 @@ registerCompSink :: CompSink s => CompFlowRegistry -> s -> IO ()
 registerCompSink reg sink =
   do
     logInfo ("Registering " ++ show (compSinkId sink))
+    lock <- newMVar ()
     atomically $ modifyTVar' (cfr_state reg) $ \state ->
-      state{rs_sinks = HashMap.insert (compSinkId sink) (AnyCompSink sink) (rs_sinks state)}
+      state
+        { rs_sinks = HashMap.insert (compSinkId sink) (AnyCompSink sink) (rs_sinks state)
+        , rs_sinkLocks = HashMap.insert (compSinkId sink) lock (rs_sinkLocks state)
+        }
 
 unregisterCompSink :: CompSink s => CompFlowRegistry -> s -> IO ()
 unregisterCompSink reg sink =
   do
     logInfo ("Unregistering " ++ show (compSinkId sink))
+    -- rs_sinkLocks is left untouched here for the same reason
+    -- unregisterCompSrc leaves rs_srcLocks untouched -- see that function's
+    -- NOTE.
     atomically $ modifyTVar' (cfr_state reg) $ \state ->
       state{rs_sinks = HashMap.delete (compSinkId sink) (rs_sinks state)}
+
+{- | Look up @ix@'s dedicated lock, created once at 'registerCompSrc' time --
+ every registered source instance has exactly one, for the lifetime of the
+ registry (never removed by 'unregisterCompSrc' -- see its own NOTE). Only
+ ever called from "Control.Computations.CompEngine.Impl"'s
+ @getOrCreateGroup@, and only for an @ix@ it just resolved through this same
+ registry (via 'withTypedCompSrcIdIndexed'), so the error branch here should
+ be unreachable outside a broken invariant -- it exists purely so a future
+ regression fails loudly instead of silently skipping the lock it should
+ have taken.
+-}
+lookupSrcLock :: CompFlowRegistry -> CompSrcInstIx -> IO (MVar ())
+lookupSrcLock reg ix = do
+  regState <- readTVarIO (cfr_state reg)
+  case HashMap.lookup ix (rs_srcLocks regState) of
+    Just lock -> pure lock
+    Nothing -> error ("lookupSrcLock: no lock registered for source index " ++ show ix)
+
+{- | Run @act@ under @sid@'s dedicated sink lock, but only when @parEnabled@
+ (the calling engine has parallel eval turned on --
+ "Control.Computations.CompEngine.Impl"'s @ce_par@ is 'Just') /and/ @conc@
+ is 'Control.Computations.CompEngine.CompSrc.FlowSerial'
+ ('Control.Computations.CompEngine.CompSink.compSinkConcurrency's own
+ default) -- see that method's haddock for the guarantee this restores.
+ Otherwise -- eval width 1, or a sink that has declared
+ 'Control.Computations.CompEngine.CompSrc.FlowConcurrent' -- this just runs
+ @act@ directly, touching neither the registry nor any lock.
+
+ __Why this can't deadlock__: the only callers
+ ("Control.Computations.CompEngine.Impl"'s @doCompSinkReq@\/
+ @doCompSinkReqValue@) hold this lock across exactly one
+ 'Control.Computations.CompEngine.CompSink.compSinkExecute' call and
+ nothing else -- no nested cap evaluation happens, and no promise-table
+ join happens, while it's held. So a thread waiting on (or holding) this
+ lock never appears in the promise table's wait-for graph -- it is either
+ doing bounded I\/O against this one sink instance, or waiting for another
+ thread that is. That is the same "claim on start, and only while doing
+ real work" argument
+ "Control.Computations.CompEngine.Impl"'s @claimOrJoin@ haddock makes for
+ why a genuine deadlock there is always a real dependency cycle, applied to
+ a lock instead of a promise: this lock can only ever be contended by two
+ threads that both, right now, want to do I\/O against the same sink, never
+ by a thread that is itself blocked waiting on the thread trying to acquire
+ it.
+-}
+withSinkInstLock :: CompFlowRegistry -> Bool -> CompSinkId -> FlowConcurrency -> IO a -> IO a
+withSinkInstLock reg parEnabled sid conc act
+  | parEnabled && conc == FlowSerial = do
+      regState <- readTVarIO (cfr_state reg)
+      case HashMap.lookup sid (rs_sinkLocks regState) of
+        Just lock -> withMVar lock (const act)
+        Nothing -> error ("withSinkInstLock: no lock registered for sink " ++ show sid)
+  | otherwise = act
 
 data Blocking = Block | DontBlock
   deriving (Eq, Show)
