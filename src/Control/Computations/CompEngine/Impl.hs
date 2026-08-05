@@ -104,8 +104,11 @@ data CompEngine = CompEngine
  * 'ps_permits' is a counting permit pool of size @width - 1@ (the batch's
    own calling thread always keeps at least one leaf's work for itself --
    see 'prepEvalLeaf'), decremented by a successful 'tryAcquirePermit' and
-   incremented back by 'releasePermit' once the forked leaf's
-   'Async.Async' has been joined, whatever the outcome.
+   incremented back by 'releasePermit' as soon as the forked leaf's own
+   work finishes, whatever the outcome -- __not__ when some later caller
+   gets around to 'Async.wait'-ing it (see 'prepEvalLeaf'\'s own note on why
+   tying release to join order, rather than to actual completion, throttles
+   the whole pool behind whichever leaf is slowest to be joined).
  * 'ps_width' is the raw width, kept alongside the derived permit count
    purely so a diagnostic doesn't have to reconstruct it from
    @width - 1@ backwards.
@@ -746,10 +749,16 @@ data OccupancyState = OccupancyState
  @COMP_ENGINE_LOCK_STATS@ is set (see 'ce_diag').
 
  * 'ed_forkAttempts'\/'ed_forkSuccesses'\/'ed_forkFailures': every call
-   'prepEvalLeaf' makes to 'tryAcquirePermit' bumps @attempts@, then
-   exactly one of @successes@\/@failures@. @failures@ is 'prepEvalLeaf's
-   Cilk-style serial elision (the leaf ran inline instead of forking), not
-   an error -- see that function's own haddock.
+   'PendingEvalLeaf'\'s @pel_tryStart@ makes to 'tryAcquirePermit' bumps
+   @attempts@, then exactly one of @successes@\/@failures@. Since
+   'topUpWindow' can retry the same still-queued leaf from many different
+   later leaves' own join points (see its haddock), one logical leaf can
+   now contribute more than one @attempts@\/@failures@ pair before it
+   either succeeds or falls back to running inline -- unlike the
+   collect-time-only decision this replaced, where each eligible leaf
+   contributed exactly one. @failures@ that never resolve into a success
+   are 'prepEvalLeaf's Cilk-style serial elision (the leaf ran inline
+   instead of forking), not an error -- see that function's own haddock.
  * 'ed_occupancy': see 'OccupancyState'.
  * 'ed_depthHist': keyed by 'ec_ancestors'\'s size (the *forking* thread's
    own chain depth -- the forked child sits one level deeper) at every
@@ -822,8 +831,8 @@ recordForkOutcome diag False = modifyIORef' (ed_forkFailures diag) (+ 1)
 {-# INLINE recordForkOutcome #-}
 
 {- | Fold one occupancy transition (@+1@ on a successful acquire, @-1@ on
- the matching release, once the forked leaf's 'Async.Async' has been
- joined -- see 'prepEvalLeaf') into 'ed_occupancy's running integral. The
+ the matching release, once the forked leaf's own work actually finishes --
+ see 'prepEvalLeaf') into 'ed_occupancy's running integral. The
  timestamp is read *outside* the 'atomically' block (an 'IO' action cannot
  run inside one); the transaction itself only does arithmetic on
  already-read values, so it stays a cheap, always-committing STM step.
@@ -929,6 +938,94 @@ tryAcquirePermit permits = atomically $ do
 -- cancellation of the forked leaf that acquired it), from 'prepEvalLeaf'.
 releasePermit :: TVar Int -> IO ()
 releasePermit permits = atomically (modifyTVar' permits (+ 1))
+
+{- | The sliding fork window: one not-yet-started eval leaf of a
+ 'CompReqCombined' batch, queued by 'prepEvalLeaf' during the batch's
+ collect phase and consumed, front first, by 'topUpWindow' during the run
+ phase.
+
+ __Why a queue, not a one-shot decision.__ The fork/inline choice used to be
+ made once per leaf, during the fast sequential IO walk that collects a
+ batch's leaves ('traverseCompReq'), long before the run phase reaches any
+ of them -- see @docs\/benchmark-notes.md@'s Stage 13. For a batch far wider
+ than the permit pool (the tiered benchmark's dominant shape: 383 eval
+ leaves against 7-15 permits), the first @width - 1@-many eligible leaves
+ in traversal order got the only permits that would ever exist for that
+ batch's whole lifetime; the remaining several hundred ran inline, one
+ after another, even though the earliest forks typically finished and freed
+ their permits back long before the batch itself finished. This type (and
+ 'topUpWindow') replace that single decision with a queue plus a per-leaf
+ retry point: a leaf that loses the race for a permit stays queued rather
+ than being condemned, and gets another chance every time a later leaf's
+ own join point re-tops-up the window -- see 'prepEvalLeaf' for where a
+ leaf's own join action calls 'topUpWindow' immediately before consulting
+ its own state.
+
+ 'pel_tryStart' is the only thing this type carries: a self-contained
+ attempt (closing over its own leaf's 'CompAp', private state cell,
+ diagnostics, and the shared 'ParState'\/@forksRef@) that 'topUpWindow' can
+ invoke without knowing anything about which leaf it belongs to -- the same
+ existential-erasure trick 'SomeSrcGroup' already uses for a batch's source
+ groups, just erasing down to @IO Bool@ instead of a typed record, since
+ nothing outside the leaf's own closure ever needs its result type.
+-}
+newtype PendingEvalLeaf = PendingEvalLeaf
+  { pel_tryStart :: IO Bool
+  -- ^ Attempts exactly one 'tryAcquirePermit'. 'True': a permit was free,
+  -- this leaf is now forked (its own private state cell -- see
+  -- 'prepEvalLeaf' -- holds the resulting 'Async.Async' handle from this
+  -- point on). 'False': the pool was empty at this instant; nothing about
+  -- this leaf's own state changes, so it stays at the front of the queue
+  -- for a future call to retry.
+  }
+
+{- | Start as many of @windowRef@'s not-yet-started eval leaves as there are
+ free permits for, strictly from the front -- i.e. in the same left-to-right
+ traversal order 'prepEvalLeaf' queued them in, __never__ skipping ahead to
+ try a later leaf out of order. Called once at the top of every
+ fork-eligible eval leaf's own join action (see 'prepEvalLeaf'), which is
+ what gives a leaf that lost its own collect-time permit race more chances
+ later, spread across the batch's whole run phase, instead of being
+ condemned to run inline the moment that one collect-time attempt failed.
+
+ Stops at the first 'False' rather than continuing past it: the queue's
+ front is always this batch's next not-yet-started leaf in traversal order
+ (every leaf before it has already been removed -- either by an earlier
+ success here, or by its own join action's inline fallback once
+ 'topUpWindow' fails to reach it -- see 'prepEvalLeaf'), so leaving a failed
+ leaf at the front is what lets the *next* call (from a later leaf's own
+ join point, once an earlier fork has freed a permit) retry the very same
+ leaf rather than silently reordering starts around it. Only __starts__ can
+ float ahead of where the run phase currently is; nothing here ever changes
+ __join__ order, which stays exactly the left-to-right order 'Prep'\'s own
+ 'Applicative' already sequences every leaf's own join action in.
+
+ No cap on how far a single call can run ahead -- a call that keeps
+ succeeding keeps going, all the way to an empty queue if the pool has that
+ many permits free at that instant. The window's size is therefore bounded
+ by the shared, engine-global permit pool alone, not by any new knob.
+-}
+topUpWindow :: IORef [PendingEvalLeaf] -> IO ()
+topUpWindow windowRef = do
+  pending <- readIORef windowRef
+  case pending of
+    [] -> pure ()
+    (pel : rest) -> do
+      started <- pel_tryStart pel
+      when started $ do
+        writeIORef windowRef rest
+        topUpWindow windowRef
+
+-- | Drop the queue's front entry unconditionally -- called only from a leaf
+-- whose own join action just found itself still un-started after its own
+-- 'topUpWindow' call (see 'prepEvalLeaf'), at which point that leaf, by
+-- 'topUpWindow'\'s own invariant, is always the front. Removing it here is
+-- what stops a future 'topUpWindow' call from retrying a leaf that has
+-- already fallen back to running inline.
+popWindowFront :: IORef [PendingEvalLeaf] -> IO ()
+popWindowFront ref = atomicModifyIORef' ref $ \case
+  [] -> ([], ())
+  (_ : rest) -> (rest, ())
 
 {- | The outcome of 'claimOrJoin': either this call is the first to reach
  @cap@ (becomes its "owner", and gets the fresh, still-empty cell to fill)
@@ -1578,36 +1675,86 @@ evalCompAp outerCap =
   sameSrcInstance _ _ = False
 
   {- | 'prepLeaf'\'s 'CompLeafEval' branch: the collect-phase decision of
-   whether to fork this leaf's evaluation onto its own thread, mirroring
-   'prepSrcLeaf'\'s own collect\/run split (see 'Prep'\'s haddock) but
-   simpler -- there is no grouping concept for eval leaves, each is its own
-   independent unit of work, so the decision is made (and, on success, acted
-   on) the moment this leaf is reached during 'traverseCompReq'\'s
-   left-to-right IO walk, not deferred to a later trigger the way
-   'runGroupOnce' is.
+   whether to fork this leaf's evaluation, mirroring 'prepSrcLeaf'\'s own
+   collect\/run split (see 'Prep'\'s haddock) -- but, unlike before this
+   window existed, a leaf that loses the permit race here is no longer
+   condemned to run inline for the rest of the batch's life. It is queued
+   into the batch's shared 'PendingEvalLeaf' window (@mWindow@) instead, and
+   gets more chances to start later, during the run phase, as earlier
+   forks finish and free their permits back -- see 'topUpWindow'\'s haddock
+   for why this was needed (in short: a batch far wider than the permit
+   pool used to have its fork-vs-inline fate for *every* leaf sealed during
+   this fast collect-time walk, before any of the earliest forks had even
+   had a chance to finish -- see @docs\/benchmark-notes.md@'s Stage 13/14).
+
+   __The first attempt still happens here, during collect, deliberately__ --
+   this function does not defer *every* fork decision to the run phase; it
+   only refuses to let a lost race be *final*. Reusing the original timing
+   for a leaf's first attempt is what keeps a narrow batch (few eligible
+   leaves, permits to spare) behaving exactly as it did before this window
+   existed, which matters beyond just performance: a batch referencing the
+   same 'hashCaching' cap twice depends on its second reference's fork
+   actually racing the first reference's still-in-flight evaluation (see
+   'doAnyEvalReqValue') to ever find a live promise to join instead of
+   re-claiming as a fresh owner, and that race is only winnable if the
+   second reference starts during collect, before the first reference's own
+   run-phase join action has run to completion and released its claim.
+   Deferring every leaf's *first* attempt to its own join point (as
+   'topUpWindow' alone would) loses that race by construction for a batch's
+   first eligible leaf, since nothing tops the window up before it ever
+   runs -- caught directly by
+   "Control.Computations.CompEngine.Tests.TestCompEvalConcurrency"'s
+   @test_hashCachingCapReferencedTwiceInOneBatchEvaluatesOnceAtEvalWidth8@,
+   which is what this design was built against.
 
    __Never forks the batch's first eval leaf__ (tracked via
    @firstEvalSeenRef@, a plain per-batch flag -- the traversal that calls
    this is itself sequential IO, so nothing here races another call to this
    same function): the calling thread always keeps at least one leaf's work
    for itself, so a single-eval-leaf batch never forks at all -- pure loss
-   for a leaf with no sibling to overlap with. This is also what makes the
-   'doAnyEvalReqValue' dedup real, not theoretical: a batch referencing the
-   same 'hashCaching' cap twice has its first reference stay inline (never
-   forked, so it starts owning immediately) while the second, now eligible
-   to fork, can genuinely begin -- and claim as a joiner -- concurrently
-   with the first still running, rather than always finding the table
-   already empty by its turn.
+   for a leaf with no sibling to overlap with, and the first eval leaf is
+   never even added to the window.
 
-   __'tryAcquirePermit' only, never block.__ On failure this returns exactly
-   'doAnyEvalReqValue'\'s own un-forked expression -- the serial elision
-   always available, per Cilk's work-first principle: the *space* bound this
-   buys comes from that elision always being there to fall back to, not from
-   work-stealing, and it is also what keeps a permit out of the wait-for
-   graph (see 'doAnyEvalReqValue'\'s haddock on why that graph being a
-   dependency subgraph is what makes a genuine deadlock always a genuine
-   cycle) -- a permit that could block would add an edge with no dependency
-   behind it.
+   @mWindow@ is 'Nothing' exactly when 'ce_par' is 'Nothing' (see its
+   allocation in 'doSuspended'\'s general path) -- both wildcarded together
+   below, rather than unwrapped separately, so there is exactly one branch
+   to reason about for "parallel eval is off", matching every other
+   'ce_par'-gated site in this module.
+
+   Every eligible leaf's own run-phase action:
+
+    1. calls 'topUpWindow' -- this may or may not be what starts *this*
+       leaf; it might already have been started by this function's own
+       collect-time attempt above, by an earlier leaf's own run-phase call,
+       or it might start several leaves beyond this one if enough permits
+       are free right now (see 'topUpWindow'\'s haddock for why there is no
+       cap on how far ahead a single call can reach);
+    2. reads its own private @stateRef@: 'Just' means it is already forked
+       (from the collect-time attempt or a later 'topUpWindow' call), so
+       this just 'Async.wait's and merges, exactly as the old collect-time
+       fork's run phase always did; 'Nothing' means every attempt so far
+       has lost the race (by 'topUpWindow'\'s own invariant, this leaf is
+       therefore still the queue's front), so it pops itself off and falls
+       back to the same un-forked 'doAnyEvalReqValue' call this leaf would
+       have run before this window existed -- Cilk's work-first serial
+       elision, same guarantee as before, just no longer sealed after only
+       one attempt.
+
+   __Only *starts* move; *joins* do not.__ A leaf can be started well ahead
+   of wherever the run phase currently is (at collect time, or by a later
+   leaf's own 'topUpWindow' call), but every leaf's own join (the
+   'Async.wait' or the inline fallback) still happens at that leaf's own
+   position in 'Prep'\'s left-to-right 'Applicative' sequence, completely
+   unchanged from before -- this is what preserves the leftmost-failing-leaf
+   guarantee ('prepSrcLeaf'\'s own note makes the same argument for source
+   leaves).
+
+   __'tryAcquirePermit' only, never block__ (inside 'PendingEvalLeaf'\'s
+   @pel_tryStart@, built here): a permit that could block would add an edge
+   to the wait-for graph with no real dependency behind it -- see
+   'doAnyEvalReqValue'\'s haddock on why that graph staying a subgraph of
+   the dependency graph is what makes a genuine deadlock always a genuine
+   cycle.
 
    On success, the forked action runs under
    "Control.Computations.Utils.ConcUtils".'trySync' (so an asynchronous
@@ -1617,13 +1764,11 @@ evalCompAp outerCap =
    this thread instead of leaving it to keep running the cap's body
    regardless) and a __fresh__ chain (this leaf's own ancestors seeded from
    the forking thread's, but its own 'ec_awaiting' slot -- see
-   'EvalChain'\'s haddock). The run phase (the returned 'CompEngineM' action)
-   joins it via 'Async.wait', merges whatever 'GenDel' the fork accumulated
-   into its own via 'mergeGenDel' (the commutative-merge machinery
-   'CapSeq'\'s haddock documents, built for exactly this), and rethrows the
-   fork's own exception unchanged on failure -- 'Async.wait'\'s own
-   semantics, so the leftmost failing leaf (composed left to right by
-   'Prep'\'s 'Applicative', same as always) is what a caller sees.
+   'EvalChain'\'s haddock). Whichever leaf ends up joining it merges
+   whatever 'GenDel' the fork accumulated into its own via 'mergeGenDel'
+   (the commutative-merge machinery 'CapSeq'\'s haddock documents, built for
+   exactly this), and rethrows the fork's own exception unchanged on
+   failure -- 'Async.wait'\'s own semantics.
   -}
   prepEvalLeaf
     :: forall x
@@ -1631,44 +1776,109 @@ evalCompAp outerCap =
     => CompEngine
     -> IORef Bool
     -> IORef [Async.Async ()]
+    -> Maybe (IORef ([PendingEvalLeaf] -> [PendingEvalLeaf]), IORef [PendingEvalLeaf])
     -> CompAp x
     -> Prep (Maybe (CompApResult x))
-  prepEvalLeaf ce firstEvalSeenRef forksRef cap = Prep $ do
+  prepEvalLeaf ce firstEvalSeenRef forksRef mWindow cap = Prep $ do
     seenBefore <- atomicModifyIORef' firstEvalSeenRef (\seen -> (True, seen))
     let inline = pure <$> doAnyEvalReqValue cap
-    case ce_par ce of
-      Just par | seenBefore && rtsSupportsBoundThreads -> do
-        whenDiag ce recordForkAttempt
-        acquired <- tryAcquirePermit (ps_permits par)
-        whenDiag ce (\d -> recordForkOutcome d acquired)
-        if acquired
-          then do
-            -- Depth is the *forking* thread's own chain size (the forked
-            -- child sits one level deeper) -- see 'EngineDiag'\'s haddock.
-            -- Occupancy is bumped here, at the moment the permit is
-            -- actually taken (matching 'tryAcquirePermit' itself, just
-            -- above), and unwound below in the same 'finally' that already
-            -- releases the permit -- one timestamp per acquire, one per
-            -- release, nothing allocated beyond that on this path.
-            whenDiag ce $ \d -> do
-              recordDepth d (HashSet.size (ec_ancestors (ce_chain ce)))
-              bumpOccupancy d 1
-            awaitingRef <- newIORef Nothing
-            let forkEngine = ce{ce_chain = (ce_chain ce){ec_awaiting = awaitingRef}}
-            asyncHandle <-
-              forkTracked forksRef (trySync (runCompEngineM' (doAnyEvalReqValue cap) forkEngine))
-            pure $ do
-              outcome <-
-                liftIO
-                  ( Async.wait asyncHandle
+    case (ce_par ce, mWindow) of
+      (Just par, Just (windowBuildRef, windowRef)) | seenBefore && rtsSupportsBoundThreads -> do
+        stateRef <- newIORef Nothing
+        let tryStart :: IO Bool
+            tryStart = do
+              whenDiag ce recordForkAttempt
+              acquired <- tryAcquirePermit (ps_permits par)
+              whenDiag ce (\d -> recordForkOutcome d acquired)
+              when acquired $ do
+                -- Depth is the *forking* thread's own chain size (the
+                -- forked child sits one level deeper) -- see
+                -- 'EngineDiag'\'s haddock. Occupancy is bumped here, at
+                -- the moment the permit is actually taken (matching
+                -- 'tryAcquirePermit' itself, just above), and unwound
+                -- inside the forked action's own 'finally' below -- one
+                -- timestamp per acquire, one per release, nothing
+                -- allocated beyond that on this path.
+                whenDiag ce $ \d -> do
+                  recordDepth d (HashSet.size (ec_ancestors (ce_chain ce)))
+                  bumpOccupancy d 1
+                awaitingRef <- newIORef Nothing
+                let forkEngine = ce{ce_chain = (ce_chain ce){ec_awaiting = awaitingRef}}
+                -- The permit is released here, inside the forked action
+                -- itself (success, synchronous failure, or cancellation
+                -- alike), rather than around the 'Async.wait' below --
+                -- deliberately, and not an arbitrary style choice. Joins
+                -- stay strictly left-to-right (see this function's own
+                -- haddock), but a fork's *actual work* can finish well out
+                -- of that order -- a fast leaf started right after a slow
+                -- one is a routine occurrence under this graph's
+                -- heterogeneous per-source latency tiers. Releasing at
+                -- join time would hold that fast leaf's permit hostage for
+                -- however long every leaf *before* it in join order takes
+                -- to be reached, even though the work behind it finished
+                -- long ago -- measured directly: an earlier version that
+                -- released at join time showed *fewer* successful forks
+                -- than the collect-time-only decision this window
+                -- replaced, not more, because permits were tied up idling
+                -- on already-finished work instead of being available for
+                -- 'topUpWindow' to hand to the next queued leaf. Releasing
+                -- as soon as the work itself completes decouples pool
+                -- throughput from join-order latency entirely; the join
+                -- below still happens in order, but 'Async.wait' on an
+                -- already-finished 'Async.Async' just reads its result,
+                -- no different from before.
+                asyncHandle <-
+                  forkTracked forksRef $
+                    trySync (runCompEngineM' (doAnyEvalReqValue cap) forkEngine)
                       `Control.Exception.finally` ( releasePermit (ps_permits par)
                                                        >> whenDiag ce (\d -> bumpOccupancy d (-1))
                                                    )
-                  )
+                writeIORef stateRef (Just asyncHandle)
+              pure acquired
+        -- Attempt immediately, right here during collect -- deliberately
+        -- the *same* timing the old collect-time-only decision gave every
+        -- leaf, not something this window replaces. Only a leaf that loses
+        -- this first race gets queued for a later retry (see
+        -- 'topUpWindow'); one that wins is forked at exactly the point in
+        -- the traversal it always was. This is what keeps a narrow batch
+        -- (few eligible leaves, permits to spare) behaving identically to
+        -- before this window existed -- in particular, it is what a
+        -- repeated 'hashCaching' reference's promise-table dedup depends
+        -- on: the second reference's fork has to actually be racing the
+        -- first reference's still-in-flight evaluation (see
+        -- 'doAnyEvalReqValue'), and it only gets that race if it starts
+        -- during collect, before the first reference's own run-phase join
+        -- action has had a chance to run to completion and release its
+        -- claim. Deferring every leaf's first attempt to its own join
+        -- point (as 'topUpWindow' alone would) loses that race by
+        -- construction for a batch's first eligible leaf, since nothing
+        -- ever tops the window up *before* it -- see
+        -- "Control.Computations.CompEngine.Tests.TestCompEvalConcurrency"'s
+        -- @test_hashCachingCapReferencedTwiceInOneBatchEvaluatesOnceAtEvalWidth8@,
+        -- which is what caught exactly that regression.
+        startedHere <- tryStart
+        unless startedHere $
+          modifyIORef' windowBuildRef (\fs -> fs . (PendingEvalLeaf tryStart :))
+        pure $ do
+          liftIO (topUpWindow windowRef)
+          mHandle <- liftIO (readIORef stateRef)
+          case mHandle of
+            Just asyncHandle -> do
+              -- No 'finally' needed here: the permit (and its occupancy
+              -- bump) is already released inside the forked action itself,
+              -- the moment its own work actually finishes -- see the
+              -- comment above 'forkTracked's call, just above. This
+              -- 'Async.wait' only ever reads a result; on an
+              -- already-finished 'Async.Async' (the common case once the
+              -- window is running well ahead of the join cursor) it
+              -- returns immediately.
+              outcome <- liftIO (Async.wait asyncHandle)
               case outcome of
                 Left ex -> liftIO (throwIO ex)
                 Right (mres, genDel) -> mergeGenDel genDel >> pure (pure mres)
-          else pure inline
+            Nothing -> do
+              liftIO (popWindowFront windowRef)
+              inline
       _ -> pure inline
 
   {- | Prepare one leaf of a 'CompReqCombined' batch as a 'Prep' value.
@@ -1684,11 +1894,12 @@ evalCompAp outerCap =
     -> IORef [(CompSrcInstIx, SomeSrcGroup)]
     -> IORef Bool
     -> IORef [Async.Async ()]
+    -> Maybe (IORef ([PendingEvalLeaf] -> [PendingEvalLeaf]), IORef [PendingEvalLeaf])
     -> CompReqLeaf r
     -> Prep r
-  prepLeaf env ce reg groupsRef firstEvalSeenRef forksRef leaf =
+  prepLeaf env ce reg groupsRef firstEvalSeenRef forksRef mWindow leaf =
     case leaf of
-      CompLeafEval cap -> prepEvalLeaf ce firstEvalSeenRef forksRef cap
+      CompLeafEval cap -> prepEvalLeaf ce firstEvalSeenRef forksRef mWindow cap
       CompLeafCache cap -> Prep (pure (pure <$> doAnyCacheReqValue cap))
       CompLeafSrc sid req -> prepSrcLeaf reg (isJust (ce_par ce)) groupsRef sid req
       CompLeafSink sid req -> Prep (pure (doCompSinkReqValue env sid req))
@@ -1777,9 +1988,41 @@ evalCompAp outerCap =
             -- by reference, only ever varying 'ce_chain'.
             firstEvalSeenRef <- liftIO (newIORef False)
             forksRef <- liftIO (newIORef [])
+            -- mWindow: the batch's shared sliding fork window (see
+            -- 'PendingEvalLeaf'/'topUpWindow'), allocated only when
+            -- parallel eval is actually on -- 'ce_par' being 'Nothing'
+            -- means 'prepEvalLeaf' never looks at it (its wildcarded
+            -- '_ -> pure inline' branch matches before ever touching
+            -- @mWindow@), so there is no reason to pay for two more
+            -- 'IORef's on a path that can never fork. This keeps a
+            -- width-1 (or non-bound-threads) general-path batch exactly as
+            -- allocation-light as it was before this window existed --
+            -- see 'CompEngine'\'s own 'ce_par' haddock on why that bar is
+            -- non-negotiable. @windowBuildRef@ is the collect-phase
+            -- difference-list accumulator (same O(1)-append idiom
+            -- @sg_fetches@ uses); it is read out into @windowRef@ -- the
+            -- actual queue 'topUpWindow' consumes -- exactly once, right
+            -- after the traversal below finishes, mirroring how @groups@
+            -- is read out of @groupsRef@ just below.
+            mWindow <-
+              if isJust (ce_par ce)
+                then liftIO (Just <$> ((,) <$> newIORef id <*> newIORef []))
+                else pure Nothing
             enginePhase <-
               liftIO
-                (unPrep (traverseCompReq (prepLeaf env ce reg groupsRef firstEvalSeenRef forksRef) req))
+                ( unPrep
+                    (traverseCompReq (prepLeaf env ce reg groupsRef firstEvalSeenRef forksRef mWindow) req)
+                )
+            -- Read out into the actual queue 'topUpWindow' consumes,
+            -- exactly once, right after the traversal above finishes,
+            -- mirroring how @groups@ is read out of @groupsRef@ just
+            -- below. By this point @windowRef@ only ever holds a leaf
+            -- whose own collect-time 'tryStart' attempt (see
+            -- 'prepEvalLeaf') already lost the permit race -- every leaf
+            -- that won it is already forked, exactly as it always was.
+            liftIO $ forM_ mWindow $ \(windowBuildRef, windowRef) -> do
+              dl <- readIORef windowBuildRef
+              writeIORef windowRef (dl [])
             groups <- liftIO (map snd <$> readIORef groupsRef)
             -- Proactively dispatch only the groups that can genuinely
             -- overlap something: FlowConcurrent instances, width > 1, and

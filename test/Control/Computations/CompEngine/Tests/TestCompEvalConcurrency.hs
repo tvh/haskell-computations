@@ -1,3 +1,4 @@
+{-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# OPTIONS_GHC -F -pgmF htfpp #-}
 
@@ -42,11 +43,13 @@ import Control.Computations.Utils.TimeSpan
 -- EXTERNAL
 ----------------------------------------
 
+import Control.Concurrent (myThreadId, rtsSupportsBoundThreads, threadDelay)
 import Control.Exception (ErrorCall, finally)
 import Control.Monad
 import qualified Data.HashMap.Strict as HashMap
 import Data.IORef
 import qualified Data.List as L
+import qualified Data.Set as Set
 import Data.Time.Clock
 import Test.Framework
 
@@ -170,3 +173,72 @@ test_directSelfCycleErrorsInsteadOfHangingAtEvalWidth8 =
     assertThrowsIO
       (evalWithCompEngine compEngine (mkCompAp selfComp (0 :: Int)) `finally` closeSif)
       (\e -> "direct cycle detected" `L.isInfixOf` show (e :: ErrorCall))
+
+----------------------------------------------------------------------------
+-- 3: the sliding fork window (Impl.hs's PendingEvalLeaf/topUpWindow) lets a
+-- batch fork more eval leaves than its raw permit count over its whole run
+-- phase -- under the single collect-time decision this replaced, a batch
+-- could never fork more than `width - 1` of its eligible leaves no matter
+-- how many it had, because every leaf visited once the pool ran dry was
+-- condemned to run inline for the rest of that batch's life (see
+-- docs/benchmark-notes.md's Stage 13/14).
+--
+-- Every real eval-leaf fork spawns a fresh green thread (Async.async, no
+-- pooling -- see forkTracked's haddock), so counting *distinct* thread ids
+-- across every cap evaluation is a safe, external way to count how many
+-- leaves this batch actually forked: one id is the calling thread (which
+-- always evaluates the batch's never-forked first leaf, plus any leaf that
+-- fell back to running inline), and every other id is a genuine fork.
+--
+-- The delay below runs inside the state-if's capEvaluationStarted hook
+-- (via ObservingStateIf), not inside a CompM comp body -- CompM has no
+-- liftIO, and this project's own benchmark notes record that an
+-- unsafePerformIO side effect inside a "pure" comp body is unsound (GHC
+-- may float/share/eliminate it). The hook is genuine, already-IO engine
+-- machinery (the same call countingStateIf's own benchmark counter hooks),
+-- so a real threadDelay there is safe and runs on whichever thread -- main
+-- or forked -- is actually evaluating that leaf.
+----------------------------------------------------------------------------
+
+windowLeafCompDef :: CompDef Int Int
+windowLeafCompDef = defineComp "window-leaf" fullCaching $ \p -> pure p
+
+windowMainCompDef :: Comp Int Int -> Int -> CompDef () ()
+windowMainCompDef leaf n =
+  defineComp "window-main" inMemoryShowCaching $ \() ->
+    void (traverse (evalCompOrFail leaf) [1 .. n])
+
+test_slidingWindowForksMoreLeavesThanThePermitCountAtEvalWidth3 :: IO ()
+test_slidingWindowForksMoreLeavesThanThePermitCountAtEvalWidth3 =
+  when rtsSupportsBoundThreads $
+    do
+      threadsRef <- newIORef Set.empty
+      let onEval :: forall a. CompAp a -> IO ()
+          onEval _cap =
+            do
+              tid <- myThreadId
+              atomicModifyIORef' threadsRef (\s -> (Set.insert tid s, ()))
+              -- Long enough that a later leaf's own join point reliably
+              -- observes this one's permit freed back before it needs it
+              -- itself -- the scenario the sliding window exists for.
+              threadDelay 20000
+      reg <- newCompFlowRegistry
+      -- width 3 -> 2 permits (ps_permits = width - 1): under the old
+      -- collect-time-only decision, at most 2 of this batch's 19 eligible
+      -- leaves (20 total, minus the never-forked first) could ever fork.
+      setCompEvalConcurrency reg (mkCompFlowConcurrency 3)
+      (rawStateIf, closeSif) <- initStateIf True
+      let stateIf = observingStateIf onEval rawStateIf
+      (_compMap, mainComp) <-
+        failInM $
+          runCompWireM $
+            do
+              leaf <- wireComp windowLeafCompDef
+              wireComp (windowMainCompDef leaf 20)
+      runMainComp reg stateIf mainComp `finally` closeSif
+      distinctThreads <- Set.size <$> readIORef threadsRef
+      -- distinctThreads - 1 is exactly how many leaves this batch forked
+      -- over its whole lifetime (see this section's own header comment) --
+      -- comfortably above the old algorithm's hard ceiling of 2 (permits),
+      -- while tolerant of ordinary scheduling jitter.
+      assertBool (distinctThreads - 1 > 4)

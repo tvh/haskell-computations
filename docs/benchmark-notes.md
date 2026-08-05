@@ -2836,3 +2836,212 @@ incremental-computations:werror` -- 158 tests, run twice, both clean;
 `TestCompEvalConcurrency`'s character is unchanged (no flakiness observed
 in either run). `TestCompReqCombined.hs`'s golden ordering trace was not
 touched.
+
+## Stage 14 — the sliding fork window: breaks the plateau at width 16, a mixed result at width 8
+
+Stage 13's own recommended fix (a): let a starved leaf retry once a permit
+frees up later in the same batch's run phase, instead of being condemned
+the instant its own collect-phase visit finds the pool empty.
+
+### The shape chosen, and why it isn't a pure "defer everything to run phase"
+
+The obvious form the investigation was framed against -- an ordered list of
+leaf actions plus a cursor, topped up before joining leaf *k* -- turned out
+to need one addition to survive contact with an existing test. A first
+implementation deferred *every* fork decision to the run phase (leaf's own
+join action calls `topUpWindow`, nothing forks during collect at all). That
+version broke
+`test_hashCachingCapReferencedTwiceInOneBatchEvaluatesOnceAtEvalWidth8`
+close to half the time: the test's dedup depends on a repeated
+`hashCaching` reference's *second* leaf racing the *first* leaf's
+still-in-flight evaluation (see `doAnyEvalReqValue`), and that race is only
+winnable if the second leaf starts *during collect*, before the first
+leaf's own run-phase join action has run to completion and released its
+claim. Deferring every leaf's first attempt to its own join point loses
+that race by construction for a batch's first eligible leaf, since nothing
+tops the window up before it ever runs.
+
+The shape landed on instead is a **hybrid**: `prepEvalLeaf` still attempts
+`tryAcquirePermit` immediately, during collect, exactly reproducing the old
+collect-time-only decision's own timing -- so a leaf that wins this first
+race is forked at exactly the point in the traversal it always was, and
+narrow batches (few eligible leaves, permits to spare) behave identically
+to before this window existed, `hashCaching` race included. Only a leaf
+that *loses* this first race is queued into a shared, per-batch
+`PendingEvalLeaf` window (a difference-list built during collect, finalised
+into a plain list once collect finishes, mirroring `SrcGroup`'s own
+`sg_fetches` idiom) instead of being condemned. Every subsequent
+fork-eligible leaf's own run-phase join action calls `topUpWindow` before
+consulting its own state: `topUpWindow` starts as many of the queue's
+front-most not-yet-started leaves as there are free permits for, strictly
+in traversal order, stopping at the first failure so a still-stuck leaf is
+retried by the *next* call rather than skipped past. A leaf whose own
+`stateRef` is still empty by the time its own join point arrives (window
+never reached it) pops itself off the queue's front -- which, by
+`topUpWindow`'s own invariant, it must still be -- and falls back to the
+same un-forked `doAnyEvalReqValue` call it always would have. **Only starts
+float; joins stay exactly where `Prep`'s own `Applicative` already
+sequences them**, left to right, unchanged. The window's size is bounded
+by the shared, engine-global permit pool alone -- no new knob.
+
+### The bug the first measurement caught: releasing at join time, not completion time
+
+Wiring the hybrid design up exactly as `docs/benchmark-notes.md`'s Stage 13
+described it -- `releasePermit` inside the same `finally` as the joining
+leaf's `Async.wait`, unchanged from the original collect-time-only fork --
+produced a measurement that contradicted its own premise: fork *successes*
+at width 8 **fell** from the unmodified baseline (32,790-34,831) to 7,090,
+even though time-weighted occupancy *rose* (4.71/7 to 6.37/7) and average
+per-fork hold time roughly *sextupled* (≈3.4 ms to ≈20 ms, computed from
+occupancy × window ÷ successes). The mechanism: joins are strictly
+left-to-right, but a fork's *actual work* finishing is not -- a fast leaf
+started right after a slow one (routine, given this graph's per-source
+latency tiers: 47-1288 μs) finishes its real work quickly, but under
+"release at join," its permit stays reserved for however long every leaf
+*before* it in join order takes to be reached and joined, not for how long
+its own work actually took. That idles permits on already-finished work
+instead of freeing them for `topUpWindow` to hand to the next queued leaf
+-- the opposite of the fix's own goal. The repair: release the permit (and
+the matching occupancy bump) **inside the forked action itself**, via a
+`finally` wrapped around the actual `runCompEngineM'` call passed to
+`forkTracked`, not around the joining leaf's `Async.wait`. The join still
+happens in order; `Async.wait` on an already-finished `Async.Async` (the
+common case once the window runs ahead of the join cursor) just reads a
+result. This also happens to close a latent gap in the pre-existing
+collect-time-only fork (not introduced by this stage, not chased further):
+a permit whose owning leaf's join action is never reached at all -- an
+earlier sibling threw first -- previously never called its `finally`
+either, since that `finally` lived on the join side; tying release to the
+fork's own completion means `cancelAllTracked`'s cancellation on the
+exception path now also guarantees the permit comes back.
+
+### The four metrics, before vs after (same session, `TIERED_BENCH_RERUN_KEYS=0`, default scale, `COMP_ENGINE_LOCK_STATS=1`, 2 reps/cell)
+
+| | width 1 | width 8 (before -> after) | width 16 (before -> after) |
+|---|---|---|---|
+| cold eval wall time | 72.49 -> 71.93 s | 21.51-21.83 s -> **19.17-19.76 s** | 22.37-22.47 s -> **9.67-10.04 s** |
+| fork attempts | 0 | 157,912-158,807 -> 330,536-333,658 | 155,825-156,474 -> 361,975-370,474 |
+| fork successes | 0 | 32,790-34,831 (21-22%) -> **16,496-20,946 (5-6%)** | 53,194-53,879 (34%) -> **60,370-66,569 (17-18%)** |
+| mean permits in use | 0.000 | 4.709-4.715 / 7 (67%) -> **6.314-6.335 / 7 (90%)** | 8.490-8.511 / 15 (57%) -> **12.316-12.398 / 15 (82%)** |
+| source-seconds / wall (56.37 s numerator) | 0.78x -> 0.78x | **2.60x -> 2.90x** | **2.51x -> 5.72x** |
+
+Batch-call counts (and therefore the leaf-count histogram) stayed
+bit-identical across every cell, confirming the graph itself did not move.
+
+### Width 16: the plateau is broken
+
+Stage 13's headline finding was that width 16 barely moved wall time
+against width 8 (17.9 vs 18.4 s in that stage's session) despite offering
+double the permit pool -- "more permits don't help" against a fan-out an
+order of magnitude past even the widest pool. That plateau is gone here:
+width 16 now measures **9.67-10.04 s, a genuine 2.2-2.3x speedup over
+width 8's 19.17-19.76 s**, where the unmodified baseline shows width 16
+*costing* slightly more than width 8 (22.4 vs 21.7 s, the plateau/mild
+regression Stage 13 documented). Effective concurrency more than doubles,
+2.51x to 5.72x, exactly the kind of jump "the window did what it claims"
+should produce. Occupancy rose from little more than half the pool (57%)
+to over four-fifths (82%), and total successful forks rose too (+19-25%
+depending on which pair of reps is compared). **This is not a null
+result at width 16** -- the sliding window measurably converts previously
+wasted, idle permit capacity into completed work.
+
+### Width 8: wall time improved, but the diagnostic story is genuinely mixed -- reported as found, not smoothed over
+
+Width 8 does **not** tell the same clean story, and this is worth stating
+plainly rather than folding into the width-16 win. Wall time did improve,
+consistently, across every paired rep (21.51-21.83 s to 19.17-19.76 s, a
+real ~9-12%) -- but occupancy rising sharply (67% to 90%) came together
+with the raw fork-success *count* **falling** (32,790-34,831 to
+16,496-20,946), the opposite of what this stage's own prediction expected
+("success ratio should rise sharply"). The fork-depth histogram explains
+where the successes moved, not just that they moved: the unmodified
+baseline's successes are overwhelmingly depth 6 (33,248 of ~34,880, 95%) --
+`riskScoreComp`'s own batch forking its direct children, exactly Stage
+13's finding. After the fix, depth 5 dominates instead (17,096 of ~20,948,
+82%), with depth 6 reduced to a few hundred. Depth is the *forking
+thread's own* ancestor-chain size, fixed per batch (captured once in
+`doSuspended`, shared by every leaf of that batch regardless of when its
+own fork attempt happens) -- so this is not a measurement artifact, it is
+successes genuinely concentrating one level shallower in the tree than
+before. The most likely explanation, not fully chased down: at width 8 the
+window doesn't just help `riskScoreComp`'s own 382-wide internal fan-out --
+it *also* lets `riskScoreComp`'s own **parent** batch (the depth-5 level,
+plausibly the per-patient batches the leaf histogram calls "140 eval
+leaves, unidentified exactly") successfully fork more of *its* eligible
+leaves too, letting several whole `riskScoreComp` evaluations for
+*different* patients run concurrently for the first time -- a kind of
+overlap the collect-time-only decision never produced at all, since a
+parent batch's own eligible leaves beyond its collect-time permit share
+were just as permanently condemned as anything else. That shifts demand
+for the same shared 7-permit pool from "one `riskScoreComp` instance
+forking heavily" to "several `riskScoreComp` instances competing," which
+would produce exactly this signature: more of the *pool's* capacity in use
+(higher occupancy, wall time down) but fewer of any *one* level's attempts
+succeeding outright (lower raw success count at the level that used to
+dominate). This is offered as the most likely reading of the data in hand,
+not a proven mechanism -- per this stage's own charter, **not chased
+further**: wall time did move, in the right direction, at both widths
+measured, which is the question this stage was actually asked to answer.
+
+### Width 1 unchanged
+
+- `Persist`: `allocated_bytes` (cold) **22,987,626,200 B identical**,
+  before and after, both freshly rebuilt in this session (the
+  `docs/benchmark-notes.md`-quoted `22,987,773,984 B` figure did not
+  reproduce for *either* build in this session's toolchain state --
+  session/toolchain drift on the target number itself, not a regression:
+  what matters is before and after agree, bit for bit, on the same build).
+- `Hospital`: **4,005.3 B/instance identical**, matching the documented
+  baseline exactly.
+- Tiered cold wall at width 1: 72.49 -> 71.93 s, flat within this session's
+  own noise band; `ce_par` is `Nothing` throughout (width 1 never allocates
+  `ParState`), so `prepEvalLeaf`'s `_ -> pure inline` branch is reached
+  before `mWindow` is ever touched -- literally the pre-window code path.
+
+### Tests
+
+`stack test --flag incremental-computations:werror` -- 158 pre-existing
+tests plus one new one (`test_slidingWindowForksMoreLeavesThanThePermitCountAtEvalWidth3`,
+`TestCompEvalConcurrency.hs`) proving the window forks more leaves than the
+raw permit count over a batch's lifetime, via distinct `Async`-spawned
+`ThreadId`s observed through a real `threadDelay` inside the state-if's
+`capEvaluationStarted` hook (safe IO, not inside a `CompM` body -- see this
+doc's own caveat on `unsafePerformIO` in a "pure" comp body). That test is
+stable across dozens of runs.
+
+`test_hashCachingCapReferencedTwiceInOneBatchEvaluatesOnceAtEvalWidth8`
+(pre-existing) is not: measuring it directly, in isolation from every other
+change in this stage, both **before and after this stage's commit, on
+the exact same optimised (`-O2`, no `--fast`) build `stack test` itself
+produces** -- the previously undocumented baseline is **22/60 ≈ 37%**
+failures (unmodified HEAD, this session), rising to **29/60 ≈ 48%** after
+this stage's change (60 standalone runs of the built test binary, each
+cell). Both figures are new measurements this stage took specifically
+because a single `stack test` run flagged the failure the CLAUDE.md brief
+warned about ("intermittently flaky ... do not chase it, but report if its
+character changes") -- the `--fast` (unoptimised) build shows **0/50** for
+both, confirming the race is real but requires call/allocation overhead
+low enough for a fresh green thread's scheduling latency to actually
+compete with an essentially-instant `pure` comp body's own claim-eval-
+release cycle, which only `-O2` gets close enough to. This is a genuine,
+if modest, character change (+11 points), most plausibly the one extra
+`IORef` write-then-read the window's cross-call-site retry design needs on
+the immediate collect-time attempt (see "the shape chosen" above) --
+**not chased further**, per the brief's own instruction: the failure mode
+is a test built on winning a hardware-scheduling race with a trivial body,
+not a correctness bug in the dedup mechanism itself (whichever side wins
+the race, the promise table still dedupes correctly; the only failure is
+both sides finishing with no overlap window at all).
+
+### Disposition
+
+Kept. `Control.Computations.CompEngine.Impl`: new `PendingEvalLeaf`
+newtype, `topUpWindow`/`popWindowFront` functions, `prepEvalLeaf` rewritten
+to the hybrid immediate-attempt/queued-retry shape above, `mWindow`
+threaded through `prepLeaf`/`doSuspended`'s general path (allocated only
+when `ce_par` is `Just`, so width 1 pays nothing new). `ed_forkAttempts`'s
+haddock updated: one logical leaf can now contribute more than one
+attempt/failure pair (retried across several later leaves' own join
+points) before it either succeeds or falls back to inline, unlike the
+collect-time-only decision this replaced. `TestCompReqCombined.hs`'s
+golden ordering trace was not touched.
