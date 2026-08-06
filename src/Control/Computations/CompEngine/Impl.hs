@@ -17,6 +17,7 @@ module Control.Computations.CompEngine.Impl (
   stepCompEngine,
   initCompEngine,
   evalWithCompEngine,
+  peekPromiseAwaits,
 )
 where
 
@@ -769,6 +770,18 @@ data OccupancyState = OccupancyState
    'doSuspended' -- independent of 'ce_par' entirely, since this is a
    structural property of the graph, not of forking, and is exactly as
    interesting at width 1 (see 'CompEngine'\'s 'ce_diag' haddock).
+ * 'ed_promiseAwaits': bumped once per call to 'doAnyEvalReqValue' that
+   resolves as a 'ClaimJoiner' rather than a 'ClaimOwner' -- i.e. once per
+   reference to a cap that found another reference's evaluation of the
+   *same* cap already in flight and joined it instead of re-evaluating.
+   Independently useful as a live dedup count (how much repeated-reference
+   work the promise table is actually saving), and it is what
+   "Control.Computations.CompEngine.Tests.TestCompEvalConcurrency"'s
+   @test_hashCachingCapReferencedTwiceInOneBatchEvaluatesOnceAtEvalWidth8@
+   polls (via 'peekPromiseAwaits') to know, deterministically rather than by
+   timing, that a second reference has actually claimed a join before
+   letting the first reference's (blocked, for exactly this test) evaluation
+   proceed.
 
  'ed_windowStart' fixes the mean-occupancy denominator's start; see
  'reportEngineDiag'.
@@ -780,6 +793,7 @@ data EngineDiag = EngineDiag
   , ed_forkFailures :: !(IORef Word64)
   , ed_occupancy :: !(TVar OccupancyState)
   , ed_depthHist :: !(IORef (Map Int Word64))
+  , ed_promiseAwaits :: !(IORef Word64)
   , ed_leafHist :: !(IORef (Map Int Word64))
   }
 
@@ -792,6 +806,7 @@ newEngineDiag = do
     <*> newIORef 0
     <*> newTVarIO (OccupancyState t0 0 0)
     <*> newIORef Map.empty
+    <*> newIORef 0
     <*> newIORef Map.empty
 
 {- | Parses @COMP_ENGINE_LOCK_STATS@ exactly as
@@ -862,6 +877,13 @@ recordDepth :: EngineDiag -> Int -> IO ()
 recordDepth diag depth =
   atomicModifyIORef' (ed_depthHist diag) (\m -> (Map.insertWith (+) depth 1 m, ()))
 
+-- | Bump 'ed_promiseAwaits' -- see that field's own haddock. Called from
+-- 'doAnyEvalReqValue'\'s 'ClaimJoiner' branch, once per reference that
+-- joins rather than owns.
+recordPromiseAwait :: EngineDiag -> IO ()
+recordPromiseAwait diag = modifyIORef' (ed_promiseAwaits diag) (+ 1)
+{-# INLINE recordPromiseAwait #-}
+
 recordLeafCount :: EngineDiag -> Int -> IO ()
 recordLeafCount diag n =
   atomicModifyIORef' (ed_leafHist diag) (\m -> (Map.insertWith (+) n 1 m, ()))
@@ -875,6 +897,24 @@ countEvalLeaves :: forall r. CompReq r -> Int
 countEvalLeaves (CompReqCombined x y) = countEvalLeaves x + countEvalLeaves y
 countEvalLeaves (CompReqEval _) = 1
 countEvalLeaves _ = 0
+
+{- | The current value of 'ed_promiseAwaits', live -- unlike every other
+ 'EngineDiag' table, which is only ever read back at teardown (see
+ 'reportEngineDiag'). @0@, not an error, when @COMP_ENGINE_LOCK_STATS@
+ diagnostics are off ('ce_diag' is 'Nothing'): a caller polling this to
+ detect "a joiner has actually shown up" (see
+ "Control.Computations.CompEngine.Tests.TestCompEvalConcurrency") is
+ expected to have turned diagnostics on for exactly that reason, but a
+ silent @0@ is a more honest answer than a partial function for the case
+ where it didn't.
+
+ Exported (unlike the rest of 'EngineDiag') purely so that test can observe
+ a real engine-internal signal -- "the second reference to a cap has
+ claimed a join on the first's still-in-flight evaluation" -- instead of
+ inferring it from timing.
+-}
+peekPromiseAwaits :: CompEngine -> IO Word64
+peekPromiseAwaits ce = maybe (pure 0) (readIORef . ed_promiseAwaits) (ce_diag ce)
 
 {- | Print every 'EngineDiag' table, called once at teardown from
  'stopCompEngine' -- see that function's haddock for the 'finally' that
@@ -904,6 +944,7 @@ reportEngineDiag ce = case ce_diag ce of
           | otherwise = 100 * fromIntegral part / fromIntegral whole :: Double
     depthHist <- readIORef (ed_depthHist diag)
     leafHist <- readIORef (ed_leafHist diag)
+    promiseAwaits <- readIORef (ed_promiseAwaits diag)
     putStrLn "=== COMP_ENGINE_LOCK_STATS: eval-fork diagnostics ==="
     printf
       "fork attempts: %d, successes: %d (%.1f%%), permit-starved failures: %d (%.1f%%)\n"
@@ -916,6 +957,7 @@ reportEngineDiag ce = case ce_diag ce of
       "time-weighted mean permits in use: %.3f (window %.3f s, ending at teardown)\n"
       meanOccupancy
       (fromIntegral elapsedNs / (1e9 :: Double))
+    printf "promise-table joins (repeated cap reference found the first still in flight): %d\n" promiseAwaits
     putStrLn "fork-depth histogram (forking thread's ancestor-chain depth -> successful forks):"
     forM_ (Map.toAscList depthHist) $ \(depth, n) -> printf "  depth %3d: %d\n" depth n
     putStrLn "eval-leaf-count-per-batch histogram (eval leaves in a CompReqCombined batch -> batch count):"
@@ -1539,6 +1581,16 @@ evalCompAp outerCap =
                 ++ ", owner claimed it under chain "
                 ++ show (HashSet.toList (ec_ancestors (ep_chain promise)))
             )
+          -- Recorded here, before the 'readMVar' below rather than after --
+          -- this is the moment this reference has *become* a joiner (the
+          -- owner's claim is still live in the promise table, or this
+          -- 'ClaimJoiner' couldn't exist), not the moment it wakes back up.
+          -- See 'ed_promiseAwaits'\'s haddock: a caller polling this counter
+          -- to detect "a joiner has shown up" needs it bumped at claim time,
+          -- not at resolution time, or the poll would only ever observe it
+          -- *after* the owner it's trying to unblock already had.
+          ce <- CompEngineM (asks id)
+          liftIO (whenDiag ce recordPromiseAwait)
           liftIO (writeIORef (ec_awaiting chain) (Just key))
           outcome <-
             liftIO $

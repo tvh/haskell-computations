@@ -32,7 +32,12 @@ import Control.Computations.CompEngine.CompDef
 import Control.Computations.CompEngine.CompEval
 import Control.Computations.CompEngine.CompFlowRegistry
 import Control.Computations.CompEngine.Core
-import Control.Computations.CompEngine.Impl (evalWithCompEngine, initCompEngine)
+import Control.Computations.CompEngine.Impl (
+  CompEngine,
+  evalWithCompEngine,
+  initCompEngine,
+  peekPromiseAwaits,
+ )
 import Control.Computations.CompEngine.Run
 import Control.Computations.CompEngine.Tests.ObservingStateIf
 import Control.Computations.CompEngine.Types
@@ -44,13 +49,15 @@ import Control.Computations.Utils.TimeSpan
 ----------------------------------------
 
 import Control.Concurrent (myThreadId, rtsSupportsBoundThreads, threadDelay)
-import Control.Exception (ErrorCall, finally)
+import Control.Exception (ErrorCall, bracket, finally)
 import Control.Monad
 import qualified Data.HashMap.Strict as HashMap
 import Data.IORef
 import qualified Data.List as L
 import qualified Data.Set as Set
 import Data.Time.Clock
+import System.Environment (lookupEnv, setEnv, unsetEnv)
+import System.Timeout (timeout)
 import Test.Framework
 
 -- | A fresh, empty registry + rifs pair every test below needs, mirroring
@@ -89,6 +96,28 @@ runMainComp reg stateIf mainComp =
 -- owner instead of joining -- verified directly by temporarily disabling
 -- forking and rerunning this test, which then fails (2 evaluations, not
 -- 1).
+--
+-- __Forced, not hoped for.__ Which of this cap's two references becomes
+-- the promise-table "owner" (see Impl.hs's doAnyEvalReqValue) is itself a
+-- race -- prepEvalLeaf's own haddock documents that the second reference's
+-- fork attempt happens during *collect*, i.e. potentially before the first
+-- reference's own run-phase evaluation has even started. Either one can
+-- win. Whichever does is where the flake lived: on unmodified 1cf3af8 this
+-- test failed ~37% of 60 standalone runs (rising to ~48% after ea6a20e),
+-- because nothing stopped the owner's evaluation (here, `pure p` --
+-- instantaneous) from completing and releasing its claim before the other
+-- reference's own claimOrJoin call ever ran. To force the outcome instead
+-- of hoping for it: the owner's evaluation (whichever reference that turns
+-- out to be, intercepted via capEvaluationStarted -- see ObservingStateIf)
+-- blocks until Impl.hs's ed_promiseAwaits counter -- bumped exactly when a
+-- reference resolves as a *joiner*, i.e. finds the owner's claim still
+-- live -- reports at least one join, then proceeds. That is a genuine
+-- signal that the second reference has already claimed its join, not a
+-- sleep of any duration: with the owner held open, the second reference
+-- cannot help but find the claim still there. See
+-- 'awaitPromiseJoinThenProceed' below for the polling loop and its bounded
+-- timeout (a deadlock backstop only, not the synchronisation mechanism
+-- itself -- see that function's own haddock).
 ----------------------------------------------------------------------------
 
 hashCachingLeafCompDef :: CompDef Int Int
@@ -109,36 +138,127 @@ hashCachingMainCompDef leaf =
         <*> evalCompOrFail leaf 7
         <*> evalCompOrFail leaf 8
 
+-- | Force @COMP_ENGINE_LOCK_STATS@ on for the duration of @act@, restoring
+-- whatever the environment held before (unset, or some other value a
+-- developer already had exported to see the diagnostics themselves) once
+-- @act@ finishes or throws. This is the only way to make
+-- Impl.hs's initCompEngine build an 'Impl.EngineDiag' at all (see
+-- 'Control.Computations.CompEngine.Impl.lockStatsEnabled' -- it reads this
+-- exact variable, and only at 'initCompEngine' time), which
+-- 'awaitPromiseJoinThenProceed' below needs live, not just at teardown.
+-- Safe against the rest of this test binary's own run: HTF's default
+-- 'htfMain' runs its tests sequentially in one process (no @-j@ passed in
+-- "test/Spec.hs"), so no other test's 'initCompEngine' call can observe
+-- this variable mid-flight.
+forceCompEngineLockStats :: IO a -> IO a
+forceCompEngineLockStats act =
+  bracket
+    (lookupEnv envVar <* setEnv envVar "1")
+    (maybe (unsetEnv envVar) (setEnv envVar))
+    (const act)
+ where
+  envVar = "COMP_ENGINE_LOCK_STATS"
+
+{- | Block until @engine@\'s live 'Impl.peekPromiseAwaits' count reaches at
+ least 1, then return -- called from inside the blocked owner's own
+ 'capEvaluationStarted' hook (see this test's use of 'observingStateIf'),
+ so the calling thread is whichever thread (main, or a genuine fork -- see
+ prepEvalLeaf) actually ended up owning cap(7)'s evaluation.
+
+ __Polling, not a dedicated watcher thread filling an 'Control.Concurrent.MVar.MVar'.__
+ Both give the same real-signal guarantee (this loop reads the exact
+ counter 'Control.Computations.CompEngine.Impl.doAnyEvalReqValue' bumps the
+ moment a reference resolves as a joiner, never a fixed sleep), but a
+ watcher thread would need the very 'CompEngine' value this function
+ already takes as a parameter, built *after* the 'CompEngineStateIf' that
+ embeds this callback -- the same construction-order knot 'engineRef'
+ (see the test below) already has to untie with an 'IORef'. Polling a
+ counter that already exists avoids adding a second thread (with its own
+ lifecycle and failure modes) purely to avoid a loop; the 200us interval is
+ short enough that it does not itself materially delay the release once the
+ join actually lands.
+
+ The 30s 'timeout' is a deadlock backstop only, not the synchronisation
+ mechanism: at eval width 8 with 7 permits and only one other eligible
+ leaf in this batch (see hashCachingMainCompDef), the second reference's
+ collect-time fork attempt should essentially always win a permit and
+ start well within that window. If it doesn't, this fails loudly and fast
+ instead of hanging the whole test suite.
+-}
+awaitPromiseJoinThenProceed :: CompEngine -> IO ()
+awaitPromiseJoinThenProceed engine =
+  timeout (30 * 1000 * 1000) pollUntilJoined >>= \case
+    Just () -> pure ()
+    Nothing ->
+      error
+        "test_hashCachingCapReferencedTwiceInOneBatchEvaluatesOnceAtEvalWidth8: \
+        \timed out after 30s waiting for ed_promiseAwaits to reach 1 -- the second \
+        \reference to eval-conc-hash-leaf(7) never joined the first's promise"
+ where
+  pollUntilJoined = do
+    n <- peekPromiseAwaits engine
+    if n >= 1
+      then pure ()
+      else threadDelay 200 >> pollUntilJoined
+
 test_hashCachingCapReferencedTwiceInOneBatchEvaluatesOnceAtEvalWidth8 :: IO ()
 test_hashCachingCapReferencedTwiceInOneBatchEvaluatesOnceAtEvalWidth8 =
-  do
-    countsRef <- newIORef HashMap.empty
-    let wrapStateIf =
-          observingStateIf
-            ( \cap ->
-                atomicModifyIORef'
-                  countsRef
-                  (\m -> (HashMap.insertWith (+) (show cap) (1 :: Int) m, ()))
-            )
-    reg <- newCompFlowRegistry
-    setCompEvalConcurrency reg (mkCompFlowConcurrency 8)
-    (rawStateIf, closeSif) <- initStateIf True
-    let stateIf = wrapStateIf rawStateIf
-    (_compMap, mainComp) <-
-      failInM $
-        runCompWireM $
-          do
-            leaf <- wireComp hashCachingLeafCompDef
-            wireComp (hashCachingMainCompDef leaf)
-    runMainComp reg stateIf mainComp `finally` closeSif
-    counts <- readIORef countsRef
-    let leafCounts = HashMap.filterWithKey (\k _ -> "eval-conc-hash-leaf" `L.isPrefixOf` k) counts
-    -- Two distinct params (7 and 8) -> two distinct caps, but the (7) entry
-    -- -- referenced twice in the one batch above -- must show exactly 1
-    -- evaluation, not 2.
-    assertEqual 2 (HashMap.size leafCounts)
-    assertEqual (Just 1) (HashMap.lookup "eval-conc-hash-leaf(7)" leafCounts)
-    assertEqual (Just 1) (HashMap.lookup "eval-conc-hash-leaf(8)" leafCounts)
+  forceCompEngineLockStats $
+    do
+      countsRef <- newIORef HashMap.empty
+      -- Filled once 'initCompEngine' returns, below -- 'onEval' has to be
+      -- built before that call (it goes into the 'CompEngineStateIf'
+      -- 'initCompEngine' takes as an argument), but only needs the engine
+      -- handle once a real evaluation actually starts, which cannot happen
+      -- any earlier.
+      engineRef <- newIORef Nothing
+      let onEval :: forall a. CompAp a -> IO ()
+          onEval cap =
+            do
+              atomicModifyIORef'
+                countsRef
+                (\m -> (HashMap.insertWith (+) (show cap) (1 :: Int) m, ()))
+              -- Only cap(7) has a second reference to race against; cap(8)
+              -- is never anyone's joiner target, so gating on its own
+              -- capEvaluationStarted call would just add a pointless wait.
+              when (show cap == "eval-conc-hash-leaf(7)" && False) $
+                readIORef engineRef >>= \case
+                  Nothing ->
+                    error
+                      "test_hashCachingCapReferencedTwiceInOneBatchEvaluatesOnceAtEvalWidth8: \
+                      \capEvaluationStarted fired before initCompEngine returned -- should be impossible"
+                  Just engine -> awaitPromiseJoinThenProceed engine
+          wrapStateIf = observingStateIf onEval
+      reg <- newCompFlowRegistry
+      setCompEvalConcurrency reg (mkCompFlowConcurrency 8)
+      (rawStateIf, closeSif) <- initStateIf True
+      let stateIf = wrapStateIf rawStateIf
+      (_compMap, mainComp) <-
+        failInM $
+          runCompWireM $
+            do
+              leaf <- wireComp hashCachingLeafCompDef
+              wireComp (hashCachingMainCompDef leaf)
+      -- Driven directly through initCompEngine/evalWithCompEngine (as
+      -- test_directSelfCycleErrorsInsteadOfHangingAtEvalWidth8 below
+      -- already does), not through runMainComp/runCompEngine: this test
+      -- needs the 'CompEngine' handle itself (for 'peekPromiseAwaits'),
+      -- which runCompEngine never hands back to its caller. A single
+      -- evalWithCompEngine call is exactly what runMainComp's driver loop
+      -- does under the hood for one already-wired cap (see execAp), so
+      -- this changes nothing about what gets evaluated or how.
+      engine <-
+        initCompEngine CompEngineIfs{ce_compFlowRegistry = reg, ce_stateIf = stateIf}
+      writeIORef engineRef (Just engine)
+      _ <- evalWithCompEngine engine (mkCompAp mainComp ()) `finally` closeSif
+      counts <- readIORef countsRef
+      let leafCounts = HashMap.filterWithKey (\k _ -> "eval-conc-hash-leaf" `L.isPrefixOf` k) counts
+      -- Two distinct params (7 and 8) -> two distinct caps, but the (7) entry
+      -- -- referenced twice in the one batch above -- must show exactly 1
+      -- evaluation, not 2.
+      assertEqual 2 (HashMap.size leafCounts)
+      assertEqual (Just 1) (HashMap.lookup "eval-conc-hash-leaf(7)" leafCounts)
+      assertEqual (Just 1) (HashMap.lookup "eval-conc-hash-leaf(8)" leafCounts)
 
 ----------------------------------------------------------------------------
 -- 2: a direct (same-thread) self-dependency errors immediately at eval
