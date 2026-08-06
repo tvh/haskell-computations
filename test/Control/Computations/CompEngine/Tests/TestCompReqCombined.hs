@@ -127,15 +127,20 @@ instance CompSrc TraceSrc where
   compSrcUnregister _ _ = pure ()
   compSrcWaitChanges _ = retry
 
-  -- Both TraceSrc instances below (b2SrcAId/b2SrcBId) are safe to run
-  -- concurrently -- 'compSrcExecute' only appends to a shared IORef via
-  -- 'atomicModifyIORef''. Declaring this doesn't change
-  -- 'test_goldenOrderingTraceAcrossSrcEvalSink' (that test's registry never
-  -- calls 'setCompEvalConcurrency', so parallel eval stays off and a
-  -- 'FlowConcurrent' declaration is inert -- see 'compSrcConcurrency'\'s
-  -- haddock); it's what lets
-  -- 'test_goldenOrderingTraceEvalSinkSubsequenceUnchangedAtWidth8' below
-  -- actually exercise the job path against the very same trace fixture.
+  -- Both TraceSrc instances below (b2SrcAId/b2SrcBId) declare
+  -- 'FlowConcurrent', though neither test below actually exercises overlap
+  -- for them: 'test_goldenOrderingTraceAcrossSrcEvalSink' never calls
+  -- 'setCompEvalConcurrency' at all (parallel eval stays off, and a
+  -- 'FlowConcurrent' declaration is inert then -- see
+  -- 'compSrcConcurrency'\'s haddock), and
+  -- 'test_goldenOrderingTraceUnchangedAtEvalWidth8' below turns parallel
+  -- eval on but its batch has exactly one eval leaf, which 'prepEvalLeaf'
+  -- always keeps inline on the calling thread regardless (see its own
+  -- comment) -- so nothing in either test ever forks, whatever this
+  -- declares. Declared 'FlowConcurrent' anyway because 'compSrcExecute'
+  -- really is safe under concurrent calls (only 'atomicModifyIORef'') and
+  -- because this is what let a now-deleted source-dispatch path be
+  -- exercised against this same trace fixture, back when one existed.
   compSrcConcurrency _ = FlowConcurrent
 
 data TraceWriteReq a where
@@ -253,27 +258,41 @@ test_goldenOrderingTraceAcrossSrcEvalSink =
       wireComp (b2MainCompDef b2SrcAId b2SrcBId leaf b2SinkId)
 
 {- | B.2's companion at eval width 8: the golden trace literal above is
- frozen (see the module haddock) and must not be edited, but concurrency is
- allowed to change *when* a job-eligible source leaf's read lands relative
- to the batch's other leaves -- see 'prepSrcLeaf's haddock in "Impl". Both
- 'TraceSrc' instances now declare 'FlowConcurrent' (see above), and this
- batch's three leaves (two source, one eval) always take the general,
- Prep-based path regardless of concurrency (three leaves, one of them
- itself nested -- never the two-leaf fast path's domain), so raising eval
- concurrency alone is enough to reach 'Control.Computations.CompEngine.Impl.dispatchSrcJobs'
- here: with parallel eval on (@ce_par@ 'Just', via 'setCompEvalConcurrency'
- below) and 7 permits free, srcA's and srcB's reads both run during the
- batch's dispatch-then-drain phase, before any of the batch's engine-thread
- work (including "eval b2-leaf(1)") even starts -- their relative order to
- *each other* is whatever the OS scheduler picks, and their position
- relative to the eval\/sink entries can float. What must NOT move is the
- eval\/sink entries' order relative to *each other*: filtering the src
- entries back out of the trace must reproduce the same subsequence as the
- golden trace above, proving concurrency reordered only what it's allowed
- to reorder.
+ frozen (see the module haddock) and must not be edited.
+
+ Before source dispatch was deleted, this test's whole point was that
+ raising eval concurrency let a job-eligible source leaf's read float
+ relative to the batch's other leaves -- with parallel eval on and permits
+ free, srcA's and srcB's reads both ran during the batch's
+ dispatch-then-drain phase, before any of the batch's engine-thread work
+ (including "eval b2-leaf(1)") even started, so only the *src* entries'
+ position could move; the eval\/sink entries' relative order to each other
+ could not.
+
+ With no dispatch left, the honest answer is that nothing in this specific
+ batch can float any more, at any eval width, so the trace this test
+ produces is not merely a subsequence of the golden one above -- it is
+ identical to it, verbatim. Two things establish that independently:
+
+  * a bare source leaf never forks on its own -- only 'prepEvalLeaf's own
+    forks ever run on a separate OS thread -- so srcA and srcB are always
+    triggered exactly where enginePhase's left-to-right walk reaches them,
+    same as at width 1;
+  * 'prepEvalLeaf' always keeps a batch's *first* eval leaf inline on the
+    calling thread, however many permits are free (see 'ParState'\'s
+    haddock on 'ps_permits'). This batch has exactly one eval leaf
+    (b2-leaf), so it is always that first (and only) one, and runs inline
+    unconditionally, regardless of 'ce_par'.
+
+ This is still worth keeping as its own test rather than folding into B.2's
+ unmodified-engine case above: it pins down that raising eval concurrency
+ alone, with no eval leaf in this batch able to actually fork, is provably
+ a no-op for this shape -- exactly the kind of regression a future change
+ to 'prepEvalLeaf's "keep the first leaf inline" rule could otherwise break
+ silently.
 -}
-test_goldenOrderingTraceEvalSinkSubsequenceUnchangedAtWidth8 :: IO ()
-test_goldenOrderingTraceEvalSinkSubsequenceUnchangedAtWidth8 =
+test_goldenOrderingTraceUnchangedAtEvalWidth8 :: IO ()
+test_goldenOrderingTraceUnchangedAtEvalWidth8 =
   do
     traceRef <- newIORef []
     let srcA = TraceSrc{trs_name = "b2-srcA", trs_traceRef = traceRef}
@@ -303,18 +322,15 @@ test_goldenOrderingTraceEvalSinkSubsequenceUnchangedAtWidth8 =
             }
     runCompEngine ifs caps rifs () `finally` closeSif
     trace <- readIORef traceRef
-    let isSrcEntry entry = "src " `L.isPrefixOf` entry
-        (srcEntries, evalSinkEntries) = L.partition isSrcEntry trace
     assertEqual
       [ "eval b2-main(())"
+      , "src b2-srcA keyA"
       , "eval b2-leaf(1)"
       , "eval b2-inner(1)"
+      , "src b2-srcB keyB"
       , "sink b2-sink result"
       ]
-      evalSinkEntries
-    assertEqual
-      (HashSet.fromList ["src b2-srcA keyA", "src b2-srcB keyB"])
-      (HashSet.fromList srcEntries)
+      trace
  where
   compDefs =
     do

@@ -754,11 +754,13 @@ rerunMutationTarget srcs patientCount n =
 -- be set before 'runCompEngine' starts: it is read exactly once, by
 -- @initCompEngine@, so setting it any later than this has no effect (see
 -- 'setCompEvalConcurrency'\'s own haddock). There is no source-side sibling
--- knob any more -- source dispatch now draws from the same eval permit pool
--- @evalWidth@ sizes (see "Control.Computations.CompEngine.Impl"'s
--- @dispatchSrcJobs@); @docs\/benchmark-notes.md@ Stage 12/12a measured the
--- old source-side width flat on this benchmark's own graph shape before it
--- was removed.
+-- knob any more, and no source-side dispatch either -- a source group's
+-- bundled call always runs inline, triggered by whichever of its member
+-- leaves 'enginePhase' reaches first (see
+-- "Control.Computations.CompEngine.Impl"'s @runGroupOnce@);
+-- @docs\/benchmark-notes.md@ Stage 12/12a measured the old source-side width
+-- flat on this benchmark's own graph shape before it was removed, and Stage
+-- 12's "Disposition" is what led to deleting dispatch outright.
 withTieredFlows :: TieredSrcs -> HashMapFlow -> Int -> CompFlowRegistry -> IO () -> IO ()
 withTieredFlows srcs sink evalWidth reg action = do
   setCompEvalConcurrency reg (mkCompEvalConcurrency evalWidth)

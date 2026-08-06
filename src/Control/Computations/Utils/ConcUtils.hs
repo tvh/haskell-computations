@@ -71,14 +71,12 @@ timeoutFail name ts action =
  exception).
 
  Written for "Control.Computations.CompEngine.Impl"'s permit-pool forks
- (both 'Control.Computations.CompEngine.Impl.prepEvalLeaf's eval-leaf forks
- and 'Control.Computations.CompEngine.Impl.dispatchSrcJobs's source-dispatch
- forks): each must be able to report its own job's exception back to its
- caller without ever swallowing a genuine 'Async.cancel' (or 'killThread')
- aimed at the fork itself -- silently catching that would leave the fork
- running arbitrary user code (ultimately a cap's own body, or
- 'Control.Computations.CompEngine.CompSrc.compSrcExecute') after whatever
- cancelled it believes the pool is gone.
+ ('Control.Computations.CompEngine.Impl.prepEvalLeaf's eval-leaf forks):
+ each must be able to report its own job's exception back to its caller
+ without ever swallowing a genuine 'Async.cancel' (or 'killThread') aimed
+ at the fork itself -- silently catching that would leave the fork running
+ arbitrary user code (ultimately a cap's own body) after whatever cancelled
+ it believes the pool is gone.
 -}
 trySync :: IO a -> IO (Either SomeException a)
 trySync action =
@@ -91,11 +89,10 @@ trySync action =
 {- | Fork @action@ onto its own 'Async.Async', appending an existentially
  result-erased copy of the handle to @pendingRef@ so a caller can guarantee
  -- via 'cancelAllTracked' -- that every fork it ever started during some
- dynamic-width unit of work (a batch's eval-leaf forks and source-dispatch
- forks, both in "Control.Computations.CompEngine.Impl"'s @doSuspended@
- machinery -- see 'Control.Computations.CompEngine.Impl.prepEvalLeaf' and
- 'Control.Computations.CompEngine.Impl.dispatchSrcJobs', its only two
- current callers) is accounted for even if the caller never gets around to
+ dynamic-width unit of work (a batch's eval-leaf forks, in
+ "Control.Computations.CompEngine.Impl"'s @doSuspended@ machinery -- see
+ 'Control.Computations.CompEngine.Impl.prepEvalLeaf', its only current
+ caller) is accounted for even if the caller never gets around to
  individually joining it (e.g. an earlier sibling leaf's exception means the
  run phase never reaches this one at all -- see 'cancelAllTracked').
 
@@ -120,8 +117,7 @@ forkTracked pendingRef action = do
  (every fork already joined, so this is a no-op sweep) and the exception
  path (some forks never individually joined, so this is what actually tears
  them down) -- see "Control.Computations.CompEngine.Impl"'s @doSuspended@
- (wraps 'enginePhase') and 'Control.Computations.CompEngine.Impl.dispatchSrcJobs'
- (wraps its own dispatch-and-join sequence), its two current callers.
+ (wraps 'enginePhase'), its only current caller.
 -}
 cancelAllTracked :: IORef [Async.Async ()] -> IO ()
 cancelAllTracked pendingRef = readIORef pendingRef >>= mapM_ Async.cancel

@@ -262,10 +262,11 @@ $ stack bench
 $ PERSIST_BENCH_SCALE=0.1 stack bench
 ```
 
-A second benchmark, the Hospital pipeline benchmark, exercises concurrent
-source dispatch (see below) with a graph whose comp bodies build real
-applicative batches and whose source has configurable latency to hide —
-things the scale benchmark's graph structurally cannot do. Run it with:
+A second benchmark, the Hospital pipeline benchmark, uses a graph whose
+comp bodies build real applicative batches (see "Concurrent flow
+execution", below, for what bundling and `FlowConcurrent` do with them) and
+whose source has configurable latency to hide — things the scale
+benchmark's graph structurally cannot do. Run it with:
 
 ```
 $ HOSPITAL_BENCH=1 stack bench
@@ -308,9 +309,10 @@ run; `TIERED_BENCH_JITTER` (default off) adds deterministic per-key jitter
 to each simulated round trip; `TIERED_BENCH_BUNDLING` (default on) toggles
 whether same-instance multi-key requests bundle into one round trip;
 `TIERED_BENCH_EVAL_CONCURRENCY` (default `1`) sets the eval concurrency
-width (`setCompEvalConcurrency`, see below) — which also governs how much
-source dispatch (see below) can overlap, since the two now share one
-permit pool. Like Hospital, it also runs a rerun-heavy live phase, controlled
+width (`setCompEvalConcurrency`, see below), the engine's only concurrency
+knob — see "Concurrent flow execution", below, for how a `FlowConcurrent`
+source's own overlap now depends on it. Like Hospital, it also runs a
+rerun-heavy live phase, controlled
 the same way: `TIERED_BENCH_RERUN_KEYS` (default `400`, `0` disables the
 phase) and `TIERED_BENCH_RERUN_LOOPS` (default `1`).
 
@@ -331,25 +333,44 @@ defaulting to `FlowSerial`) — see "Concurrent computation evaluation" below
 for why a sink needs an opinion here at all once cap evaluation itself can
 run on more than one thread.
 
-There is no separate width knob for source (or sink) dispatch — an earlier
-one existed and was removed as dead weight, measured flat on two
-independent realistic graph shapes (see `docs/benchmark-notes.md`'s Stage
-12/12a). A `FlowConcurrent` source's leaves may instead be proactively
-dispatched against the *eval* concurrency pool ("Concurrent computation
-evaluation", below): dispatch draws permits from that same shared pool
-rather than a separately-sized one, so how much source dispatch can
-actually overlap is governed entirely by `setCompEvalConcurrency`. A
-`FlowSerial` instance, or any instance reached while parallel eval is off,
-is never proactively dispatched — it always runs inline, in leaf order, on
-the engine thread, exactly as before this mechanism existed. Losing the
-race for a permit is not a failure, either: an undispatched `FlowConcurrent`
-group simply runs at its own leaf's position instead, so dispatch is purely
-a performance optimization, never a correctness requirement.
+There is no source (or sink) dispatch at all any more, and never a separate
+width knob for it — an earlier version of this project had both a
+source-side width and a proactive dispatch worker, and measured neither
+earning its keep: the width was flat on every graph shape tried, and once
+it was deleted in favor of sharing the eval permit pool, dispatch itself
+turned out to be mildly counterproductive — it competed with eval-leaf
+forking for the same permits and *lowered* source concurrency high-water
+marks on the one benchmark shaped to exercise it, for no wall-time gain
+bundling didn't already provide (see `docs/benchmark-notes.md`'s Stage 12's
+"Disposition"). Every `CompSrc` instance's requests within a batch are
+bundled into one `compSrcExecuteBatch` call regardless (see below), and
+that bundled call now always runs lazily: whichever of the instance's
+member leaves the engine's left-to-right batch walk reaches first triggers
+it, in place, on whichever thread reached it — exactly the position a
+`FlowSerial` instance (or any instance reached while parallel eval is off)
+already ran at before dispatch ever existed.
+
+That "whichever thread reached it" clause is where `FlowConcurrent` still
+earns its keep. Two eval leaves — nested cap evaluations inside an
+applicative batch, forked onto separate OS threads by
+`setCompEvalConcurrency`'s pool (see "Concurrent computation evaluation",
+below) — can each build their own nested batch against the very same
+source instance, and those two `compSrcExecuteBatch` calls genuinely run at
+the same time. For a `FlowConcurrent` instance that's exactly the point:
+its own `compSrcExecuteBatch` override, if it has one, is free to overlap
+its sub-requests (see `HashMapFlow`, `TimeSrc`, `FileSrc` below). For a
+`FlowSerial` instance, a per-instance lock (taken around the bundled call,
+released before either thread evaluates another cap or joins another
+promise, so it can't deadlock) restores the "one at a time" guarantee even
+though two different threads are asking. Without any eval concurrency
+turned on, none of this arises — nothing ever forks, and every source read
+runs exactly where it always did.
 
 `HashMapFlow`, `TimeSrc`, and `FileSrc` all declare `FlowConcurrent`. A
 source that hasn't opted in stays serialized no matter how much eval
 concurrency is available. See `docs/benchmark-notes.md`'s Stage 5 for the
-original design and measured numbers.
+original design and measured numbers, and Stage 12's "Disposition" for why
+dispatch was deleted.
 
 ## Concurrent computation evaluation
 
@@ -375,17 +396,17 @@ compDriver
 ```
 
 The default width is 1: no fork pool is allocated at all, and every eval
-leaf runs exactly as it did before this knob existed, and no `FlowConcurrent`
-source or sink ever gets proactively dispatched either (see "Concurrent flow
-execution", above). Nothing changes unless you opt in.
+leaf runs exactly as it did before this knob existed. With no eval leaf
+ever forking, no `FlowConcurrent` source or sink ever gets a second thread
+to overlap on either (see "Concurrent flow execution", above) — nothing
+changes unless you opt in.
 
-This is the *only* concurrency width knob the engine exposes: source
-dispatch draws from this same pool rather than a separately-sized one of
-its own (an earlier version of this project had a second, source-side width
-knob; it was removed as dead weight — see `docs/benchmark-notes.md`'s Stage
-12/12a). It must be set before the engine starts: it is read exactly once,
-at engine start, so a call after that has no effect on an already-running
-engine.
+This is the *only* concurrency width knob the engine exposes — there is no
+source-side sibling (an earlier version of this project had one; it was
+removed as dead weight, along with the proactive source-dispatch worker it
+sized — see `docs/benchmark-notes.md`'s Stage 12's "Disposition"). It must
+be set before the engine starts: it is read exactly once, at engine start,
+so a call after that has no effect on an already-running engine.
 
 **Measured effect.** On the tiered benchmark (see Benchmark, above),
 `docs/benchmark-notes.md`'s Stage 15 measured, within one session, cold

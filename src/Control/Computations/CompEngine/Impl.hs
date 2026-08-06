@@ -109,10 +109,12 @@ data CompEngine = CompEngine
    work finishes, whatever the outcome -- __not__ when some later caller
    gets around to 'Async.wait'-ing it (see 'prepEvalLeaf'\'s own note on why
    tying release to join order, rather than to actual completion, throttles
-   the whole pool behind whichever leaf is slowest to be joined). This same
-   pool is also what 'dispatchSrcJobs' draws its permits from for source
-   dispatch, deliberately -- see that function's haddock for why sharing one
-   bound between eval-leaf forking and source dispatch is safe.
+   the whole pool behind whichever leaf is slowest to be joined). 'prepEvalLeaf'
+   is this pool's only drawer -- there is no separate source-side dispatch
+   any more (removed once bundling was shown to subsume it on every workload
+   measured, see @docs\/benchmark-notes.md@ Stage 12's "Disposition"); a
+   source group's bundled call always runs inline, on whichever thread's
+   'enginePhase' walk reaches its first member leaf (see 'runGroupOnce').
  * 'ps_width' is the raw width, kept alongside the derived permit count
    purely so a diagnostic doesn't have to reconstruct it from
    @width - 1@ backwards.
@@ -409,21 +411,20 @@ instance Applicative Prep where
  reason -- a batch of thousands of same-instance leaves must not re-copy
  this list on every append), plus a run-once guard so the group's bundled
  'Control.Computations.CompEngine.CompSrc.compSrcExecuteBatch' call fires
- exactly once no matter which of its member leaves reaches it first, or
- whether the engine proactively ran it as a dispatched job before any leaf
- was even reached (see 'runGroupOnce').
+ exactly once no matter which of its member leaves reaches it first (see
+ 'runGroupOnce').
 -}
 data SrcGroup s = SrcGroup
   { sg_src :: s
-  , sg_conc :: FlowConcurrency
   , sg_fetches :: IORef ([SrcFetch s] -> [SrcFetch s])
   , sg_triggered :: IORef Bool
   , sg_lock :: Option (MVar ())
   -- ^ 'Some' iff this group's instance actually needs 'runGroupOnce' to
   -- serialize against a concurrently-forked sibling -- i.e. iff parallel
-  -- eval is enabled *and* @sg_conc@ is 'FlowSerial' -- resolved once, here,
-  -- at group-creation time (see 'getOrCreateGroup'), rather than
-  -- re-checked on every 'runGroupOnce' call: the group is only ever
+  -- eval is enabled *and* 'getOrCreateGroup's own @conc@ argument (that
+  -- instance's registered 'FlowConcurrency') is 'FlowSerial' -- resolved
+  -- once, here, at group-creation time (see 'getOrCreateGroup'), rather
+  -- than re-checked on every 'runGroupOnce' call: the group is only ever
   -- triggered once anyway (see 'sg_triggered'), so there is nothing to
   -- gain from deferring the lookup, and doing it once keeps 'runGroupOnce'
   -- itself a plain 'SrcGroup' consumer with no registry\/'ce_par' access of
@@ -486,35 +487,32 @@ getOrCreateGroup reg parEnabled groupsRef ix src conc = do
         if parEnabled && conc == FlowSerial
           then Some <$> lookupSrcLock reg ix
           else pure None
-      let g = SrcGroup src conc fetchesRef triggeredRef lock
+      let g = SrcGroup src fetchesRef triggeredRef lock
       writeIORef groupsRef ((ix, SomeSrcGroup g) : groups)
       pure g
 
 {- | Run @g@\'s bundled 'compSrcExecuteBatch' call exactly once, however many
- times (and from however many threads) this is called for the same group:
- the 'sg_triggered' guard makes every call after the first a no-op. This is
- what lets the same function serve both dispatch paths a group can take
- (see the 'CompReqCombined' case of 'doSuspended'):
-
-  * a 'FlowConcurrent' group dispatched as a job calls this from a
-    'dispatchSrcJobs' fork, before 'enginePhase' runs at all -- by the time
-    any member leaf's own 'CompEngineM' action (built by 'prepSrcLeaf',
-    below) reaches this same call, it is already a no-op and just reads its
-    own slot;
-  * a group that was never dispatched -- a 'FlowSerial' instance, parallel
-    eval disabled, or one that simply lost the src-dispatch permit race
-    (see 'dispatchSrcJobs') -- is never proactively triggered, so this call
-    happens for the first time when the *first* of
-    its member leaves is reached inside 'enginePhase'\'s left-to-right run,
-    exactly the position a single, unbundled 'compSrcExecute' call would
-    have run at before this group existed. This is deliberate: bundling
-    genuinely needs no worker thread, so it is applied even when nothing is
-    ever dispatched as a job at all (see
-    "Control.Computations.CompEngine.CompSrc".'Control.Computations.CompEngine.CompSrc.compSrcExecuteBatch'\'s
-    haddock) -- but doing so must not change *when*, relative to the rest of
-    the batch's leaves, this instance's data is actually asked for, which is
-    exactly what the golden ordering trace in
-    "Control.Computations.CompEngine.Tests.TestCompReqCombined" pins down.
+ of @g@\'s member leaves ('enginePhase'\'s left-to-right run reaches them one
+ at a time, via 'prepSrcLeaf'\'s @readMySlot@, below) call this: the
+ 'sg_triggered' guard makes every call after the first a no-op, so only the
+ *first* member leaf reached actually runs 'compSrcExecuteBatch', exactly
+ the position a single, unbundled 'compSrcExecute' call would have run at
+ before this group existed. This is deliberate: bundling genuinely needs no
+ worker thread of its own (see
+ "Control.Computations.CompEngine.CompSrc".'Control.Computations.CompEngine.CompSrc.compSrcExecuteBatch'\'s
+ haddock) -- there is no proactive dispatch path any more (bundling was
+ measured to subsume it on every workload tried, see
+ @docs\/benchmark-notes.md@ Stage 12's "Disposition"), so this call always
+ happens lazily, on whichever thread's 'enginePhase' walk reaches @g@\'s
+ first member leaf. Every member leaf of one group is reached from the
+ *same* batch's own sequential 'enginePhase' walk (see the
+ 'CompReqCombined' case of 'doSuspended', where @g@\'s @groupsRef@ is
+ created fresh per batch), so this guard's job is simpler than it might
+ look: it is resolving repeat visits from one thread's own sequential walk,
+ not a race between threads -- but doing so must not change *when*,
+ relative to the rest of the batch's leaves, this instance's data is
+ actually asked for, which is exactly what the golden ordering trace in
+ "Control.Computations.CompEngine.Tests.TestCompReqCombined" pins down.
 
  Guarded by 'Control.Computations.Utils.ConcUtils.trySync' at the group
  level, on top of whatever fault isolation @compSrcExecuteBatch@ itself
@@ -981,70 +979,10 @@ tryAcquirePermit permits = atomically $ do
 
 -- | Give a permit taken by 'tryAcquirePermit' back to the pool -- called
 -- once per successful acquire, unconditionally (success, failure, or
--- cancellation of the forked job that acquired it), from 'prepEvalLeaf' and
--- 'dispatchSrcJobs' alike.
+-- cancellation of the forked job that acquired it), from 'prepEvalLeaf',
+-- its only caller.
 releasePermit :: TVar Int -> IO ()
 releasePermit permits = atomically (modifyTVar' permits (+ 1))
-
-{- | Dispatch @jobs@ (one 'runGroupOnce' call per proactively-dispatchable
- 'FlowConcurrent' 'SrcGroup' the batch being prepared holds -- see the sole
- caller, the 'CompReqCombined' case of 'doSuspended') against @par@'s
- __shared eval permit pool__, rather than a separately-sized worker pool of
- its own -- there is no fixed width here at all, and no queue: every job
- gets exactly one 'tryAcquirePermit' attempt.
-
- __A job that loses that race is simply left undispatched__, never queued or
- retried. That's safe, not just convenient: 'runGroupOnce'\'s own
- 'sg_triggered' guard (see its haddock) makes dispatch here purely an
- optimisation -- an undispatched group still runs, inline, the first time
- 'enginePhase'\'s left-to-right walk reaches one of its member leaves, which
- is exactly the position it would have run at if it had never been a
- dispatch candidate at all (the pre-existing behaviour for a 'FlowSerial'
- group, or any group reached while parallel eval is off).
-
- __Contention with 'prepEvalLeaf'.__ This draws from the very same
- @ps_permits par@ pool eval-leaf forking does, by design -- one shared
- bound on total in-flight work, rather than two independently-sized pools
- that could each claim to be "full" while the other sits idle. That sharing
- is safe precisely because both sides are try-only with an inline fallback
- (this one falls back to 'enginePhase' running the group inline;
- 'prepEvalLeaf' falls back to Cilk-style serial elision) -- a lost race on
- either side only ever means more fallback work for that side, never a
- wait, so neither can starve the other into blocking.
-
- __Never blocks acquiring a permit__ (matches 'prepEvalLeaf'\'s own
- discipline -- see its haddock's "tryAcquirePermit only, never block"), and
- __always releases inside the forked action, on completion__, not at join
- time -- the same regression 'prepEvalLeaf'\'s own note on release timing
- describes (also documented at @docs\/benchmark-notes.md@ Stage 15, "The
- permit-release bug the window work uncovered": releasing at join time
- holds a fast job's permit hostage behind however long every job before it
- in join order takes to actually be joined).
-
- __Preserves the dispatch-then-drain barrier__: every fork this starts is
- tracked (via 'forkTracked', into a pool-local list) and joined, with
- 'Async.wait', before this function returns -- so by the time
- 'doSuspended'\'s @jobs@ comment's three reasons apply (in particular:
- 'enginePhase'\'s reads of a dispatched group's member slots, via
- 'prepSrcLeaf'\'s @readMySlot@, must never block), every job this call
- started has unconditionally already finished. The whole dispatch-and-join
- sequence runs under 'cancelAllTracked' in a 'Control.Exception.finally', a
- no-op sweep on the happy path (everything already joined) and the actual
- teardown on any exception path (mirroring 'doSuspended'\'s own use of
- 'cancelAllTracked' around 'enginePhase').
--}
-dispatchSrcJobs :: ParState -> [IO ()] -> IO ()
-dispatchSrcJobs par jobs = do
-  pendingRef <- newIORef []
-  let dispatchAll = forM_ jobs $ \job -> do
-        acquired <- tryAcquirePermit (ps_permits par)
-        when acquired $
-          void $
-            forkTracked
-              pendingRef
-              (job `Control.Exception.finally` releasePermit (ps_permits par))
-  (dispatchAll >> readIORef pendingRef >>= mapM_ Async.wait)
-    `Control.Exception.finally` cancelAllTracked pendingRef
 
 {- | The sliding fork window: one not-yet-started eval leaf of a
  'CompReqCombined' batch, queued by 'prepEvalLeaf' during the batch's
@@ -1712,11 +1650,10 @@ evalCompAp outerCap =
    it there and then if nothing has already -- see 'runGroupOnce') and then
    reads this leaf's own result back out of its slot.
 
-   Which requests actually become one 'compSrcExecuteBatch' call, and
-   whether that call is proactively dispatched to a worker or left to run
-   lazily on the engine thread, is decided once per *group*, not per leaf --
-   see the 'CompReqCombined' case of 'doSuspended', which is the only
-   caller and is where @groupsRef@ comes from.
+   Which requests actually become one 'compSrcExecuteBatch' call is decided
+   once per *group*, not per leaf -- see the 'CompReqCombined' case of
+   'doSuspended', which is the only caller and is where @groupsRef@ comes
+   from.
   -}
   prepSrcLeaf
     :: forall s a
@@ -1748,18 +1685,39 @@ evalCompAp outerCap =
     -- sg_src g's own compSrcId, computed once here instead of once per
     -- dependency inside readMySlot below (see wrapCompSrcDep's haddock).
     cid = unTypedCompSrcId sid
-    -- The engine-thread half of every source leaf, job or not: make sure
-    -- this leaf's group has actually run (a no-op if some other leaf's
-    -- CompEngineM action, or a dispatched job, already triggered it -- see
-    -- 'runGroupOnce'), then read this leaf's own slot and either re-raise a
-    -- stored exception or finish exactly like before batching existed, via
-    -- 'dependOn'. Every leaf's CompEngineM action here is composed
-    -- leaf-by-leaf through CompEngineM's left-to-right Applicative (see
-    -- Prep's haddock), so an exception raised for a leaf earlier in the
-    -- batch stops any later leaf's slot from ever being read -- the
-    -- leftmost failing leaf is the one whose exception escapes, mirroring
-    -- compMAp's left-error bias at the Fail level (Types.hs, compMAp's
-    -- haddock).
+    -- The engine-thread half of every source leaf: make sure this leaf's
+    -- group has actually run (a no-op if some earlier leaf's CompEngineM
+    -- action already triggered it -- see 'runGroupOnce'), then read this
+    -- leaf's own slot and either re-raise a stored exception or finish
+    -- exactly like before batching existed, via 'dependOn'.
+    --
+    -- This 'runGroupOnce' call can never find the slot unfilled, i.e. can
+    -- never hit the "invariant broken" error just below -- there is no
+    -- dispatch path any more to have filled it early on some other thread,
+    -- and nothing else can be filling it late, either. @g@ belongs to
+    -- exactly one 'CompReqCombined' batch (its @groupsRef@ is allocated
+    -- fresh per batch in 'doSuspended', never shared across batches), and
+    -- every member leaf of that batch is reached from that *same* batch's
+    -- own sequential 'enginePhase' walk -- a forked eval leaf (see
+    -- 'prepEvalLeaf') evaluates a different cap entirely, on its own fresh
+    -- 'CompEngineM' state, and if that nested evaluation reads sources of
+    -- its own it does so through its *own* 'CompReqCombined' case and its
+    -- own fresh @groupsRef@, never this one. So @g@'s 'sg_triggered' guard
+    -- is only ever consulted, and its 'compSrcExecuteBatch' call only ever
+    -- run, by the one thread walking this batch's 'enginePhase' -- either
+    -- this call is the first to reach @g@ and 'runGroupOnce' fills the slot
+    -- right here, synchronously, before the 'readIORef' below, or an
+    -- earlier leaf of the same sequential walk already did, and by
+    -- definition already returned before this leaf's turn came up. Either
+    -- way the slot is always filled before it is read; this call cannot
+    -- block and cannot observe a stale 'Nothing'.
+    --
+    -- Every leaf's CompEngineM action here is composed leaf-by-leaf through
+    -- CompEngineM's left-to-right Applicative (see Prep's haddock), so an
+    -- exception raised for a leaf earlier in the batch stops any later
+    -- leaf's slot from ever being read -- the leftmost failing leaf is the
+    -- one whose exception escapes, mirroring compMAp's left-error bias at
+    -- the Fail level (Types.hs, compMAp's haddock).
     readMySlot
       :: SrcGroup s
       -> IORef (Maybe (Either SomeException (CompSrcDeps s, Fail a)))
@@ -2134,8 +2092,7 @@ evalCompAp outerCap =
             -- difference-list accumulator (same O(1)-append idiom
             -- @sg_fetches@ uses); it is read out into @windowRef@ -- the
             -- actual queue 'topUpWindow' consumes -- exactly once, right
-            -- after the traversal below finishes, mirroring how @groups@
-            -- is read out of @groupsRef@ just below.
+            -- after the traversal below finishes.
             mWindow <-
               if isJust (ce_par ce)
                 then liftIO (Just <$> ((,) <$> newIORef id <*> newIORef []))
@@ -2146,84 +2103,98 @@ evalCompAp outerCap =
                     (traverseCompReq (prepLeaf env ce reg groupsRef firstEvalSeenRef forksRef mWindow) req)
                 )
             -- Read out into the actual queue 'topUpWindow' consumes,
-            -- exactly once, right after the traversal above finishes,
-            -- mirroring how @groups@ is read out of @groupsRef@ just
-            -- below. By this point @windowRef@ only ever holds a leaf
-            -- whose own collect-time 'tryStart' attempt (see
-            -- 'prepEvalLeaf') already lost the permit race -- every leaf
-            -- that won it is already forked, exactly as it always was.
+            -- exactly once, right after the traversal above finishes. By
+            -- this point @windowRef@ only ever holds a leaf whose own
+            -- collect-time 'tryStart' attempt (see 'prepEvalLeaf') already
+            -- lost the permit race -- every leaf that won it is already
+            -- forked, exactly as it always was.
             liftIO $ forM_ mWindow $ \(windowBuildRef, windowRef) -> do
               dl <- readIORef windowBuildRef
               writeIORef windowRef (dl [])
-            groups <- liftIO (map snd <$> readIORef groupsRef)
-            -- Proactively dispatch only the groups that can genuinely
-            -- overlap something: FlowConcurrent instances, parallel eval
-            -- enabled, and (as ever) only when the RTS can actually run
-            -- threads concurrently. Every other group -- FlowSerial, or any
-            -- instance while parallel eval is off -- is left untriggered
-            -- here: no job, no fork, nothing. It runs lazily instead, the
-            -- first time enginePhase's left-to-right walk reaches one of its
-            -- member leaves (see runGroupOnce), which is exactly the
-            -- position an unbundled single call would have run at -- the
-            -- mechanism that keeps this dispatch-then-drain step from
-            -- moving a FlowSerial (or parallel-eval-off) group's actual
-            -- round trip earlier than the golden ordering trace in
-            -- TestCompReqCombined allows.
+            -- There is no proactive source dispatch any more -- bundling
+            -- was measured to subsume it on every workload tried (see
+            -- @docs\/benchmark-notes.md@ Stage 12's "Disposition"), and
+            -- deleting it recovered the source high-water-mark regression
+            -- that sharing the eval permit pool with it had introduced (see
+            -- Stage 12's "before"/"after" numbers). Every 'SrcGroup' this
+            -- batch built (@groupsRef@, read out just above while building
+            -- @enginePhase@) runs lazily instead: 'runGroupOnce' triggers
+            -- it the first time 'enginePhase's left-to-right walk reaches
+            -- one of its member leaves, via 'prepSrcLeaf'\'s @readMySlot@ --
+            -- exactly the position a single, unbundled call would have run
+            -- at, for a 'FlowConcurrent' group exactly as much as a
+            -- 'FlowSerial' one; this is also exactly the position
+            -- TestCompReqCombined's golden ordering trace already pins
+            -- down, since it is what a 'FlowSerial' group (or any group
+            -- reached while parallel eval is off) always did, dispatch or
+            -- not.
             --
-            -- Dispatch-then-drain, never overlapping 'dispatchSrcJobs' with
-            -- the engine phase that follows it, for three reasons:
+            -- 'FlowConcurrent' genuine overlap is still reachable without a
+            -- dispatch worker: two eval leaves forked onto different
+            -- threads by 'prepEvalLeaf' can each build their own nested
+            -- batch against the same 'FlowConcurrent' instance, and those
+            -- two nested 'compSrcExecuteBatch' calls run concurrently for
+            -- real (see 'runGroupOnce'\'s "Locking and why it can't
+            -- deadlock" for the mirror-image 'FlowSerial' case, where
+            -- 'sg_lock' is what keeps that same scenario serialized
+            -- instead).
+            --
+            -- What used to be a three-reason "dispatch-then-drain" barrier
+            -- guarding a separate dispatch-and-join call is, with that call
+            -- gone, a record of why each of the three concerns it guarded
+            -- against is now a non-issue rather than something to keep
+            -- proving on every change to this function:
+            --
             --  * allCompSrcChanges (CompFlowRegistry.hs) folds every
             --    source's compSrcWaitChanges into one STM transaction on
-            --    the engine thread; it must never race a source's
-            --    concurrently-running compSrcExecuteBatch, and draining
-            --    first guarantees that;
-            --  * a nested batch (e.g. an eval leaf whose body issues its
-            --    own wide batch) can't starve this pool: by the time
-            --    enginePhase runs (and could recurse into doSuspended
-            --    again), every fork from *this* 'dispatchSrcJobs' call has
-            --    already been joined, so no outer fork is still holding a
-            --    permit;
-            --  * enginePhase's read of each dispatched group's member slots
-            --    (see prepSrcLeaf's readMySlot) can then never block -- the
-            --    job that fills them has unconditionally already finished.
-            -- CompEngineM's Applicative still sequences every (now
-            -- possibly-slot-reading) leaf's engine-thread effects strictly
-            -- left to right (see its instance above), which is what keeps
-            -- leaf order identical to the recursive walk above for
-            -- everything except which source *groups* ran concurrently
-            -- during the dispatch phase (see the golden trace in
-            -- TestCompReqCombined, and its width-8 companion assertion
-            -- that only *src* trace entries may float).
-            --
-            -- The pool 'dispatchSrcJobs' draws permits from is 'ce_par's own
-            -- 'ps_permits' -- the same pool 'prepEvalLeaf's eval-leaf forks
-            -- draw from, not a separately-sized pool of its own (see
-            -- 'dispatchSrcJobs'\'s haddock for why sharing one bound is
-            -- safe: eval-leaf forking and source dispatch now genuinely
-            -- contend for the same permits, but both are try-only with an
-            -- inline fallback, so a lost race on either side only ever
-            -- means more fallback work, never a wait -- neither can starve
-            -- the other into blocking).
-            let jobs =
-                  [ runGroupOnce g
-                  | SomeSrcGroup g <- groups
-                  , rtsSupportsBoundThreads
-                  , isJust (ce_par ce)
-                  , sg_conc g == FlowConcurrent
-                  ]
-            liftIO (forM_ (ce_par ce) (\par -> dispatchSrcJobs par jobs))
-            -- Join every eval-leaf fork this batch started before returning,
-            -- including on the exception path -- 'cancelAllTracked' is a
-            -- no-op for any fork already individually joined by its own
-            -- leaf (see 'prepEvalLeaf') and tears down the rest, the same
-            -- guarantee 'Async.withAsync' gives for a *fixed* fork count,
-            -- reconstructed here for a dynamic one. This is also what keeps
-            -- a fork from outliving the batch and racing 'allCompSrcChanges'
-            -- (Impl.hs's own three-reason note above) the same way a
-            -- dispatched source job already can't -- 'dispatchSrcJobs'
-            -- itself already joined (or cancelled) every fork it started, so
-            -- by this point there is nothing left here for a source job to
-            -- leave behind.
+            --    the engine thread, and must never race a concurrently-
+            --    running compSrcExecuteBatch. It is only ever called from
+            --    the top-level driver loop, between runs (Run.hs's
+            --    @loop'@), i.e. only after the previous run's whole
+            --    'execAp' call tree -- every top-level 'runCompEngineM'
+            --    call -- has already returned. The only forks this engine
+            --    ever starts now are 'prepEvalLeaf's eval-leaf forks, and
+            --    every one of them is joined at its own leaf's position in
+            --    Prep's left-to-right Applicative sequence before
+            --    'enginePhase' as a whole can finish (or, on an exception
+            --    path, torn down by 'cancelAllTracked' just below) -- so by
+            --    the time any 'doSuspended' call returns, every
+            --    'compSrcExecuteBatch' call started underneath it, however
+            --    deeply nested inside forked eval leaves, has already
+            --    completed. That holds inductively at every nesting depth
+            --    (a nested batch enforces the same discipline on its own
+            --    forks before *it* returns), so it holds all the way up to
+            --    the top-level loop with no separate drain step required --
+            --    it now falls straight out of eval-leaf forking's own
+            --    pre-existing join discipline, the same discipline that
+            --    already had to hold for 'prepEvalLeaf's forks regardless
+            --    of whether source dispatch existed;
+            --  * nested-batch pool starvation was a concern about *this*
+            --    dispatch call's own still-running jobs holding permits
+            --    while enginePhase ran (and could itself recurse into
+            --    nested batches wanting the same pool). With no dispatch
+            --    call, there is no outer job left to hold a permit hostage
+            --    -- 'ps_permits'\'s only remaining consumer is
+            --    'prepEvalLeaf', which already releases each permit inside
+            --    the forked action itself, on completion, not at join (see
+            --    its own haddock). What contention remains between an
+            --    outer batch's forks and a nested batch's forks is just the
+            --    ordinary, already-accepted behaviour of one shared pool --
+            --    see @docs\/benchmark-notes.md@ Stage 13 on nested batches
+            --    inheriting the same starvation as their outer batch;
+            --  * 'prepSrcLeaf'\'s @readMySlot@ still must never block
+            --    reading a group's slot, and now trivially can't:
+            --    @readMySlot@ calls 'runGroupOnce' itself, immediately
+            --    before reading the slot (see its own comment), and every
+            --    group this batch owns is only ever triggered from this
+            --    same batch's own sequential 'enginePhase' walk -- never
+            --    from a dispatch thread (there is none) and never from a
+            --    different batch's groups (each 'CompReqCombined' case
+            --    allocates its own @groupsRef@, never shared). So the slot
+            --    is always filled, synchronously, on this very thread,
+            --    before it is read here -- either by this call, if no
+            --    earlier leaf reached the group first, or by that earlier
+            --    leaf's own call, if it did.
             inner <- finallyCompEngineM enginePhase (cancelAllTracked forksRef)
             loop env (inner >>= contToCompM . cont)
 

@@ -579,14 +579,14 @@ test_leftmostFailingEvalLeafExceptionEscapesAtWidth8 =
 -- 6: every fork is joined before its batch returns, including on the
 -- exception path -- what keeps allCompSrcChanges from ever racing a
 -- running compSrcExecuteBatch (see Impl.hs's doSuspended, the three-reason
--- comment above its dispatchJobs call). Reuses test 5's left/right failing
--- pair unchanged, plus a third STRAY leaf whose only job is to still be
--- genuinely in flight -- blocked, not finished -- at the exact moment the
--- batch fails, so this test can tell "torn down by cancelAllTracked" apart
--- from "coincidentally finished before anyone needed to tear it down"
--- (test 5's own left/right pair can't distinguish those: right fails fast
--- enough that it's normally already done by the time left throws, fork or
--- no fork).
+-- comment on the general path's own 'cancelAllTracked' call). Reuses test
+-- 5's left/right failing pair unchanged, plus a third STRAY leaf whose only
+-- job is to still be genuinely in flight -- blocked, not finished -- at the
+-- exact moment the batch fails, so this test can tell "torn down by
+-- cancelAllTracked" apart from "coincidentally finished before anyone
+-- needed to tear it down" (test 5's own left/right pair can't distinguish
+-- those: right fails fast enough that it's normally already done by the
+-- time left throws, fork or no fork).
 --
 -- STRAY announces it has started (and is now blocked) via its own MVar;
 -- LEFT waits for both right's failure signal AND stray's start signal

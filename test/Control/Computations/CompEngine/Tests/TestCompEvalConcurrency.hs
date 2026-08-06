@@ -8,12 +8,12 @@
  haddocks: @ParState@, @EvalPromise@, @doAnyEvalReqValue@, @prepEvalLeaf@,
  @doCompAp@). Deliberately a sibling module to "TestCompFlowConcurrency"
  rather than an extension of it: this module is about eval-leaf forking
- (nested cap evaluation) specifically, while that module is about
- 'Control.Computations.CompEngine.Impl.dispatchSrcJobs' -- proactive source
- dispatch, which now draws from this same eval permit pool rather than a
- separately-sized one of its own (the source-side width knob this project
- used to expose alongside it was removed as dead weight -- see
- @docs\/benchmark-notes.md@ Stage 12\/12a).
+ (nested cap evaluation) specifically, while that module is about what
+ 'FlowSerial'\/'FlowConcurrent' source instances guarantee -- there is no
+ source-side dispatch or width knob any more at all (removed as dead
+ weight, subsumed by bundling -- see @docs\/benchmark-notes.md@ Stage 12's
+ "Disposition"); a source group's bundled call now always runs lazily,
+ triggered by whichever member leaf 'enginePhase' reaches first.
 
  Every test here builds its own registry (never "TestHelper"'s
  @initCompEngineTest@, which never hands the registry back) so it can call

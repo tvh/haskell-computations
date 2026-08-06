@@ -16,11 +16,10 @@ and this project adheres to the
   Defaults to `FlowSerial`, so no existing instance's behaviour changes;
   `HashMapFlow`, `TimeSrc`, and `FileSrc` now declare `FlowConcurrent`.
 - A second benchmark, the Hospital pipeline benchmark
-  (`HOSPITAL_BENCH=1 stack bench`), exercising concurrent source dispatch
-  with a graph that builds real applicative batches against sources with
-  configurable latency — something the existing scale benchmark's graph
-  cannot do. Env vars: `HOSPITAL_BENCH_SCALE`, `HOSPITAL_BENCH_SRC_LATENCY_US`.
-  See the README's Benchmark section.
+  (`HOSPITAL_BENCH=1 stack bench`), with a graph that builds real applicative
+  batches against sources with configurable latency — something the
+  existing scale benchmark's graph cannot do. Env vars: `HOSPITAL_BENCH_SCALE`,
+  `HOSPITAL_BENCH_SRC_LATENCY_US`. See the README's Benchmark section.
 - `COMP_ENGINE_LOCK_STATS` env var: when set, instruments the engine's
   single state-lock with acquisition count and total hold time, printed at
   engine shutdown. Off by default; adds no overhead when unset.
@@ -38,17 +37,20 @@ and this project adheres to the
   races the driver thread and can silently undercount reruns.
 - `CompEvalConcurrency`, `mkCompEvalConcurrency`, `unCompEvalConcurrency`,
   `setCompEvalConcurrency`/`readCompEvalConcurrency` on `CompFlowRegistry`:
-  the engine's one concurrency width knob, for how many nested cap
+  the engine's one and only concurrency width knob, for how many nested cap
   evaluations (eval leaves of a `CompReqCombined` batch) may fork to a
   permit-bounded pool instead of running one at a time on the engine
-  thread. `FlowConcurrent` source (and sink) dispatch draws permits from
-  this same shared pool rather than a separately-sized one of its own. A
-  promise table (one IVar per in-flight cap) guarantees each cap is still
-  evaluated at most once per occasion no matter how many leaves reference
-  it. Default width 1 allocates no fork pool at all and is byte-identical
-  to the pre-existing engine; `newCompFlowRegistry`'s signature is
-  unchanged, so this is purely additive. Read once, at engine start. See
-  the README's "Concurrent computation evaluation" section and
+  thread. A `FlowConcurrent` source (or sink) instance's own genuine
+  overlap now comes from this same forking, not from a dispatch mechanism
+  of its own: two eval leaves forked onto separate threads can each build
+  their own nested batch against the same instance, and those nested
+  batches run concurrently for real. A promise table (one IVar per
+  in-flight cap) guarantees each cap is still evaluated at most once per
+  occasion no matter how many leaves reference it. Default width 1
+  allocates no fork pool at all and is byte-identical to the pre-existing
+  engine; `newCompFlowRegistry`'s signature is unchanged, so this is purely
+  additive. Read once, at engine start. See the README's "Concurrent
+  computation evaluation" and "Concurrent flow execution" sections and
   `docs/benchmark-notes.md`'s Stages 13-15 for the design, the ordering
   contract that changes above width 1, and measured numbers (16.6x
   cold-eval speedup within one session on the tiered benchmark at width 64,
