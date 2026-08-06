@@ -30,7 +30,7 @@ import Control.Computations.CompEngine.CompSink
 import Control.Computations.CompEngine.CompSrc
 import Control.Computations.CompEngine.Core
 import Control.Computations.CompEngine.Types
-import Control.Computations.Utils.ConcUtils (cancelAllTracked, dispatchJobs, forkTracked, trySync)
+import Control.Computations.Utils.ConcUtils (cancelAllTracked, forkTracked, trySync)
 import Control.Computations.Utils.Logging
 import Control.Computations.Utils.Types
 
@@ -109,7 +109,10 @@ data CompEngine = CompEngine
    work finishes, whatever the outcome -- __not__ when some later caller
    gets around to 'Async.wait'-ing it (see 'prepEvalLeaf'\'s own note on why
    tying release to join order, rather than to actual completion, throttles
-   the whole pool behind whichever leaf is slowest to be joined).
+   the whole pool behind whichever leaf is slowest to be joined). This same
+   pool is also what 'dispatchSrcJobs' draws its permits from for source
+   dispatch, deliberately -- see that function's haddock for why sharing one
+   bound between eval-leaf forking and source dispatch is safe.
  * 'ps_width' is the raw width, kept alongside the derived permit count
    purely so a diagnostic doesn't have to reconstruct it from
    @width - 1@ backwards.
@@ -402,10 +405,9 @@ instance Applicative Prep where
 {- | Mutable, per-'CompSrc'-instance state accumulated while preparing one
  'CompReqCombined' batch: every 'SrcFetch' any leaf of the batch has
  contributed so far (built as a difference list, the same O(1)-append trick
- "Control.Computations.Utils.ConcUtils".'Control.Computations.Utils.ConcUtils.dispatchJobs'\'s
- own caller used to use for 'SrcJobs', for the same reason -- a batch of
- thousands of same-instance leaves must not re-copy this list on every
- append), plus a run-once guard so the group's bundled
+ the sliding fork window's own @windowBuildRef@ uses below, for the same
+ reason -- a batch of thousands of same-instance leaves must not re-copy
+ this list on every append), plus a run-once guard so the group's bundled
  'Control.Computations.CompEngine.CompSrc.compSrcExecuteBatch' call fires
  exactly once no matter which of its member leaves reaches it first, or
  whether the engine proactively ran it as a dispatched job before any leaf
@@ -495,17 +497,19 @@ getOrCreateGroup reg parEnabled groupsRef ix src conc = do
  (see the 'CompReqCombined' case of 'doSuspended'):
 
   * a 'FlowConcurrent' group dispatched as a job calls this from a
-    'Control.Computations.Utils.ConcUtils.dispatchJobs' worker, before
-    'enginePhase' runs at all -- by the time any member leaf's own
-    'CompEngineM' action (built by 'prepSrcLeaf', below) reaches this same
-    call, it is already a no-op and just reads its own slot;
-  * a group that was never dispatched (a 'FlowSerial' instance, or any
-    instance at width 1 -- see 'CompFlowConcurrency') is never proactively
-    triggered, so this call happens for the first time when the *first* of
+    'dispatchSrcJobs' fork, before 'enginePhase' runs at all -- by the time
+    any member leaf's own 'CompEngineM' action (built by 'prepSrcLeaf',
+    below) reaches this same call, it is already a no-op and just reads its
+    own slot;
+  * a group that was never dispatched -- a 'FlowSerial' instance, parallel
+    eval disabled, or one that simply lost the src-dispatch permit race
+    (see 'dispatchSrcJobs') -- is never proactively triggered, so this call
+    happens for the first time when the *first* of
     its member leaves is reached inside 'enginePhase'\'s left-to-right run,
     exactly the position a single, unbundled 'compSrcExecute' call would
     have run at before this group existed. This is deliberate: bundling
-    genuinely needs no worker thread, so it is applied even at width 1 (see
+    genuinely needs no worker thread, so it is applied even when nothing is
+    ever dispatched as a job at all (see
     "Control.Computations.CompEngine.CompSrc".'Control.Computations.CompEngine.CompSrc.compSrcExecuteBatch'\'s
     haddock) -- but doing so must not change *when*, relative to the rest of
     the batch's leaves, this instance's data is actually asked for, which is
@@ -977,9 +981,70 @@ tryAcquirePermit permits = atomically $ do
 
 -- | Give a permit taken by 'tryAcquirePermit' back to the pool -- called
 -- once per successful acquire, unconditionally (success, failure, or
--- cancellation of the forked leaf that acquired it), from 'prepEvalLeaf'.
+-- cancellation of the forked job that acquired it), from 'prepEvalLeaf' and
+-- 'dispatchSrcJobs' alike.
 releasePermit :: TVar Int -> IO ()
 releasePermit permits = atomically (modifyTVar' permits (+ 1))
+
+{- | Dispatch @jobs@ (one 'runGroupOnce' call per proactively-dispatchable
+ 'FlowConcurrent' 'SrcGroup' the batch being prepared holds -- see the sole
+ caller, the 'CompReqCombined' case of 'doSuspended') against @par@'s
+ __shared eval permit pool__, rather than a separately-sized worker pool of
+ its own -- there is no fixed width here at all, and no queue: every job
+ gets exactly one 'tryAcquirePermit' attempt.
+
+ __A job that loses that race is simply left undispatched__, never queued or
+ retried. That's safe, not just convenient: 'runGroupOnce'\'s own
+ 'sg_triggered' guard (see its haddock) makes dispatch here purely an
+ optimisation -- an undispatched group still runs, inline, the first time
+ 'enginePhase'\'s left-to-right walk reaches one of its member leaves, which
+ is exactly the position it would have run at if it had never been a
+ dispatch candidate at all (the pre-existing behaviour for a 'FlowSerial'
+ group, or any group reached while parallel eval is off).
+
+ __Contention with 'prepEvalLeaf'.__ This draws from the very same
+ @ps_permits par@ pool eval-leaf forking does, by design -- one shared
+ bound on total in-flight work, rather than two independently-sized pools
+ that could each claim to be "full" while the other sits idle. That sharing
+ is safe precisely because both sides are try-only with an inline fallback
+ (this one falls back to 'enginePhase' running the group inline;
+ 'prepEvalLeaf' falls back to Cilk-style serial elision) -- a lost race on
+ either side only ever means more fallback work for that side, never a
+ wait, so neither can starve the other into blocking.
+
+ __Never blocks acquiring a permit__ (matches 'prepEvalLeaf'\'s own
+ discipline -- see its haddock's "tryAcquirePermit only, never block"), and
+ __always releases inside the forked action, on completion__, not at join
+ time -- the same regression 'prepEvalLeaf'\'s own note on release timing
+ describes (also documented at @docs\/benchmark-notes.md@ Stage 15, "The
+ permit-release bug the window work uncovered": releasing at join time
+ holds a fast job's permit hostage behind however long every job before it
+ in join order takes to actually be joined).
+
+ __Preserves the dispatch-then-drain barrier__: every fork this starts is
+ tracked (via 'forkTracked', into a pool-local list) and joined, with
+ 'Async.wait', before this function returns -- so by the time
+ 'doSuspended'\'s @jobs@ comment's three reasons apply (in particular:
+ 'enginePhase'\'s reads of a dispatched group's member slots, via
+ 'prepSrcLeaf'\'s @readMySlot@, must never block), every job this call
+ started has unconditionally already finished. The whole dispatch-and-join
+ sequence runs under 'cancelAllTracked' in a 'Control.Exception.finally', a
+ no-op sweep on the happy path (everything already joined) and the actual
+ teardown on any exception path (mirroring 'doSuspended'\'s own use of
+ 'cancelAllTracked' around 'enginePhase').
+-}
+dispatchSrcJobs :: ParState -> [IO ()] -> IO ()
+dispatchSrcJobs par jobs = do
+  pendingRef <- newIORef []
+  let dispatchAll = forM_ jobs $ \job -> do
+        acquired <- tryAcquirePermit (ps_permits par)
+        when acquired $
+          void $
+            forkTracked
+              pendingRef
+              (job `Control.Exception.finally` releasePermit (ps_permits par))
+  (dispatchAll >> readIORef pendingRef >>= mapM_ Async.wait)
+    `Control.Exception.finally` cancelAllTracked pendingRef
 
 {- | The sliding fork window: one not-yet-started eval leaf of a
  'CompReqCombined' batch, queued by 'prepEvalLeaf' during the batch's
@@ -1972,8 +2037,10 @@ evalCompAp outerCap =
         reg <- CompEngineM (asks (ce_compFlowRegistry . ce_compEngineIfs))
         -- Fetched here, before the fast-path/general-path fork below, so
         -- both branches can share it: the fast path needs it only for the
-        -- leaf-count histogram just below (never for forking -- see its own
-        -- comment), the general path for the same reasons it always did
+        -- leaf-count histogram just below and its own 'ce_par' check (never
+        -- for forking -- see its own comment); 'reg' itself is *not* needed
+        -- by the fast path any more (nothing there reads the registry) --
+        -- only the general path uses it, for the same reasons it always did
         -- (see its own comment on 'firstEvalSeenRef'/'forksRef').
         ce <- CompEngineM (asks id)
         -- 'req' here is still this whole 'CompReqCombined' node (the case
@@ -1985,19 +2052,19 @@ evalCompAp outerCap =
         -- it). 'countEvalLeaves' is a pure walk and 'whenDiag' never forces
         -- it when diagnostics are off, so this costs nothing then.
         liftIO (whenDiag ce (\d -> recordLeafCount d (countEvalLeaves req)))
-        width <- liftIO (readCompFlowConcurrency reg)
         if not (isCompReqCombined reqA)
           && not (isCompReqCombined reqB)
-          && unCompFlowConcurrency width == 1
+          && not (isJust (ce_par ce))
           && not (sameSrcInstance reqA reqB)
           then do
-            -- Fast path for two *leaves* combined directly at width 1 (e.g.
-            -- plain `f <$> a <*> b`, the overwhelmingly common shape a batch
-            -- of exactly two suspended actions takes) -- today's pre-Prep
-            -- code, kept verbatim rather than routed through
-            -- traverseCompReq/Prep. Also excluded here: two source leaves
-            -- against the *same* instance, even at width 1 -- bundling them
-            -- into one compSrcExecuteBatch call needs no worker thread (see
+            -- Fast path for two *leaves* combined directly when nothing
+            -- could possibly fork (e.g. plain `f <$> a <*> b`, the
+            -- overwhelmingly common shape a batch of exactly two suspended
+            -- actions takes) -- today's pre-Prep code, kept verbatim rather
+            -- than routed through traverseCompReq/Prep. Also excluded here:
+            -- two source leaves against the *same* instance, even with
+            -- parallel eval off -- bundling them into one
+            -- compSrcExecuteBatch call needs no worker thread (see
             -- "Control.Computations.CompEngine.CompSrc"'s
             -- compSrcExecuteBatch haddock), so this specific two-leaf shape
             -- must still fall through to the general path below to get that
@@ -2006,11 +2073,23 @@ evalCompAp outerCap =
             -- Prep for the general two-leaf shape cost a small but real
             -- (~1.5-2%, beyond run-to-run noise) cold-eval wall-time
             -- regression for no change in max_live_bytes, so it isn't worth
-            -- paying except where bundling actually pays for it. Above
-            -- width 1, a two-leaf batch instead falls through to the
-            -- general path below and goes through Prep like everything
-            -- else, so its source leaves can actually be queued and
-            -- overlap.
+            -- paying except where bundling actually pays for it. With
+            -- parallel eval on, a two-leaf batch instead falls through to
+            -- the general path below and goes through Prep like everything
+            -- else, so its eval leaves (and, if it also has any, its
+            -- source leaves) can actually be queued and overlap.
+            --
+            -- The condition here gates on 'ce_par', not on any source-side
+            -- width: this branch decides whether *this* batch could ever
+            -- fork anything, which is a property of eval concurrency, not
+            -- of source dispatch. Gating on the source width instead was a
+            -- real bug -- a two-leaf batch (the commonest shape by far) with
+            -- eval concurrency enabled but no source concurrency to speak
+            -- of took this shortcut unconditionally, skipping Prep and
+            -- therefore 'prepEvalLeaf' entirely, so its eval leaves could
+            -- never fork no matter how wide the eval permit pool was. See
+            -- @docs\/benchmark-notes.md@ Stage 12's "Disposition" and Stage
+            -- 13's "What a fix would have to change" for how that surfaced.
             -- Both branches share `env`, so whatever either records via
             -- tellDep lands directly in the shared accumulator; no manual
             -- union of per-branch dependency sets is needed.
@@ -2023,9 +2102,10 @@ evalCompAp outerCap =
             loop env resCont
           else do
             -- General path: batches with more than two leaves (deeper
-            -- CompReqCombined nesting), a two-leaf batch at width > 1, or a
-            -- two-leaf batch of same-instance source reads at any width --
-            -- flatten the whole thing to its leaves in one traversal (see
+            -- CompReqCombined nesting), a two-leaf batch with parallel eval
+            -- on, or a two-leaf batch of same-instance source reads
+            -- regardless of parallel eval -- flatten the whole thing to its
+            -- leaves in one traversal (see
             -- traverseCompReq and Prep) instead of recursing node by node.
             -- groupsRef is fresh per batch: every CompLeafSrc leaf reached
             -- during the traversal below either creates or joins a
@@ -2047,8 +2127,8 @@ evalCompAp outerCap =
             -- '_ -> pure inline' branch matches before ever touching
             -- @mWindow@), so there is no reason to pay for two more
             -- 'IORef's on a path that can never fork. This keeps a
-            -- width-1 (or non-bound-threads) general-path batch exactly as
-            -- allocation-light as it was before this window existed --
+            -- parallel-eval-off (or non-bound-threads) general-path batch
+            -- exactly as allocation-light as it was before this window existed --
             -- see 'CompEngine'\'s own 'ce_par' haddock on why that bar is
             -- non-negotiable. @windowBuildRef@ is the collect-phase
             -- difference-list accumulator (same O(1)-append idiom
@@ -2077,20 +2157,21 @@ evalCompAp outerCap =
               writeIORef windowRef (dl [])
             groups <- liftIO (map snd <$> readIORef groupsRef)
             -- Proactively dispatch only the groups that can genuinely
-            -- overlap something: FlowConcurrent instances, width > 1, and
-            -- (as ever) only when the RTS can actually run threads
-            -- concurrently. Every other group -- FlowSerial, or any
-            -- instance at width 1 -- is left untriggered here: no job, no
-            -- worker thread, nothing. It runs lazily instead, the first
-            -- time enginePhase's left-to-right walk reaches one of its
+            -- overlap something: FlowConcurrent instances, parallel eval
+            -- enabled, and (as ever) only when the RTS can actually run
+            -- threads concurrently. Every other group -- FlowSerial, or any
+            -- instance while parallel eval is off -- is left untriggered
+            -- here: no job, no fork, nothing. It runs lazily instead, the
+            -- first time enginePhase's left-to-right walk reaches one of its
             -- member leaves (see runGroupOnce), which is exactly the
             -- position an unbundled single call would have run at -- the
             -- mechanism that keeps this dispatch-then-drain step from
-            -- moving a FlowSerial/width-1 group's actual round trip earlier
-            -- than the golden ordering trace in TestCompReqCombined allows.
+            -- moving a FlowSerial (or parallel-eval-off) group's actual
+            -- round trip earlier than the golden ordering trace in
+            -- TestCompReqCombined allows.
             --
-            -- Dispatch-then-drain, never overlapping dispatchJobs with the
-            -- engine phase that follows it, for three reasons:
+            -- Dispatch-then-drain, never overlapping 'dispatchSrcJobs' with
+            -- the engine phase that follows it, for three reasons:
             --  * allCompSrcChanges (CompFlowRegistry.hs) folds every
             --    source's compSrcWaitChanges into one STM transaction on
             --    the engine thread; it must never race a source's
@@ -2099,9 +2180,9 @@ evalCompAp outerCap =
             --  * a nested batch (e.g. an eval leaf whose body issues its
             --    own wide batch) can't starve this pool: by the time
             --    enginePhase runs (and could recurse into doSuspended
-            --    again), every worker from *this* dispatchJobs call has
-            --    already exited, so no outer worker is still holding a
-            --    pool slot;
+            --    again), every fork from *this* 'dispatchSrcJobs' call has
+            --    already been joined, so no outer fork is still holding a
+            --    permit;
             --  * enginePhase's read of each dispatched group's member slots
             --    (see prepSrcLeaf's readMySlot) can then never block -- the
             --    job that fills them has unconditionally already finished.
@@ -2113,14 +2194,24 @@ evalCompAp outerCap =
             -- during the dispatch phase (see the golden trace in
             -- TestCompReqCombined, and its width-8 companion assertion
             -- that only *src* trace entries may float).
+            --
+            -- The pool 'dispatchSrcJobs' draws permits from is 'ce_par's own
+            -- 'ps_permits' -- the same pool 'prepEvalLeaf's eval-leaf forks
+            -- draw from, not a separately-sized pool of its own (see
+            -- 'dispatchSrcJobs'\'s haddock for why sharing one bound is
+            -- safe: eval-leaf forking and source dispatch now genuinely
+            -- contend for the same permits, but both are try-only with an
+            -- inline fallback, so a lost race on either side only ever
+            -- means more fallback work, never a wait -- neither can starve
+            -- the other into blocking).
             let jobs =
                   [ runGroupOnce g
                   | SomeSrcGroup g <- groups
                   , rtsSupportsBoundThreads
-                  , unCompFlowConcurrency width > 1
+                  , isJust (ce_par ce)
                   , sg_conc g == FlowConcurrent
                   ]
-            liftIO (dispatchJobs (unCompFlowConcurrency width) jobs)
+            liftIO (forM_ (ce_par ce) (\par -> dispatchSrcJobs par jobs))
             -- Join every eval-leaf fork this batch started before returning,
             -- including on the exception path -- 'cancelAllTracked' is a
             -- no-op for any fork already individually joined by its own
@@ -2129,7 +2220,10 @@ evalCompAp outerCap =
             -- reconstructed here for a dynamic one. This is also what keeps
             -- a fork from outliving the batch and racing 'allCompSrcChanges'
             -- (Impl.hs's own three-reason note above) the same way a
-            -- dispatched source job already can't.
+            -- dispatched source job already can't -- 'dispatchSrcJobs'
+            -- itself already joined (or cancelled) every fork it started, so
+            -- by this point there is nothing left here for a source job to
+            -- leave behind.
             inner <- finallyCompEngineM enginePhase (cancelAllTracked forksRef)
             loop env (inner >>= contToCompM . cont)
 
@@ -2151,17 +2245,17 @@ execAp (AnyCompAp cap) = void $ doCompAp cap
  'CompFlowRegistry.readCompEvalConcurrency' __exactly once__ to decide
  'ce_par' -- see that function's haddock for why a later
  'CompFlowRegistry.setCompEvalConcurrency' call has no effect on an
- already-initialised engine, unlike the source-side width knob. A width of 1
- (the registry's own default, and every pre-existing caller's behaviour)
- gives 'Nothing': no promise table, no permit pool, allocated for nothing,
- and every gated code path this project added takes its old, unmodified
- branch -- see 'CompEngine'\'s own haddock on 'ce_par' for why that is the
- acceptance bar this function exists to guarantee.
+ already-initialised engine. A width of 1 (the registry's own default, and
+ every pre-existing caller's behaviour) gives 'Nothing': no promise table,
+ no permit pool, allocated for nothing, and every gated code path this
+ project added takes its old, unmodified branch -- see 'CompEngine'\'s own
+ haddock on 'ce_par' for why that is the acceptance bar this function exists
+ to guarantee.
 -}
 initCompEngine :: CompEngineIfs -> IO CompEngine
 initCompEngine compEngineIfs = do
   counter <- newIORef 0
-  width <- unCompFlowConcurrency <$> readCompEvalConcurrency (ce_compFlowRegistry compEngineIfs)
+  width <- unCompEvalConcurrency <$> readCompEvalConcurrency (ce_compFlowRegistry compEngineIfs)
   mPar <-
     if width <= 1
       then pure Nothing

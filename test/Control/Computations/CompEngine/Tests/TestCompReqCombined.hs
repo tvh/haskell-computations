@@ -131,9 +131,9 @@ instance CompSrc TraceSrc where
   -- concurrently -- 'compSrcExecute' only appends to a shared IORef via
   -- 'atomicModifyIORef''. Declaring this doesn't change
   -- 'test_goldenOrderingTraceAcrossSrcEvalSink' (that test's registry never
-  -- calls 'setCompFlowConcurrency', so it stays at the default width of 1,
-  -- where a 'FlowConcurrent' declaration is inert -- see
-  -- 'compSrcConcurrency'\'s haddock); it's what lets
+  -- calls 'setCompEvalConcurrency', so parallel eval stays off and a
+  -- 'FlowConcurrent' declaration is inert -- see 'compSrcConcurrency'\'s
+  -- haddock); it's what lets
   -- 'test_goldenOrderingTraceEvalSinkSubsequenceUnchangedAtWidth8' below
   -- actually exercise the job path against the very same trace fixture.
   compSrcConcurrency _ = FlowConcurrent
@@ -252,19 +252,25 @@ test_goldenOrderingTraceAcrossSrcEvalSink =
       leaf <- wireComp (b2LeafCompDef inner)
       wireComp (b2MainCompDef b2SrcAId b2SrcBId leaf b2SinkId)
 
-{- | B.2's companion at width 8: the golden trace literal above is frozen
- (see the module haddock) and must not be edited, but concurrency is
+{- | B.2's companion at eval width 8: the golden trace literal above is
+ frozen (see the module haddock) and must not be edited, but concurrency is
  allowed to change *when* a job-eligible source leaf's read lands relative
  to the batch's other leaves -- see 'prepSrcLeaf's haddock in "Impl". Both
- 'TraceSrc' instances now declare 'FlowConcurrent' (see above), so at width
- 8 srcA's and srcB's reads both run during the batch's dispatch-then-drain
- phase, before any of the batch's engine-thread work (including "eval
- b2-leaf(1)") even starts -- their relative order to *each other* is
- whatever the OS scheduler picks, and their position relative to the eval\/
- sink entries can float. What must NOT move is the eval\/sink entries'
- order relative to *each other*: filtering the src entries back out of the
- trace must reproduce the same subsequence as the golden trace above,
- proving concurrency reordered only what it's allowed to reorder.
+ 'TraceSrc' instances now declare 'FlowConcurrent' (see above), and this
+ batch's three leaves (two source, one eval) always take the general,
+ Prep-based path regardless of concurrency (three leaves, one of them
+ itself nested -- never the two-leaf fast path's domain), so raising eval
+ concurrency alone is enough to reach 'Control.Computations.CompEngine.Impl.dispatchSrcJobs'
+ here: with parallel eval on (@ce_par@ 'Just', via 'setCompEvalConcurrency'
+ below) and 7 permits free, srcA's and srcB's reads both run during the
+ batch's dispatch-then-drain phase, before any of the batch's engine-thread
+ work (including "eval b2-leaf(1)") even starts -- their relative order to
+ *each other* is whatever the OS scheduler picks, and their position
+ relative to the eval\/sink entries can float. What must NOT move is the
+ eval\/sink entries' order relative to *each other*: filtering the src
+ entries back out of the trace must reproduce the same subsequence as the
+ golden trace above, proving concurrency reordered only what it's allowed
+ to reorder.
 -}
 test_goldenOrderingTraceEvalSinkSubsequenceUnchangedAtWidth8 :: IO ()
 test_goldenOrderingTraceEvalSinkSubsequenceUnchangedAtWidth8 =
@@ -274,7 +280,7 @@ test_goldenOrderingTraceEvalSinkSubsequenceUnchangedAtWidth8 =
         srcB = TraceSrc{trs_name = "b2-srcB", trs_traceRef = traceRef}
         sink = TraceSink{trk_name = "b2-sink", trk_traceRef = traceRef}
     reg <- newCompFlowRegistry
-    setCompFlowConcurrency reg (mkCompFlowConcurrency 8)
+    setCompEvalConcurrency reg (mkCompEvalConcurrency 8)
     registerCompSrc reg srcA
     registerCompSrc reg srcB
     registerCompSink reg sink

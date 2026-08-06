@@ -184,7 +184,7 @@ runOrderingTrace mWidth =
     traceRef <- newIORef []
     let sink = OtcSink{otc_name = "otc-sink", otc_traceRef = traceRef}
     reg <- newCompFlowRegistry
-    forM_ mWidth $ \w -> setCompEvalConcurrency reg (mkCompFlowConcurrency w)
+    forM_ mWidth $ \w -> setCompEvalConcurrency reg (mkCompEvalConcurrency w)
     registerCompSink reg sink
     (rawStateIf, closeSif) <- initStateIf True
     let stateIf =
@@ -422,7 +422,7 @@ test_dedupYieldsOneValueNotJustOneEvaluationAtEvalWidth8 =
                 Just engine -> awaitPromiseJoinThenProceed engine
           wrapStateIf = observingStateIf onEval
       reg <- newCompFlowRegistry
-      setCompEvalConcurrency reg (mkCompFlowConcurrency 8)
+      setCompEvalConcurrency reg (mkCompEvalConcurrency 8)
       registerCompSrc reg src
       (rawStateIf, closeSif) <- initStateIf True
       let stateIf = wrapStateIf rawStateIf
@@ -529,20 +529,15 @@ test_leftmostFailingEvalLeafExceptionEscapesAtWidth8 =
           leftSrc = ActionSrc "eval-boom-left" leftAction
           rightSrc = ActionSrc "eval-boom-right" rightAction
       reg <- newCompFlowRegistry
-      -- Both knobs, not just the eval one: this is a plain two-leaf
-      -- `(,) <$> a <*> b` batch, and doSuspended's own two-leaf fast path
-      -- (Impl.hs) is gated on the *source*-side width
-      -- (readCompFlowConcurrency), completely independent of
-      -- 'setCompEvalConcurrency' -- see "TestCompFlowConcurrency"'s own
-      -- test 6 comment. Leaving the source width at its default of 1 would
-      -- route this batch through the old sequential fast path instead of
-      -- prepEvalLeaf, where nothing ever forks and LEFT's own takeMVar
-      -- would block forever (exactly what this design's own comment above
-      -- warns about) -- caught directly during this test's own
-      -- development, where the omission deadlocked it for the full 30s
-      -- backstop.
-      setCompFlowConcurrency reg (mkCompFlowConcurrency 8)
-      setCompEvalConcurrency reg (mkCompFlowConcurrency 8)
+      -- This is a plain two-leaf `(,) <$> a <*> b` batch, and doSuspended's
+      -- own two-leaf fast path (Impl.hs) is gated on whether parallel eval
+      -- is enabled at all (@ce_par@ 'Nothing') -- see
+      -- "TestCompFlowConcurrency"'s own test 6 comment. Leaving eval
+      -- concurrency at its default of 1 would route this batch through the
+      -- old sequential fast path instead of prepEvalLeaf, where nothing
+      -- ever forks and LEFT's own takeMVar would block forever (exactly
+      -- what this design's own comment above warns about).
+      setCompEvalConcurrency reg (mkCompEvalConcurrency 8)
       registerCompSrc reg leftSrc
       registerCompSrc reg rightSrc
       (_compMap, mainComp) <-
@@ -648,7 +643,7 @@ test_everyForkJoinedBeforeBatchReturnsOnExceptionPathAtWidth8 =
           rightSrc = ActionSrc "join-boom-right" rightAction
           straySrc = ActionSrc "join-boom-stray" strayAction
       reg <- newCompFlowRegistry
-      setCompEvalConcurrency reg (mkCompFlowConcurrency 8)
+      setCompEvalConcurrency reg (mkCompEvalConcurrency 8)
       registerCompSrc reg leftSrc
       registerCompSrc reg rightSrc
       registerCompSrc reg straySrc
@@ -805,13 +800,11 @@ test_depsStayPerEvaluationAtEvalWidth8 =
     do
       src <- initDepsSrc
       reg <- newCompFlowRegistry
-      -- Both knobs -- see test 5's own comment on why a plain two-leaf
-      -- `(,) <$> a <*> b` batch (deps-main's own shape) needs the
-      -- *source*-side width raised too, not just the eval one, to actually
-      -- reach prepEvalLeaf instead of doSuspended's old sequential
+      -- See test 5's own comment on why a plain two-leaf `(,) <$> a <*> b`
+      -- batch (deps-main's own shape) needs eval concurrency raised to
+      -- actually reach prepEvalLeaf instead of doSuspended's old sequential
       -- fast path.
-      setCompFlowConcurrency reg (mkCompFlowConcurrency 8)
-      setCompEvalConcurrency reg (mkCompFlowConcurrency 8)
+      setCompEvalConcurrency reg (mkCompEvalConcurrency 8)
       registerCompSrc reg src
       countsRef <- newIORef []
       (rawStateIf, closeSif) <- initStateIf True

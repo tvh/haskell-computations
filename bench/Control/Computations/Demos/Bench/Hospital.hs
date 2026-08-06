@@ -1,13 +1,26 @@
 {-# LANGUAGE ApplicativeDo #-}
 
 {- | A second benchmark, alongside "Control.Computations.Demos.Bench.Main",
- that can actually show the effect of
- 'Control.Computations.CompEngine.CompFlowRegistry.setCompFlowConcurrency':
- the existing benchmark builds zero applicative batches (its bodies are
- sequential monadic binds, going through 'compMBind' rather than the
- engine's own @<*>@\/@compMAp@) and its source has no latency to hide, so
- changing that benchmark's width knob is a documented no-op. This module's
+ built to make applicative batching -- and, historically, source-dispatch
+ concurrency -- actually visible: the existing benchmark builds zero
+ applicative batches (its bodies are sequential monadic binds, going through
+ 'compMBind' rather than the engine's own @<*>@\/@compMAp@) and its source
+ has no latency to hide, so neither can show anything here. This module's
  graph is built specifically so both of those stop being true.
+
+ __No concurrency knob of its own.__ This module used to also expose the
+ engine's old source-side dispatch-pool width knob through its own env var.
+ Stage 12\/12a of @docs\/benchmark-notes.md@ measured it flat at every width on
+ this exact graph -- same-instance source leaves are grouped and bundled
+ into one round trip regardless of dispatch width (see
+ 'Control.Computations.CompEngine.CompSrc.compSrcExecuteBatch'), and this
+ graph's batches almost never span more than one or two distinct source
+ instances, so there was nothing for a wider pool to overlap -- and the knob
+ was removed from the engine entirely as dead weight. "Control.Computations.Demos.Bench.Tiered"
+ is the benchmark built afterward specifically to find a graph shape (mixed
+ leaves, heterogeneous per-source latency) where concurrency has something
+ to show; this module now serves as its uniform-latency, stratified-leaves
+ baseline, unchanged so the comparison stays apples to apples.
 
  __Shape__: modelled on @app\/Control\/Computations\/Demos\/Hospital\/CompDefs.hs@
  (read that module for the flavour of a real client of this library) but
@@ -34,13 +47,16 @@
  'medOrderComp' reads order\/drug (2 keys), 'noteComp' reads text\/author (2
  keys) -- each such comp body's independent binds get desugared by
  @ApplicativeDo@ into one @\<*\>@-combined request against the /same/
- 'SystemSrc' instance, which is exactly what 'FlowConcurrent' lets the
- engine dispatch as overlapping jobs at width > 1. 'patientSummaryComp' is
- the one deliberately /cross/-system batch: it reads one key from each of
- the five sources in a single applicative block. Without this design, only
- 'patientSummaryComp' would ever batch across sources and the concurrent
- fraction of all source calls would be under 1% of the graph's ~1.6M source
- calls -- see 'hospitalBenchMain'\'s reported call counts for the actual
+ 'SystemSrc' instance, which is exactly what 'FlowConcurrent' lets bundle
+ into a single 'Control.Computations.CompEngine.CompSrc.compSrcExecuteBatch'
+ round trip -- unconditionally, regardless of any dispatch concurrency (see
+ this module's own haddock above on why the source-dispatch knob measured
+ flat here). 'patientSummaryComp' is the one deliberately /cross/-system
+ batch: it reads one key from each of the five sources in a single
+ applicative block. Without this design, only 'patientSummaryComp' would
+ ever batch across sources and the multi-instance fraction of all source
+ calls would be under 1% of the graph's ~1.6M source calls -- see
+ 'hospitalBenchMain'\'s reported call counts for the actual
  achieved fraction.
 
  __Depth__: heterogeneous across ~11 levels (the existing benchmark is a
@@ -818,17 +834,11 @@ rerunMutationTarget srcs patientCount n =
   p = fromIntegral ((n * 9973) `mod` patientCount) :: PatId
   subId = fromIntegral (n `div` 5) :: Word32
 
-{- | Registers all five sources plus the sink, and sets the registry's
- 'CompFlowConcurrency' width -- done here, inside the very
- @withRegisteredFlows@ callback 'hospitalBenchDriver' (mirroring
- 'Control.Computations.CompEngine.Driver.compDriver'') hands the registry
- to, so no driver forking is needed to reach it (see
- 'CompFlowRegistry'\'s own haddock for why that's the intended access
- point).
--}
-withHospitalFlows :: HospitalSrcs -> HashMapFlow -> Int -> CompFlowRegistry -> IO () -> IO ()
-withHospitalFlows srcs sink width reg action = do
-  setCompFlowConcurrency reg (mkCompFlowConcurrency width)
+-- | Registers all five sources plus the sink. No concurrency knob is set
+-- here any more -- see the module haddock's "No concurrency knob of its
+-- own" note.
+withHospitalFlows :: HospitalSrcs -> HashMapFlow -> CompFlowRegistry -> IO () -> IO ()
+withHospitalFlows srcs sink reg action = do
   forM_ (namedSrcs srcs) (registerCompSrc reg . snd)
   registerCompSink reg sink
   action
@@ -943,7 +953,6 @@ hospitalBenchMain :: IO ()
 hospitalBenchMain = do
   scale <- readEnvDouble "HOSPITAL_BENCH_SCALE" 1.0
   latencyUs <- readEnvIntAtLeast 0 "HOSPITAL_BENCH_SRC_LATENCY_US" 0
-  width <- readEnvIntAtLeast 1 "HOSPITAL_BENCH_CONCURRENCY" 1
   let patientCount = scaledPatientCount scale
       wardCount = scaledWardCount scale patientCount
       histogram = depthHistogram wardCount patientCount
@@ -957,10 +966,9 @@ hospitalBenchMain = do
   -- benchmark ends up with -N (all cores) rather than the single capability
   -- earlier baselines in docs/benchmark-notes.md silently ran on.
   printf
-    "HOSPITAL_BENCH_SCALE=%.4f HOSPITAL_BENCH_SRC_LATENCY_US=%d HOSPITAL_BENCH_CONCURRENCY=%d capabilities: %d\n"
+    "HOSPITAL_BENCH_SCALE=%.4f HOSPITAL_BENCH_SRC_LATENCY_US=%d capabilities: %d\n"
     scale
     latencyUs
-    width
     caps
   printf
     "patients: %d, wards: %d (avg %.1f patients/ward), target instances (analytic): %d\n"
@@ -984,7 +992,7 @@ hospitalBenchMain = do
       ( hospitalBenchDriver
           counterRef
           runVar
-          (withHospitalFlows srcs sink width)
+          (withHospitalFlows srcs sink)
           (wireHospitalComps patientCount wardCount)
       )
 

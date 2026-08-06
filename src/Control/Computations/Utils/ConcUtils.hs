@@ -4,7 +4,6 @@ module Control.Computations.Utils.ConcUtils (
   timeout,
   timeoutFail,
   trySync,
-  dispatchJobs,
   forkTracked,
   cancelAllTracked,
 ) where
@@ -71,12 +70,15 @@ timeoutFail name ts action =
  catch-all like this one can tell them apart from an ordinary synchronous
  exception).
 
- Written for 'dispatchJobs': a worker there must be able to report its own
- job's exception back to its caller without ever swallowing a genuine
- 'Async.cancel' (or 'killThread') aimed at the worker itself -- silently
- catching that would leave the worker running arbitrary user
- 'Control.Computations.CompEngine.CompSrc.compSrcExecute' code after
- whatever cancelled it believes the whole pool is gone.
+ Written for "Control.Computations.CompEngine.Impl"'s permit-pool forks
+ (both 'Control.Computations.CompEngine.Impl.prepEvalLeaf's eval-leaf forks
+ and 'Control.Computations.CompEngine.Impl.dispatchSrcJobs's source-dispatch
+ forks): each must be able to report its own job's exception back to its
+ caller without ever swallowing a genuine 'Async.cancel' (or 'killThread')
+ aimed at the fork itself -- silently catching that would leave the fork
+ running arbitrary user code (ultimately a cap's own body, or
+ 'Control.Computations.CompEngine.CompSrc.compSrcExecute') after whatever
+ cancelled it believes the pool is gone.
 -}
 trySync :: IO a -> IO (Either SomeException a)
 trySync action =
@@ -86,45 +88,14 @@ trySync action =
       | otherwise -> pure (Left e)
     Right v -> pure (Right v)
 
-{- | Run @jobs@ against a fixed pool of at most @width@ concurrent workers,
- then block until every job has finished. Callers must not let this overlap
- whatever runs after it -- see
- "Control.Computations.CompEngine.Impl"'s @SrcJobs@\/@Prep@, the only
- current caller, for why its own dispatch-then-drain discipline depends on
- that.
-
- A worker repeatedly pops the next job off a shared queue (an 'IORef',
- popped via 'atomicModifyIORef'') rather than being handed one job each, so
- @width@ stays fixed no matter how many jobs there are: a ten-thousand-job
- batch still spawns at most @width@ workers, not ten thousand threads.
-
- Built on 'Async.replicateConcurrently_' rather than a bare 'forkIO' per
- worker: it is 'Async.withAsync'-scoped, so an asynchronous exception that
- unwinds the caller -- in particular 'Async.cancel' reaching the thread that
- called this -- tears down every still-running worker with it. A bare
- 'forkIO' worker would survive that unwind and keep running arbitrary job
- code (ultimately a caller's own 'Control.Computations.CompEngine.CompSrc.compSrcExecute')
- after whatever owns the pool is already gone.
-
- Each @job@ is expected to catch its own synchronous exceptions (e.g. via
- 'trySync') and record the outcome itself -- this just runs @[IO ()]@, it
- does not interpret what a job does or report back anything beyond \"all
- jobs have run\".
--}
-dispatchJobs :: Int -> [IO ()] -> IO ()
-dispatchJobs width jobs = do
-  ref <- newIORef jobs
-  let pop [] = ([], Nothing)
-      pop (x : xs) = (xs, Just x)
-      worker = atomicModifyIORef' ref pop >>= maybe (pure ()) (\j -> j >> worker)
-  Async.replicateConcurrently_ (min width (length jobs)) worker
-
 {- | Fork @action@ onto its own 'Async.Async', appending an existentially
  result-erased copy of the handle to @pendingRef@ so a caller can guarantee
  -- via 'cancelAllTracked' -- that every fork it ever started during some
- dynamic-width unit of work (a batch's eval-leaf forks, in
- "Control.Computations.CompEngine.Impl"'s @doSuspended@, the only current
- caller) is accounted for even if the caller never gets around to
+ dynamic-width unit of work (a batch's eval-leaf forks and source-dispatch
+ forks, both in "Control.Computations.CompEngine.Impl"'s @doSuspended@
+ machinery -- see 'Control.Computations.CompEngine.Impl.prepEvalLeaf' and
+ 'Control.Computations.CompEngine.Impl.dispatchSrcJobs', its only two
+ current callers) is accounted for even if the caller never gets around to
  individually joining it (e.g. an earlier sibling leaf's exception means the
  run phase never reaches this one at all -- see 'cancelAllTracked').
 
@@ -145,11 +116,12 @@ forkTracked pendingRef action = do
  whether or not each one was already individually joined:
  'Async.cancel' on an 'Async.Async' whose action has already completed (or
  already been cancelled) is a documented no-op. Meant to run in a 'finally'
- around a batch's engine-thread phase, so it fires on both the success path
- (every fork already joined by its own leaf, so this is a no-op sweep) and
- the exception path (some forks never reached by the run phase at all, so
- this is what actually tears them down) -- see
- "Control.Computations.CompEngine.Impl"'s @doSuspended@, the only caller.
+ around the forking phase it guards, so it fires on both the success path
+ (every fork already joined, so this is a no-op sweep) and the exception
+ path (some forks never individually joined, so this is what actually tears
+ them down) -- see "Control.Computations.CompEngine.Impl"'s @doSuspended@
+ (wraps 'enginePhase') and 'Control.Computations.CompEngine.Impl.dispatchSrcJobs'
+ (wraps its own dispatch-and-join sequence), its two current callers.
 -}
 cancelAllTracked :: IORef [Async.Async ()] -> IO ()
 cancelAllTracked pendingRef = readIORef pendingRef >>= mapM_ Async.cancel

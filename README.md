@@ -274,9 +274,9 @@ $ HOSPITAL_BENCH=1 stack bench
 Env vars: `HOSPITAL_BENCH_SCALE` (default `1.0`, ~1,000 patients across 20
 wards, ~976,000 instances) scales the patient/ward count continuously;
 `HOSPITAL_BENCH_SRC_LATENCY_US` (default `0`) adds a simulated per-call
-source latency, in microseconds, to stand in for a real service call;
-`HOSPITAL_BENCH_CONCURRENCY` (default `1`) sets the concurrent flow
-execution width (see below).
+source latency, in microseconds, to stand in for a real service call. This
+benchmark has no concurrency knob of its own (see `docs/benchmark-notes.md`'s
+Stage 12/12a for why).
 
 After its cold eval and single-key live update, the Hospital benchmark also
 runs a rerun-heavy live phase: it mutates many source keys in one batch
@@ -307,10 +307,10 @@ base latency), `0` disables simulated latency for a cheap structural-only
 run; `TIERED_BENCH_JITTER` (default off) adds deterministic per-key jitter
 to each simulated round trip; `TIERED_BENCH_BUNDLING` (default on) toggles
 whether same-instance multi-key requests bundle into one round trip;
-`TIERED_BENCH_CONCURRENCY` (default `1`) sets the source-side dispatch
-width (`setCompFlowConcurrency`, above); `TIERED_BENCH_EVAL_CONCURRENCY`
-(default `1`) sets the eval-side fork width (`setCompEvalConcurrency`, see
-below). Like Hospital, it also runs a rerun-heavy live phase, controlled
+`TIERED_BENCH_EVAL_CONCURRENCY` (default `1`) sets the eval concurrency
+width (`setCompEvalConcurrency`, see below) — which also governs how much
+source dispatch (see below) can overlap, since the two now share one
+permit pool. Like Hospital, it also runs a rerun-heavy live phase, controlled
 the same way: `TIERED_BENCH_RERUN_KEYS` (default `400`, `0` disables the
 phase) and `TIERED_BENCH_RERUN_LOOPS` (default `1`).
 
@@ -323,35 +323,33 @@ NOTE: those are working notes, not polished docs.
 
 By default, every request a comp body makes — even ones batched together
 via `<*>` into one `CompReqCombined` — runs one at a time on the engine
-thread. A `CompSrc` can declare it tolerates concurrent calls to its own
-`compSrcExecute` (`compSrcConcurrency`, defaulting to `FlowSerial`), and a
-`CompFlowRegistry` can be given a concurrency width above its default of 1;
-when both are true, the source leaves of a batch may be dispatched to a
-bounded worker pool instead of running inline. A `CompSink` can declare the
+thread. A `CompSrc` declares whether it tolerates concurrent calls to its
+own `compSrcExecute` via `compSrcConcurrency`, a plain two-state value:
+`FlowSerial` (the default) or `FlowConcurrent`. A `CompSink` declares the
 same thing for its own `compSinkExecute` (`compSinkConcurrency`, also
 defaulting to `FlowSerial`) — see "Concurrent computation evaluation" below
 for why a sink needs an opinion here at all once cap evaluation itself can
-run on more than one thread. Cap evaluation and cache lookups still run
-inline regardless of this section's own knob; see below for the separate
-knob that lets cap evaluation fork.
+run on more than one thread.
 
-To turn it on, call `setCompFlowConcurrency` inside the `withRegisteredFlows`
-callback `compDriver`/`compDriver'` already hand you:
-
-```haskell
-compDriver
-  (\reg action -> do
-      setCompFlowConcurrency reg (mkCompFlowConcurrency 4)
-      registerCompSrc reg mySrc
-      action)
-  wireComps
-  ()
-```
+There is no separate width knob for source (or sink) dispatch — an earlier
+one existed and was removed as dead weight, measured flat on two
+independent realistic graph shapes (see `docs/benchmark-notes.md`'s Stage
+12/12a). A `FlowConcurrent` source's leaves may instead be proactively
+dispatched against the *eval* concurrency pool ("Concurrent computation
+evaluation", below): dispatch draws permits from that same shared pool
+rather than a separately-sized one, so how much source dispatch can
+actually overlap is governed entirely by `setCompEvalConcurrency`. A
+`FlowSerial` instance, or any instance reached while parallel eval is off,
+is never proactively dispatched — it always runs inline, in leaf order, on
+the engine thread, exactly as before this mechanism existed. Losing the
+race for a permit is not a failure, either: an undispatched `FlowConcurrent`
+group simply runs at its own leaf's position instead, so dispatch is purely
+a performance optimization, never a correctness requirement.
 
 `HashMapFlow`, `TimeSrc`, and `FileSrc` all declare `FlowConcurrent`. A
-source that hasn't opted in stays serialized no matter how wide the
-registry's width is. See `docs/benchmark-notes.md`'s Stage 5 for the design
-and measured numbers.
+source that hasn't opted in stays serialized no matter how much eval
+concurrency is available. See `docs/benchmark-notes.md`'s Stage 5 for the
+original design and measured numbers.
 
 ## Concurrent computation evaluation
 
@@ -369,7 +367,7 @@ To turn it on, call `setCompEvalConcurrency` inside the same
 ```haskell
 compDriver
   (\reg action -> do
-      setCompEvalConcurrency reg (mkCompFlowConcurrency 64)
+      setCompEvalConcurrency reg (mkCompEvalConcurrency 64)
       registerCompSrc reg mySrc
       action)
   wireComps
@@ -377,17 +375,17 @@ compDriver
 ```
 
 The default width is 1: no fork pool is allocated at all, and every eval
-leaf runs exactly as it did before this knob existed. Nothing changes
-unless you opt in.
+leaf runs exactly as it did before this knob existed, and no `FlowConcurrent`
+source or sink ever gets proactively dispatched either (see "Concurrent flow
+execution", above). Nothing changes unless you opt in.
 
-This is a *separate* knob from `setCompFlowConcurrency`, deliberately:
-sharing one width between "how many source jobs a batch may dispatch" and
-"how many nested cap evaluations may run concurrently" would make any win
-unattributable to either mechanism. It also differs in when it's read —
-`setCompFlowConcurrency` is read fresh every batch, but
-`setCompEvalConcurrency` is read exactly once, at engine start, so it must
-be called before the engine that reads the registry starts; a call after
-that has no effect.
+This is the *only* concurrency width knob the engine exposes: source
+dispatch draws from this same pool rather than a separately-sized one of
+its own (an earlier version of this project had a second, source-side width
+knob; it was removed as dead weight — see `docs/benchmark-notes.md`'s Stage
+12/12a). It must be set before the engine starts: it is read exactly once,
+at engine start, so a call after that has no effect on an already-running
+engine.
 
 **Measured effect.** On the tiered benchmark (see Benchmark, above),
 `docs/benchmark-notes.md`'s Stage 15 measured, within one session, cold

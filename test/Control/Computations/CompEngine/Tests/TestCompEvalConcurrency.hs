@@ -3,16 +3,17 @@
 {-# OPTIONS_GHC -F -pgmF htfpp #-}
 
 {- | Exercises 'Control.Computations.CompEngine.CompFlowRegistry.setCompEvalConcurrency'
- -- the eval-side width knob added alongside the promise table and
- 'Control.Computations.CompEngine.Impl.EvalChain' (see that module's
+ -- the (now only) concurrency width knob, added alongside the promise table
+ and 'Control.Computations.CompEngine.Impl.EvalChain' (see that module's
  haddocks: @ParState@, @EvalPromise@, @doAnyEvalReqValue@, @prepEvalLeaf@,
  @doCompAp@). Deliberately a sibling module to "TestCompFlowConcurrency"
- rather than an extension of it: that module is entirely about the
- *source*-side width knob
- ('Control.Computations.CompEngine.CompFlowRegistry.setCompFlowConcurrency'),
- which this project leaves untouched and orthogonal (see
- 'Control.Computations.CompEngine.CompFlowRegistry.setCompEvalConcurrency'\'s
- own haddock for why the two knobs are deliberately not shared).
+ rather than an extension of it: this module is about eval-leaf forking
+ (nested cap evaluation) specifically, while that module is about
+ 'Control.Computations.CompEngine.Impl.dispatchSrcJobs' -- proactive source
+ dispatch, which now draws from this same eval permit pool rather than a
+ separately-sized one of its own (the source-side width knob this project
+ used to expose alongside it was removed as dead weight -- see
+ @docs\/benchmark-notes.md@ Stage 12\/12a).
 
  Every test here builds its own registry (never "TestHelper"'s
  @initCompEngineTest@, which never hands the registry back) so it can call
@@ -230,7 +231,7 @@ test_hashCachingCapReferencedTwiceInOneBatchEvaluatesOnceAtEvalWidth8 =
                   Just engine -> awaitPromiseJoinThenProceed engine
           wrapStateIf = observingStateIf onEval
       reg <- newCompFlowRegistry
-      setCompEvalConcurrency reg (mkCompFlowConcurrency 8)
+      setCompEvalConcurrency reg (mkCompEvalConcurrency 8)
       (rawStateIf, closeSif) <- initStateIf True
       let stateIf = wrapStateIf rawStateIf
       (_compMap, mainComp) <-
@@ -285,7 +286,7 @@ test_directSelfCycleErrorsInsteadOfHangingAtEvalWidth8 :: IO ()
 test_directSelfCycleErrorsInsteadOfHangingAtEvalWidth8 =
   do
     reg <- newCompFlowRegistry
-    setCompEvalConcurrency reg (mkCompFlowConcurrency 8)
+    setCompEvalConcurrency reg (mkCompEvalConcurrency 8)
     (rawStateIf, closeSif) <- initStateIf True
     (_compMap, selfComp) <- failInM $ runCompWireM (defineRecursiveComp selfCycleCompDef)
     let ifs = CompEngineIfs{ce_compFlowRegistry = reg, ce_stateIf = rawStateIf}
@@ -346,7 +347,7 @@ test_slidingWindowForksMoreLeavesThanThePermitCountAtEvalWidth3 =
       -- width 3 -> 2 permits (ps_permits = width - 1): under the old
       -- collect-time-only decision, at most 2 of this batch's 19 eligible
       -- leaves (20 total, minus the never-forked first) could ever fork.
-      setCompEvalConcurrency reg (mkCompFlowConcurrency 3)
+      setCompEvalConcurrency reg (mkCompEvalConcurrency 3)
       (rawStateIf, closeSif) <- initStateIf True
       let stateIf = observingStateIf onEval rawStateIf
       (_compMap, mainComp) <-

@@ -1,22 +1,28 @@
 {-# LANGUAGE TypeFamilies #-}
 {-# OPTIONS_GHC -F -pgmF htfpp #-}
 
-{- | Exercises the bounded worker pool a wide 'CompReqCombined' batch (see
- "Control.Computations.CompEngine.Types") may dispatch 'FlowConcurrent'
- source *groups* to once 'Control.Computations.CompEngine.CompFlowRegistry.setCompFlowConcurrency'
- raises a registry's width above 1 -- see "Control.Computations.CompEngine.Impl"'s
- @prepSrcLeaf@\/@Prep@\/@SrcGroup@\/@runGroupOnce@ for the implementation
- these tests pin down. "Control.Computations.CompEngine.Tests.TestCompReqCombined"
- keeps the width-1 (default, unchanged-behaviour) regression guards; this
- module is specifically about width > 1.
+{- | Exercises 'Control.Computations.CompEngine.Impl.dispatchSrcJobs' --
+ which proactively dispatches 'FlowConcurrent' source *groups* against the
+ engine's shared eval permit pool once
+ 'Control.Computations.CompEngine.CompFlowRegistry.setCompEvalConcurrency'
+ raises a registry's eval width above 1, enabling parallel eval (@ce_par@ is
+ 'Just') -- see "Control.Computations.CompEngine.Impl"'s
+ @prepSrcLeaf@\/@Prep@\/@SrcGroup@\/@runGroupOnce@\/@dispatchSrcJobs@ for the
+ implementation these tests pin down. There is no source-side concurrency
+ knob any more (see @docs\/benchmark-notes.md@ Stage 12\/12a for why it was
+ removed): source dispatch now piggybacks entirely on whether *eval*
+ concurrency is enabled and how many permits its pool has free.
+ "Control.Computations.CompEngine.Tests.TestCompReqCombined" keeps the
+ parallel-eval-off (default, unchanged-behaviour) regression guards; this
+ module is specifically about parallel eval being on.
 
  Since every 'CompLeafSrc' leaf resolving to the same instance within one
  batch is now bundled into a single
  'Control.Computations.CompEngine.CompSrc.compSrcExecuteBatch' call (see
  that method's haddock), "several requests against the same instance
- overlap at width > 1" is no longer something the engine's job dispatch
+ overlap once dispatched" is no longer something the engine's job dispatch
  provides by itself -- a batch against one instance is one call regardless
- of width. It is still achievable, but now it is the instance's own
+ of dispatch. It is still achievable, but now it is the instance's own
  responsibility, via its 'compSrcExecuteBatch' override (see
  'ConcurrentBatchSrc' below) -- exactly like a real batched backend that can
  issue several sub-requests of one round trip concurrently would do it
@@ -26,7 +32,7 @@
  Every test here builds its own 'Control.Computations.CompEngine.CompFlowRegistry.CompFlowRegistry'
  by hand (rather than going through "Control.Computations.CompEngine.Tests.TestHelper"'s
  @initCompEngineTest@) precisely so it can call
- 'Control.Computations.CompEngine.CompFlowRegistry.setCompFlowConcurrency'
+ 'Control.Computations.CompEngine.CompFlowRegistry.setCompEvalConcurrency'
  on it before running -- @initCompEngineTest@ never hands its registry back
  to the caller.
 -}
@@ -124,8 +130,13 @@ runOnce reg mainCompDef =
     runCompEngine ifs caps rifs () `finally` closeSif
 
 ----------------------------------------------------------------------------
--- 1 & 2: FlowSerial never overlaps regardless of width; FlowConcurrent
--- genuinely does at width > 1.
+-- 1 & 2: FlowSerial never overlaps, and neither does FlowConcurrent with
+-- the engine's own default (sequential) compSrcExecuteBatch -- see the
+-- module haddock on why bundling makes both of these true regardless of
+-- eval concurrency: with only one registered instance in play, there is
+-- only ever one SrcGroup, so it is one compSrcExecuteBatch call whether
+-- runGroupOnce ends up triggered from a dispatchSrcJobs fork or lazily
+-- from enginePhase.
 ----------------------------------------------------------------------------
 
 -- | Bump an in-flight counter, record the high-water mark it reaches, hold
@@ -164,28 +175,32 @@ runMutualExclusionCase conc =
     highWater <- newTVarIO 0
     let src = ScriptedSrc "mutex-src" conc (mkOverlapAction inFlight highWater)
     reg <- newCompFlowRegistry
-    setCompFlowConcurrency reg (mkCompFlowConcurrency 8)
+    -- No 'setCompEvalConcurrency' call needed: with only one registered
+    -- instance, there is only ever one SrcGroup, so bundling alone (see
+    -- the module haddock) already guarantees a single sequential
+    -- compSrcExecuteBatch call regardless of whether parallel eval, and
+    -- therefore proactive dispatch, is on at all.
     registerCompSrc reg src
     runOnce reg (mutexMainCompDef (typedCompSrcIdOf src))
     readTVarIO highWater
 
 -- | All eight requests above land in one batch against one instance, so the
 -- engine bundles them into a single 'compSrcExecuteBatch' call regardless
--- of 'FlowConcurrency' or width (see the module haddock) -- 'ScriptedSrc'
+-- of 'FlowConcurrency' or dispatch (see the module haddock) -- 'ScriptedSrc'
 -- never overrides that method, so its default (sequential) implementation
 -- serves all eight itself, one at a time, whether the instance declares
--- 'FlowSerial' or 'FlowConcurrent'. This is the width-1-style "no overlap"
--- case for *both* declarations now; 'FlowConcurrent's own overlap guarantee
--- moves to 'test_flowConcurrentSourceGenuinelyOverlapsAtWidth8' below, via
--- an instance that actually implements it.
-test_flowSerialSourceNeverOverlapsAtWidth8 :: IO ()
-test_flowSerialSourceNeverOverlapsAtWidth8 =
+-- 'FlowSerial' or 'FlowConcurrent'. This is the "no overlap" case for
+-- *both* declarations; 'FlowConcurrent's own overlap guarantee moves to
+-- 'test_flowConcurrentSourceGenuinelyOverlapsViaOwnBatchExec' below, via an
+-- instance that actually implements it.
+test_flowSerialSourceNeverOverlaps :: IO ()
+test_flowSerialSourceNeverOverlaps =
   do
     hw <- runMutualExclusionCase FlowSerial
     assertEqual 1 hw
 
-test_flowConcurrentSourceWithDefaultBatchExecNeverOverlapsAtWidth8 :: IO ()
-test_flowConcurrentSourceWithDefaultBatchExecNeverOverlapsAtWidth8 =
+test_flowConcurrentSourceWithDefaultBatchExecNeverOverlaps :: IO ()
+test_flowConcurrentSourceWithDefaultBatchExecNeverOverlaps =
   do
     hw <- runMutualExclusionCase FlowConcurrent
     assertEqual 1 hw
@@ -232,18 +247,22 @@ mutexConcurrentMainCompDef srcId =
     void (traverse (\_ -> compSrcReq srcId ScriptedReq) [1 .. 8 :: Int])
 
 -- | Guarded on 'rtsSupportsBoundThreads' so this can't go flaky on a
--- non-threaded RTS, where width > 1 is deliberately a no-op (see
--- prepSrcLeaf's haddock) -- this repo's own test stanza always builds
--- @-threaded -with-rtsopts=-N@, so the guard holds here.
-test_flowConcurrentSourceGenuinelyOverlapsAtWidth8 :: IO ()
-test_flowConcurrentSourceGenuinelyOverlapsAtWidth8 =
+-- non-threaded RTS -- this repo's own test stanza always builds
+-- @-threaded -with-rtsopts=-N@, so the guard holds here. No
+-- 'setCompEvalConcurrency' call needed: the overlap this test checks for
+-- comes entirely from 'ConcurrentBatchSrc's own 'compSrcExecuteBatch'
+-- override running its 8 sub-requests via 'Async.mapConcurrently_' inside
+-- one 'runGroupOnce' call -- unaffected by whether that one call is ever
+-- proactively dispatched by 'Control.Computations.CompEngine.Impl.dispatchSrcJobs'
+-- at all (see the module haddock).
+test_flowConcurrentSourceGenuinelyOverlapsViaOwnBatchExec :: IO ()
+test_flowConcurrentSourceGenuinelyOverlapsViaOwnBatchExec =
   when rtsSupportsBoundThreads $
     do
       inFlight <- newTVarIO 0
       highWater <- newTVarIO 0
       let src = ConcurrentBatchSrc "mutex-concurrent-src" (mkOverlapAction inFlight highWater)
       reg <- newCompFlowRegistry
-      setCompFlowConcurrency reg (mkCompFlowConcurrency 8)
       registerCompSrc reg src
       runOnce reg (mutexConcurrentMainCompDef (typedCompSrcIdOf src))
       hw <- readTVarIO highWater
@@ -252,7 +271,7 @@ test_flowConcurrentSourceGenuinelyOverlapsAtWidth8 =
 ----------------------------------------------------------------------------
 -- 1b: the FlowSerial guarantee across two DIFFERENT comps' bodies, each
 -- forming its own nested batch against the same instance, when both bodies
--- are themselves forked onto separate threads by eval-width > 1 (see
+-- are themselves forked onto separate threads by eval concurrency (see
 -- Impl.hs's prepEvalLeaf). Tests 1/1a above only ever put every request
 -- against one instance into a single shared batch/SrcGroup, so they would
 -- keep passing even if the per-instance locks this module's own
@@ -277,16 +296,16 @@ crossBodyLeafCompDef name srcId =
     sum <$> traverse (\_ -> compSrcReq srcId ScriptedReq) [1 .. 8 :: Int]
 
 -- | Exactly two eval leaves (compA, compB) combined via `<*>` -- the shape
--- test 6's own comment identifies as needing width > 1 to escape the
--- two-leaf fast path (see doSuspended) and reach prepEvalLeaf at all; the
--- source-side width set in 'runCrossBodyOverlapCase' below takes care of
--- that here.
+-- test 6's own comment identifies as needing parallel eval enabled to
+-- escape the two-leaf fast path (see doSuspended) and reach prepEvalLeaf at
+-- all; the 'setCompEvalConcurrency' call in 'runCrossBodyOverlapCase' below
+-- takes care of that here.
 crossBodyMainCompDef :: Comp () Int -> Comp () Int -> CompDef () (Int, Int)
 crossBodyMainCompDef compA compB =
   defineComp "cross-body-main" inMemoryShowCaching $ \() ->
     (,) <$> evalCompOrFail compA () <*> evalCompOrFail compB ()
 
--- | Wired by hand, like test_noCapEvaluatedTwiceAtWidth8 below, rather than
+-- | Wired by hand, like test_noCapEvaluatedTwiceAtEvalWidth8 below, rather than
 -- through 'runOnce': compA/compB must be wired *before* crossBodyMainCompDef
 -- is built, since it closes over them as already-wired 'Comp' values (the
 -- same reason dedupMainCompDef above takes its leaf as a parameter instead
@@ -298,8 +317,7 @@ runCrossBodyOverlapCase =
     highWater <- newTVarIO 0
     let src = ScriptedSrc "cross-body-src" FlowSerial (mkOverlapAction inFlight highWater)
     reg <- newCompFlowRegistry
-    setCompFlowConcurrency reg (mkCompFlowConcurrency 8)
-    setCompEvalConcurrency reg (mkCompFlowConcurrency 8)
+    setCompEvalConcurrency reg (mkCompEvalConcurrency 8)
     registerCompSrc reg src
     (rawStateIf, closeSif) <- initStateIf True
     (_compMap, mainComp) <-
@@ -324,12 +342,12 @@ runCrossBodyOverlapCase =
     readTVarIO highWater
 
 -- | Guarded on 'rtsSupportsBoundThreads' for the same reason as
--- test_flowConcurrentSourceGenuinelyOverlapsAtWidth8 above: without real
+-- test_flowConcurrentSourceGenuinelyOverlapsViaOwnBatchExec above: without real
 -- OS-thread concurrency, no eval leaf ever forks, so this would trivially
 -- pass (both bodies would run sequentially on the same thread) whether or
 -- not the fix under test exists.
-test_flowSerialSourceNeverOverlapsAcrossForkedBodiesAtWidth8 :: IO ()
-test_flowSerialSourceNeverOverlapsAcrossForkedBodiesAtWidth8 =
+test_flowSerialSourceNeverOverlapsAcrossForkedBodiesAtEvalWidth8 :: IO ()
+test_flowSerialSourceNeverOverlapsAcrossForkedBodiesAtEvalWidth8 =
   when rtsSupportsBoundThreads $
     do
       hw <- runCrossBodyOverlapCase
@@ -390,8 +408,7 @@ runCrossBodySinkOverlapCase =
     highWater <- newTVarIO 0
     let sink = ScriptedSink "cross-body-sink" FlowSerial (void (mkOverlapAction inFlight highWater))
     reg <- newCompFlowRegistry
-    setCompFlowConcurrency reg (mkCompFlowConcurrency 8)
-    setCompEvalConcurrency reg (mkCompFlowConcurrency 8)
+    setCompEvalConcurrency reg (mkCompEvalConcurrency 8)
     registerCompSink reg sink
     (rawStateIf, closeSif) <- initStateIf True
     (_compMap, mainComp) <-
@@ -417,16 +434,17 @@ runCrossBodySinkOverlapCase =
 
 -- | Guarded on 'rtsSupportsBoundThreads' for the same reason 1b's own
 -- test is.
-test_flowSerialSinkNeverOverlapsAcrossForkedBodiesAtWidth8 :: IO ()
-test_flowSerialSinkNeverOverlapsAcrossForkedBodiesAtWidth8 =
+test_flowSerialSinkNeverOverlapsAcrossForkedBodiesAtEvalWidth8 :: IO ()
+test_flowSerialSinkNeverOverlapsAcrossForkedBodiesAtEvalWidth8 =
   when rtsSupportsBoundThreads $
     do
       hw <- runCrossBodySinkOverlapCase
       assertEqual 1 hw
 
 ----------------------------------------------------------------------------
--- 3: no cap gets evaluated twice at width 8, even when the same batch also
--- dispatches concurrent source jobs alongside the eval leaves.
+-- 3: no cap gets evaluated twice at eval width 8, even when the same batch
+-- also dispatches concurrent source jobs (against the same shared permit
+-- pool) alongside the eval leaves.
 ----------------------------------------------------------------------------
 
 dedupLeafCompDef :: CompDef Int Int
@@ -440,13 +458,13 @@ dedupMainCompDef leaf srcId =
         <$> traverse (\i -> evalCompOrFail leaf (i `mod` 10)) [0 .. 999 :: Int]
         <*> traverse (\_ -> compSrcReq srcId ScriptedReq) [1 .. 32 :: Int]
 
-test_noCapEvaluatedTwiceAtWidth8 :: IO ()
-test_noCapEvaluatedTwiceAtWidth8 =
+test_noCapEvaluatedTwiceAtEvalWidth8 :: IO ()
+test_noCapEvaluatedTwiceAtEvalWidth8 =
   do
     countsRef <- newIORef HashMap.empty
     let src = ScriptedSrc "dedup-src" FlowConcurrent (pure 0)
     reg <- newCompFlowRegistry
-    setCompFlowConcurrency reg (mkCompFlowConcurrency 8)
+    setCompEvalConcurrency reg (mkCompEvalConcurrency 8)
     registerCompSrc reg src
     (rawStateIf, closeSif) <- initStateIf True
     let stateIf =
@@ -484,7 +502,12 @@ test_noCapEvaluatedTwiceAtWidth8 =
 -- 4: when several concurrently-dispatched source leaves all throw, the
 -- exception that escapes is the LEFTMOST failing leaf's -- mirroring
 -- compMAp's left-error bias at the Fail level (Types.hs) at the exception
--- level too.
+-- level too. Needs eval concurrency on (three distinct instances, so three
+-- separate one-member SrcGroups -- see 'dispatchSrcJobs') so all three are
+-- genuinely dispatched and drained together before any slot is read,
+-- exercising the "every leaf's compSrcExecute has already run by the time
+-- the exception is observed" case, not just the trivially-leftmost
+-- sequential case parallel eval off would give for free.
 ----------------------------------------------------------------------------
 
 boomMainCompDef
@@ -500,14 +523,14 @@ boomMainCompDef leftId harmlessId rightId =
         <*> compSrcReq harmlessId ScriptedReq
         <*> compSrcReq rightId ScriptedReq
 
-test_leftmostFailingSourceLeafExceptionEscapesAtWidth8 :: IO ()
-test_leftmostFailingSourceLeafExceptionEscapesAtWidth8 =
+test_leftmostFailingSourceLeafExceptionEscapesAtEvalWidth8 :: IO ()
+test_leftmostFailingSourceLeafExceptionEscapesAtEvalWidth8 =
   do
     let boomLeft = ScriptedSrc "boom-left" FlowConcurrent (throwIO (userError "left boom"))
         boomHarmless = ScriptedSrc "boom-harmless" FlowConcurrent (pure 0)
         boomRight = ScriptedSrc "boom-right" FlowConcurrent (throwIO (userError "right boom"))
     reg <- newCompFlowRegistry
-    setCompFlowConcurrency reg (mkCompFlowConcurrency 8)
+    setCompEvalConcurrency reg (mkCompEvalConcurrency 8)
     registerCompSrc reg boomLeft
     registerCompSrc reg boomHarmless
     registerCompSrc reg boomRight
@@ -553,7 +576,11 @@ test_cancelTearsDownBlockedWorker =
         filler1 = ScriptedSrc "cancel-filler1" FlowConcurrent (pure 1)
         filler2 = ScriptedSrc "cancel-filler2" FlowConcurrent (pure 2)
     reg <- newCompFlowRegistry
-    setCompFlowConcurrency reg (mkCompFlowConcurrency 4)
+    -- Eval width 4 -> 3 permits, exactly enough for all three distinct
+    -- instances' single-member SrcGroups to be dispatched via
+    -- 'dispatchSrcJobs' at once, so 'blocked' is genuinely off running on
+    -- its own fork (holding a permit) when the cancel below lands.
+    setCompEvalConcurrency reg (mkCompEvalConcurrency 4)
     registerCompSrc reg blocked
     registerCompSrc reg filler1
     registerCompSrc reg filler2
@@ -582,14 +609,17 @@ test_cancelTearsDownBlockedWorker =
 -- 6: the plain two-leaf shape `(,) <$> compSrcReq srcA .. <*> compSrcReq
 -- srcB ..` -- the overwhelmingly common shape a batch of exactly two
 -- suspended actions takes -- must still let its two FlowConcurrent source
--- leaves genuinely overlap once width > 1. doSuspended's CompReqCombined
--- case (Impl.hs) used to take a fast path whenever neither child was
--- itself a CompReqCombined, with no regard for width at all, so a plain
--- `f <$> a <*> b` never reached dispatchJobs at any width -- only batches
--- of three or more leaves (reached via traverse, as in the mutex/dedup
--- tests above) ever got dispatched as jobs. The fast path is now taken
--- only at width 1, where it is provably a no-op change (no source leaf
--- could ever be dispatched as a job at width 1 anyway).
+-- leaves genuinely overlap once parallel eval is on. doSuspended's
+-- CompReqCombined case (Impl.hs) used to take a fast path whenever neither
+-- child was itself a CompReqCombined and the *source*-side width was 1,
+-- with no regard for whether parallel eval was on -- a real bug (see
+-- Impl.hs's own note at the fast-path condition): a plain `f <$> a <*> b`
+-- could never reach 'dispatchSrcJobs' no matter how wide eval concurrency
+-- was, only batches of three or more leaves (reached via traverse, as in
+-- the mutex/dedup tests above) ever got dispatched as jobs. The fast path
+-- is now gated on 'ce_par' being 'Nothing' (parallel eval off) instead, and
+-- is provably a no-op change there: nothing could ever be dispatched with
+-- no permit pool to dispatch it against anyway.
 ----------------------------------------------------------------------------
 
 twoLeafMainCompDef
@@ -603,36 +633,42 @@ twoLeafMainCompDef srcAId srcBId =
 -- mark across both -- 2 only if the two leaves' 'compSrcExecute' calls
 -- genuinely ran at the same time, not merely if each instance's own calls
 -- never overlapped themselves (there's only one call per instance here
--- anyway).
+-- anyway). @evalWidth@ of 1 leaves parallel eval off (@ce_par@ 'Nothing'),
+-- taking the fast path and forcing the two leaves to run one at a time;
+-- anything above 1 turns parallel eval on and gives 'dispatchSrcJobs' at
+-- least one permit per group (@evalWidth - 1@ permits for exactly 2
+-- groups, so @evalWidth >= 3@ guarantees both are dispatched at once).
 runTwoLeafOverlapCase :: Int -> IO Int
-runTwoLeafOverlapCase width =
+runTwoLeafOverlapCase evalWidth =
   do
     inFlight <- newTVarIO 0
     highWater <- newTVarIO 0
     let srcA = ScriptedSrc "two-leaf-a" FlowConcurrent (mkOverlapAction inFlight highWater)
         srcB = ScriptedSrc "two-leaf-b" FlowConcurrent (mkOverlapAction inFlight highWater)
     reg <- newCompFlowRegistry
-    setCompFlowConcurrency reg (mkCompFlowConcurrency width)
+    setCompEvalConcurrency reg (mkCompEvalConcurrency evalWidth)
     registerCompSrc reg srcA
     registerCompSrc reg srcB
     runOnce reg (twoLeafMainCompDef (typedCompSrcIdOf srcA) (typedCompSrcIdOf srcB))
     readTVarIO highWater
 
 -- | Guarded on 'rtsSupportsBoundThreads' for the same reason as
--- test_flowConcurrentSourceGenuinelyOverlapsAtWidth8 above: without real
--- OS-thread concurrency, width > 1 is deliberately a no-op.
-test_twoLeafBatchGenuinelyOverlapsAtWidth4 :: IO ()
-test_twoLeafBatchGenuinelyOverlapsAtWidth4 =
+-- test_flowSerialSourceNeverOverlapsAcrossForkedBodiesAtEvalWidth8 above:
+-- without real OS-thread concurrency, parallel eval never actually forks
+-- anything, so 'dispatchSrcJobs' would never get called at all.
+test_twoLeafBatchGenuinelyOverlapsWithParallelEvalOn :: IO ()
+test_twoLeafBatchGenuinelyOverlapsWithParallelEvalOn =
   when rtsSupportsBoundThreads $
     do
       hw <- runTwoLeafOverlapCase 4
       assertEqual 2 hw
 
--- | Same two-leaf shape, but at width 1 -- the fast path's own domain --
--- where the two source leaves must run one at a time, exactly as before
--- jobs existed.
-test_twoLeafBatchNeverOverlapsAtWidth1 :: IO ()
-test_twoLeafBatchNeverOverlapsAtWidth1 =
+-- | Same two-leaf shape, but with parallel eval off (@evalWidth = 1@,
+-- 'ce_par' 'Nothing') -- the fast path's own domain -- where the two source
+-- leaves must run one at a time, exactly as before 'dispatchSrcJobs'
+-- existed.
+test_twoLeafBatchNeverOverlapsWithParallelEvalOff :: IO ()
+test_twoLeafBatchNeverOverlapsWithParallelEvalOff =
   do
     hw <- runTwoLeafOverlapCase 1
     assertEqual 1 hw
