@@ -47,6 +47,51 @@ and this project adheres to the
   `SystemSrc.sysInsertBatch`, an atomic multi-key insert — the naive
   "many separate `sysInsert` calls, then one `waitForFullSettle`" approach
   races the driver thread and can silently undercount reruns.
+- `setCompEvalConcurrency`/`readCompEvalConcurrency` on `CompFlowRegistry`:
+  the eval-side sibling of `setCompFlowConcurrency` — a width knob for how
+  many nested cap evaluations (eval leaves of a `CompReqCombined` batch) may
+  fork to a permit-bounded pool instead of running one at a time on the
+  engine thread. A promise table (one IVar per in-flight cap) guarantees
+  each cap is still evaluated at most once per occasion no matter how many
+  leaves reference it. Default width 1 allocates no fork pool at all and is
+  byte-identical to the pre-existing engine; `newCompFlowRegistry`'s
+  signature is unchanged, so this is purely additive. Read once, at engine
+  start, unlike the source-side knob. See the README's "Concurrent
+  computation evaluation" section and `docs/benchmark-notes.md`'s Stages
+  13-15 for the design, the ordering contract that changes above width 1,
+  and measured numbers (16.6x cold-eval speedup within one session on the
+  tiered benchmark at width 64, against a ~64-wide ceiling).
+- `compSinkConcurrency :: s -> FlowConcurrency` on `CompSink`, the sink-side
+  sibling of `CompSrc`'s `compSrcConcurrency`. Defaults to `FlowSerial`, so
+  no existing `CompSink` instance's behaviour changes; only consulted when
+  eval concurrency is enabled, since that's the only way two threads could
+  ever reach the same sink instance at once.
+- A third benchmark, the tiered pipeline benchmark
+  (`TIERED_BENCH=1 stack bench`), extending Hospital's graph with per-source
+  latency tiers (a ~40x spread across five sources) and comps that read a
+  source alongside their existing comp dependencies in the same applicative
+  batch — the mixed shape needed to actually exercise eval concurrency,
+  which Hospital's own graph mixes in only one comp. Env vars:
+  `TIERED_BENCH_SCALE`, `TIERED_BENCH_LATENCY_MULT`, `TIERED_BENCH_JITTER`,
+  `TIERED_BENCH_BUNDLING`, `TIERED_BENCH_CONCURRENCY`,
+  `TIERED_BENCH_EVAL_CONCURRENCY`, `TIERED_BENCH_RERUN_KEYS`,
+  `TIERED_BENCH_RERUN_LOOPS`. See the README's Benchmark section.
+
+### Changed
+
+- **Ordering contract above eval width 1**: turning on
+  `setCompEvalConcurrency` above its default of 1 gives up two guarantees
+  the engine previously always held — the interleaving of
+  `capEvaluationStarted` across a batch's eval leaves, and the relative
+  order of sink writes issued by *different* caps (order within one cap's
+  own body is still preserved). Dependency correctness, dedup (now complete
+  at any width, `hashCaching` included), left-error bias, and
+  join-before-batch-returns all still hold at any width. Width 1 is
+  unaffected and remains byte-identical to the engine as it existed before
+  this change, evaluation order included — this is a behaviour change only
+  for callers who opt in. See the README's "Concurrent computation
+  evaluation" section and `docs/benchmark-notes.md`'s Stage 15, "The
+  ordering contract, which changed".
 
 ### Fixed
 

@@ -8,6 +8,7 @@ import Test.Framework
 -- egrep -R -l '^(test|prop)_' src | sed 's|src/||g; s|/|.|g; s|.hs$||g' | sort -u | gawk '{ printf "import {-@ HTF_TESTS @-} %s\n", $0 }'
 import {-@ HTF_TESTS @-} Control.Computations.CompEngine.Tests.TestCompEngine
 import {-@ HTF_TESTS @-} Control.Computations.CompEngine.Tests.TestCompEvalConcurrency
+import {-@ HTF_TESTS @-} Control.Computations.CompEngine.Tests.TestCompEvalOrderingContract
 import {-@ HTF_TESTS @-} Control.Computations.CompEngine.Tests.TestCompFlowConcurrency
 import {-@ HTF_TESTS @-} Control.Computations.CompEngine.Tests.TestCompReqCombined
 import {-@ HTF_TESTS @-} Control.Computations.CompEngine.Tests.TestDriver

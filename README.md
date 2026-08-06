@@ -288,6 +288,32 @@ reruns at scale 1.0; `0` disables the phase) sets keys mutated per round;
 scale benchmark's `PERSIST_BENCH_LIVE_LOOPS` diagnostic (see
 `bench/Control/Computations/Demos/Bench/Main.hs`).
 
+A third benchmark, the tiered pipeline benchmark, extends Hospital's graph
+with per-source latency tiers (five sources, a ~40x spread instead of one
+shared latency) and four comps that read a source alongside their existing
+comp dependencies in the same applicative batch — the mixed source/comp
+shape needed to actually exercise concurrent computation evaluation (see
+below), which Hospital's own graph only mixes in a single comp. Run it
+with:
+
+```
+$ TIERED_BENCH=1 stack bench
+```
+
+Env vars: `TIERED_BENCH_SCALE` (default `0.18`, ~180 patients across ~4
+wards) scales the patient/ward count continuously; `TIERED_BENCH_LATENCY_MULT`
+(default `1.0`) scales the five per-source latency tiers (25 μs to 1 ms
+base latency), `0` disables simulated latency for a cheap structural-only
+run; `TIERED_BENCH_JITTER` (default off) adds deterministic per-key jitter
+to each simulated round trip; `TIERED_BENCH_BUNDLING` (default on) toggles
+whether same-instance multi-key requests bundle into one round trip;
+`TIERED_BENCH_CONCURRENCY` (default `1`) sets the source-side dispatch
+width (`setCompFlowConcurrency`, above); `TIERED_BENCH_EVAL_CONCURRENCY`
+(default `1`) sets the eval-side fork width (`setCompEvalConcurrency`, see
+below). Like Hospital, it also runs a rerun-heavy live phase, controlled
+the same way: `TIERED_BENCH_RERUN_KEYS` (default `400`, `0` disables the
+phase) and `TIERED_BENCH_RERUN_LOOPS` (default `1`).
+
 [`docs/benchmark-notes.md`](docs/benchmark-notes.md) has measured numbers
 from prior runs, stage by stage, with what was kept and what was reverted.
 
@@ -301,9 +327,13 @@ thread. A `CompSrc` can declare it tolerates concurrent calls to its own
 `compSrcExecute` (`compSrcConcurrency`, defaulting to `FlowSerial`), and a
 `CompFlowRegistry` can be given a concurrency width above its default of 1;
 when both are true, the source leaves of a batch may be dispatched to a
-bounded worker pool instead of running inline. Everything else in a batch —
-cap evaluation, cache lookups, sink writes — still runs on the engine
-thread regardless.
+bounded worker pool instead of running inline. A `CompSink` can declare the
+same thing for its own `compSinkExecute` (`compSinkConcurrency`, also
+defaulting to `FlowSerial`) — see "Concurrent computation evaluation" below
+for why a sink needs an opinion here at all once cap evaluation itself can
+run on more than one thread. Cap evaluation and cache lookups still run
+inline regardless of this section's own knob; see below for the separate
+knob that lets cap evaluation fork.
 
 To turn it on, call `setCompFlowConcurrency` inside the `withRegisteredFlows`
 callback `compDriver`/`compDriver'` already hand you:
@@ -322,3 +352,77 @@ compDriver
 source that hasn't opted in stays serialized no matter how wide the
 registry's width is. See `docs/benchmark-notes.md`'s Stage 5 for the design
 and measured numbers.
+
+## Concurrent computation evaluation
+
+By default, the eval leaves of an applicative batch — the nested cap
+evaluations inside a `CompReqCombined`, as distinct from the source leaves
+the section above governs — also run one at a time, on the engine thread.
+`setCompEvalConcurrency` lets eval leaves fork to a permit-bounded pool
+instead. A promise table, one IVar per in-flight cap, guarantees each cap
+is still evaluated at most once per occasion no matter how many leaves
+reference it or how wide the pool is.
+
+To turn it on, call `setCompEvalConcurrency` inside the same
+`withRegisteredFlows` callback:
+
+```haskell
+compDriver
+  (\reg action -> do
+      setCompEvalConcurrency reg (mkCompFlowConcurrency 64)
+      registerCompSrc reg mySrc
+      action)
+  wireComps
+  ()
+```
+
+The default width is 1: no fork pool is allocated at all, and every eval
+leaf runs exactly as it did before this knob existed. Nothing changes
+unless you opt in.
+
+This is a *separate* knob from `setCompFlowConcurrency`, deliberately:
+sharing one width between "how many source jobs a batch may dispatch" and
+"how many nested cap evaluations may run concurrently" would make any win
+unattributable to either mechanism. It also differs in when it's read —
+`setCompFlowConcurrency` is read fresh every batch, but
+`setCompEvalConcurrency` is read exactly once, at engine start, so it must
+be called before the engine that reads the registry starts; a call after
+that has no effect.
+
+**Measured effect.** On the tiered benchmark (see Benchmark, above),
+`docs/benchmark-notes.md`'s Stage 15 measured, within one session, cold
+eval going from 71.9 s at width 1 to 4.3 s at width 64 — 16.6x — against
+56.4 measured source-seconds of latency to hide, i.e. 13.1x effective
+concurrency against ~2.5 s of genuinely serial engine work. The ceiling
+sits around width 64 and is close to the floor: widths 128 and 256 measure
+the same 4.4 s. NOTE: only within-session ratios are meaningful here — this
+benchmark has documented run-to-run drift (`docs/benchmark-notes.md`'s
+Stage 12a), so don't compare this section's absolute seconds against a
+different run's. See Stages 13-15 for the full investigation, including
+the fan-out/permit-pool mismatch this fixes and the permit-release bug
+found and fixed along the way.
+
+### What ordering you still get
+
+Still guaranteed at any eval width:
+
+- dependency correctness — a cap's own dependency set is only ever written
+  by the thread evaluating that cap;
+- dedup, now complete at any width — every reference to the same cap within
+  one occasion sees one evaluation and one result, `hashCaching` included;
+- left-error bias, and the leftmost-failing-leaf guarantee;
+- every fork is joined before its batch returns, including on the
+  exception path;
+- width 1 is byte-identical to the engine as it existed before this knob,
+  evaluation order included.
+
+No longer guaranteed above width 1:
+
+- the interleaving of `capEvaluationStarted` across a batch's leaves;
+- the relative order of sink writes issued by *different* caps (within one
+  cap's own body, order is still preserved — this is also why
+  `compSinkConcurrency` exists, see above).
+
+Read this before turning the width up in production — it's the part most
+likely to surprise you. See `docs/benchmark-notes.md`'s Stage 15, "The
+ordering contract, which changed", for the full reasoning.

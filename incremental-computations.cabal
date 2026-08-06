@@ -256,6 +256,7 @@ test-suite incremental-computations-test
       Control.Computations.CompEngine.Tests.ObservingStateIf
       Control.Computations.CompEngine.Tests.TestCompEngine
       Control.Computations.CompEngine.Tests.TestCompEvalConcurrency
+      Control.Computations.CompEngine.Tests.TestCompEvalOrderingContract
       Control.Computations.CompEngine.Tests.TestCompFlowConcurrency
       Control.Computations.CompEngine.Tests.TestCompReqCombined
       Control.Computations.CompEngine.Tests.TestDriver
