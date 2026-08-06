@@ -1,0 +1,30 @@
+# Info-table profiling config (see docs/benchmark-notes.md, Stage 16).
+#
+# Use with a separate work dir so the ordinary build is left alone:
+#
+#   stack build --stack-yaml stack-itm.yaml --work-dir .stack-work-itm \
+#     --bench --no-run-benchmarks
+#   HOSPITAL_BENCH=1 HOSPITAL_BENCH_SCALE=0.1 \
+#     .stack-work-itm/dist/*/ghc-*/build/incremental-computations-bench/incremental-computations-bench \
+#     +RTS -hi -i0.1 -l -RTS
+#   eventlog2html --bands 0 -o out.html incremental-computations-bench.eventlog
+#
+# Read the *HTML* detail table, not --json: the JSON labels bands with a
+# symbol and address only and looks like it carries no source information,
+# while the HTML table has the full IPE record (closure type, type
+# description, module, source span). Stage 16 lost time to exactly that.
+#
+# $everything, not $locals: $locals covers only this package, which leaves
+# every vector / unordered-containers info table unmapped and caps
+# attribution around 6.7%. This reaches 60.2%.
+#
+# NOTE: boot libraries shipped with GHC (base, containers, text, bytestring)
+# are not rebuilt by this and stay unattributed regardless -- that is the
+# residual ~40%, and it is a ceiling rather than a gap to close.
+resolver: lts-24.51
+
+packages:
+- .
+
+ghc-options:
+  "$everything": -finfo-table-map

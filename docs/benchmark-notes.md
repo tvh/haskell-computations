@@ -3116,7 +3116,122 @@ Not documented anywhere else yet. **Still guaranteed at any width:**
 `capEvaluationStarted` across a batch's leaves, and the relative order of sink
 writes issued by *different* caps. Within one body, order is preserved.
 
-NOTE: nothing currently tests the changed contract. The frozen golden ordering
-trace still passes only because it exercises *source* concurrency, not eval
-concurrency. Restating it — assert the multiset of entries plus the surviving
-happens-before edges, rather than a total order — is open work.
+NOTE (superseded): this section originally recorded that nothing tested the
+changed contract. Commit `24a1dbe` closed that — `TestCompEvalOrderingContract`
+now carries one test per clause above, including the multiset-invariance and
+within-body-order restatements this note asked for. See that module's haddock.
+
+## Stage 16 — `THUNK_1_0` localised: it is the existential's dictionary tax
+
+Stage 8 measured `THUNK_1_0` at 810,987,120 B — **25.80%** of the Hospital
+peak census, the single largest entry — and could not attribute it. Its
+"What `THUNK_1_0` probably is" section guessed "unforced intermediate
+closures a chain of `ForAnyCompFlow`-rewrapping calls" leaves behind, and
+flagged the guess as circumstantial. A later attempt with
+`-finfo-table-map` reached only 6.7% attribution and was abandoned.
+
+That guess was wrong, and it was checkable in advance: `StrictData` is on
+globally with no opt-outs, so all three of `ForAnyCompFlow`'s fields are
+forced at construction and rewrapping cannot leave unforced intermediates
+behind. The right answer is adjacent but not the same, and it is worse.
+
+### Getting attribution from 6.7% to 60.2%
+
+The earlier attempt applied `-finfo-table-map` via stack's `$locals`, which
+covers only the project package — every `vector` / `unordered-containers`
+info table stayed unmapped. `stack-itm.yaml` (committed alongside this
+stage, disposable, used with `--work-dir .stack-work-itm` so the ordinary
+build is untouched) applies it to `$everything` instead. Full snapshot
+rebuild, 82 actions, ~376 MB of work dir.
+
+Two things that cost time and are worth writing down:
+
+- **The JSON output is not the one to use.** `eventlog2html --json` labels
+  each band with a symbol and address only; parsed that way the profile
+  looks like it has no source information at all (5.1% "attributed", and
+  that 5.1% turned out to be a false positive matching the `:` in
+  `C:Hashable_con_info`). The **HTML** output's detail table carries the
+  full IPE record — closure type, type description, module, source span.
+  The data was there the whole time; the JSON drops it.
+- Boot libraries shipped with GHC (`base`, `containers`, `text`,
+  `bytestring`) cannot be rebuilt this way and stay unattributed. That is
+  the residual 39.8%, and it is a ceiling, not a fixable gap.
+
+Measured at `HOSPITAL_BENCH_SCALE=0.1`, which Stage 8 established
+reproduces the full-scale shape within 0.1 percentage points. This run's
+`THUNK_1_0` share is **26.5%** against Stage 8's 25.80% — same population,
+independently reproduced with a different tool.
+
+### Where it is
+
+| Module | Share of `THUNK_1_0` |
+|---|---|
+| `CompEngine.CompSrc` | **90.5%** |
+| `CompEngine.SimpleStateIf` | 9.5% |
+| everything else | ~0% |
+
+And within `CompSrc.hs`, the sites are six lines:
+
+| Bytes (scale 0.1) | Type of the thunk | Site |
+|---|---|---|
+| 7.15 MB x2 | `SomeCompSrcVer s -> SomeCompSrcVer s -> Bool` | `CompSrc.hs:273` |
+| 7.14 MB x2 | `SomeCompSrcKey s -> SomeCompSrcKey s -> Bool` | `CompSrc.hs:265` |
+| 3.58 MB x3 | `show`/`showList`/`showsPrec` for `SomeCompSrcVer` | `CompSrc.hs:272` |
+| 3.57 MB x3 | `show`/`showList`/`showsPrec` for `SomeCompSrcKey` | `CompSrc.hs:264` |
+| 3.58 MB x2 | `hash`/`hashWithSalt` for `SomeCompSrcVer` | `CompSrc.hs:274` |
+| 3.57 MB x2 | `hash`/`hashWithSalt` for `SomeCompSrcKey` | `CompSrc.hs:266` |
+| 3.58 MB | `TypeRep (SomeCompSrcDep s)` | `CompSrc.hs:363` |
+
+Those lines are, verbatim, the `deriving newtype instance CompSrc s =>
+Show/Eq/Hashable (SomeCompSrcKey s)` block and its `SomeCompSrcVer` twin,
+plus `wrapCompSrcDepWithId`'s `ForAnyCompFlow` construction. The
+`SimpleStateIf` remainder is the same thing at one call site
+(`SimpleStateIf.hs:1038`, `Typeable (SomeCompSrcKey ...)` /
+`Typeable (SomeCompSrcVer ...)`).
+
+`FUN_1_0` — 7.6% of this census, 232 MB at full scale in Stage 8 — is
+**21.45 of 21.49 MB in `CompSrc` too**. Same family, same lines.
+
+### The mechanism
+
+These instances are *constrained*: `CompSrc s => Show (SomeCompSrcKey s)`.
+A constrained instance's dictionary is not a static top-level closure; it
+has to be built from the `CompSrc s` dictionary in scope. And
+`ForAnyCompFlow`'s constructor **stores** dictionaries —
+`(Typeable s, c s, IsCompFlowData (k s)) =>` is part of the existential —
+so every wrapped key, version and dep retains its own dictionary, whose
+class-method fields are themselves unforced thunks. `StrictData` cannot
+reach them: it makes *data* fields strict, and these are dictionary fields
+of a compiler-generated record of functions.
+
+So the cost is **O(distinct source keys)** for something that is genuinely
+**O(source instance types)** — five, in this benchmark.
+
+This also finally explains the rest of Stage 8's table rather than leaving
+it as a coincidence. `C:Eq` (231 MB), `C:Hashable` (154 MB), `C:Show`
+(154 MB) and `CTuple4` (193 MB, the `IsCompFlowData` constraint tuple) are
+the dictionary closures; `THUNK_1_0` (811 MB) and `FUN_1_0` (232 MB) are
+their unforced method fields. Summed with `ForAnyCompFlow` itself and
+`CompSrcId`/`Dep`, that is the great majority of the peak, and it is all
+one thing: **the boxed existential identity representation of a source
+key**. Stage 8 put the identifiable cluster at 48.0% and guessed
+`THUNK_1_0` belonged to it, reaching 73.8% if so. It does belong to it.
+
+### What would fix it
+
+Not a caching or forcing change — forcing the method fields would replace
+thunks with equally-per-value dictionary closures. The dictionaries have to
+stop being stored per *value*. Two directions, neither attempted:
+
+- Store one dictionary record per registered source instance, keyed by the
+  `CompSrcId` the wrapper already carries, and have `ForAnyCompFlow` hold
+  that key rather than the constraints. The registry already maps each id
+  to exactly one type — `getOrCreateGroup` relies on that and errors if it
+  is ever violated — so the invariant this needs is already asserted.
+- Defunctionalise: replace the existential with a sum over the registered
+  source types, paying a closed-world constraint for a flat representation.
+
+Both are large. Recording the measurement is the point of this stage; the
+one thing that should *not* happen next is another round of guessing at
+`THUNK_1_0`, which has now cost two investigations and one wrong published
+hypothesis.

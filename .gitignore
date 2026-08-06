@@ -24,3 +24,7 @@ cabal.project.local~
 .HTF/
 .ghc.environment.*
 run-data/
+
+# info-table profiling scratch (see stack-itm.yaml)
+.stack-work-itm/
+stack-itm.yaml.lock
