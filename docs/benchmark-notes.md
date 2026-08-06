@@ -3045,3 +3045,78 @@ attempt/failure pair (retried across several later leaves' own join
 points) before it either succeeds or falls back to inline, unlike the
 collect-time-only decision this replaced. `TestCompReqCombined.hs`'s
 golden ordering trace was not touched.
+
+## Stage 15 — the sliding fork window breaks the plateau, and the ordering contract that changed
+
+Stage 14's sliding fork window (commit `ea6a20e`) removed the fan-out/pool
+mismatch Stage 13 diagnosed. Verified same-session, with instance count
+(175,695) and batch calls (143,477) **identical at every width** — the same
+work, not an early bail:
+
+| eval width | 1 | 8 | 16 | 32 | 64 | 128 | 256 |
+|---|---|---|---|---|---|---|---|
+| Stage 13 | 60.5 s | 18.4 s | 18.3 s | 18.6 s | — | — | — |
+| after | 71.9 s | 19.4 s | 10.2 s | 5.6 s | **4.3 s** | 4.4 s | 4.4 s |
+
+**16.6x within-session** (71.9 -> 4.3). NOTE: the two rows' width-1 figures
+differ by ~19% with no relevant code change between them — that is this
+benchmark's documented cross-session drift (Stage 12a), which is why every
+ratio quoted here is within-session and why cross-row comparison of absolute
+numbers is not meaningful.
+
+The ceiling is ~64 and it sits close to the floor. The graph holds 56.4
+source-seconds, so 4.3 s is **13.1x effective concurrency**, against ~2.5 s of
+measured serial engine work.
+
+### What this did not require
+
+**The state layer was never touched.** No change to `DefTable`, `SrcIndex`,
+`KeyIntern`, the stale queue, the outputs map, or the global state `MVar`. The
+state-layer concurrency project that was scoped in detail and deliberately
+deferred turned out not to be needed at all.
+
+Three explanations for the plateau were proposed and killed by measurement
+before the real one was found, each costing real time:
+
+- **Idle capabilities.** Refuted by a same-session `-N` sweep: 72.5 / 72.1 /
+  71.3 / 71.5 s at `-N1/4/8/14`, flat (Stage 12a).
+- **Lock saturation.** Refuted by commit `b47306e`, which cut acquisitions
+  951,988 -> 654,902 and lock wait 8.53 -> 5.84 s and moved wall time zero.
+  Lock utilisation was only ~10%; the cost was blocking-and-rescheduling, not
+  contention for a busy resource.
+- **Not enough forkable work** (this document's own author's guess). Refuted by
+  Stage 13's histograms: the fan-out is 383 leaves wide, and 78% of fork
+  attempts were permit-starved.
+
+### The permit-release bug the window work uncovered
+
+Releasing a fork's permit at **join** time — matching the pre-window code —
+made things measurably *worse*. Joins are strictly left-to-right but completion
+is not, so a fast leaf started behind a slow one had its permit held hostage
+until join order reached it. Releasing on completion, inside the forked action,
+is what unlocked the scaling; it also closed a latent permit leak on the
+exception path.
+
+### The ordering contract, which changed
+
+Not documented anywhere else yet. **Still guaranteed at any width:**
+
+- dependency correctness — `cme_deps` is per-evaluation and only ever written
+  by the thread running that evaluation;
+- **dedup, now complete** — every joiner reads the owner's own result out of
+  the IVar, so all references to a cap within one occasion see one value and
+  one evaluation, `hashCaching` included, where it previously cost two;
+- left-error bias, and the leftmost-failing-leaf guarantee;
+- every fork joined before its batch's `doSuspended` returns, including on the
+  exception path — which is what keeps `allCompSrcChanges` from ever racing a
+  running `compSrcExecuteBatch`;
+- **width 1 byte-identical, evaluation order included.**
+
+**No longer guaranteed above width 1:** the interleaving of
+`capEvaluationStarted` across a batch's leaves, and the relative order of sink
+writes issued by *different* caps. Within one body, order is preserved.
+
+NOTE: nothing currently tests the changed contract. The frozen golden ordering
+trace still passes only because it exercises *source* concurrency, not eval
+concurrency. Restating it — assert the multiset of entries plus the surviving
+happens-before edges, rather than a total order — is open work.
