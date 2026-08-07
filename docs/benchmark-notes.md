@@ -3235,3 +3235,107 @@ Both are large. Recording the measurement is the point of this stage; the
 one thing that should *not* happen next is another round of guessing at
 `THUNK_1_0`, which has now cost two investigations and one wrong published
 hypothesis.
+
+## Stage 17 — the dictionary tax, paid off: 4,005 -> 2,221 B/instance
+
+Stage 16 localised `THUNK_1_0` to six `deriving newtype` lines in
+`CompSrc.hs` and proposed two fixes, both large: key the dictionaries by
+`CompSrcId` in a registry, or defunctionalise the existential into a closed
+sum. **Neither was necessary.** The fix is eleven lines and changes no
+user-visible behaviour.
+
+### The change
+
+Two edits that only work together:
+
+1. **Retarget the `deriving newtype` contexts** from `CompSrc s =>` to the
+   underlying type's own constraint — `Show (CompSrcKey s) => Show
+   (SomeCompSrcKey s)`, and so on for `Eq`/`Hashable` across
+   `SomeCompSrcKey`/`SomeCompSrcVer`/`SomeCompSrcDep`, plus `CompSink`'s
+   `SomeCompSinkOuts`.
+2. **Add `IsCompFlowData (SomeCompSrcKey s)`, `(SomeCompSrcVer s)` and
+   `(SomeCompSrcDep s)` as superclasses of `CompSrc`** (and the
+   `SomeCompSinkOuts` counterpart to `CompSink`).
+
+Edit 1 alone does nothing — it makes the dictionary function's body
+simpler without changing how often it runs. It is there to break a
+circularity: with `CompSrc s =>` as the deriving context, proving the new
+superclass would require the very class being declared.
+
+Edit 2 is the fix. A superclass is a *field* of the dictionary record, so
+resolving `IsCompFlowData (SomeCompSrcDep s)` becomes a single record
+selection returning the same shared object every time. Previously the only
+route was applying the `deriving newtype` dictionary function to the
+`CompSrc s` dictionary in scope — an application that cannot float to top
+level, because the dictionary it consumes is a lambda-bound argument rather
+than a CAF. So it reran at every wrap site, and GND builds its result
+record one method at a time, leaving one unforced thunk per class method
+behind on every call. That per-method structure is exactly what Stage 16's
+profile showed: 3 distinct thunks at each `Show` line, 2 at each `Eq`, 2 at
+each `Hashable`.
+
+The dictionary is now built once, when the concrete `instance CompSrc Foo`
+dictionary CAF is built. **O(distinct source keys) becomes O(source
+types).**
+
+### Measured
+
+Hospital, scale 1.0, 976,063 instances, same session, ordinary (unprofiled)
+build:
+
+| | before | after | |
+|---|---|---|---|
+| `max_live_bytes` | 3,909.4 MB | **2,168.1 MB** | **-44.5%** |
+| bytes/instance | 4,005.2 B | **2,221.3 B** | -44.5% |
+| `allocated_bytes` (cold eval) | 35,074.8 MB | 33,308.6 MB | -5.0% |
+| cold eval wall | 11.99 s | 10.81 s | -9.9%, one rep |
+
+The allocation figure is the trustworthy one of the last two — allocation
+counts don't drift the way this repo's wall times do (Stage 12a, and the
+16% same-code drift recorded in `d11efc4`). The wall-time number is a
+single rep and should not be quoted without more.
+
+Info-table census, scale 0.1, same recipe as Stage 16:
+
+| | before | after |
+|---|---|---|
+| peak census | 282.9 MB | 115.2 MB |
+| `THUNK_1_0` | 75.0 MB (26.5%) | **3.4 MB (2.9%)** |
+| `FUN_1_0` | 21.5 MB | **0.0 MB** |
+| `CompSrc` module, all closure types | 103.6 MB | 13.4 MB |
+
+`FUN_1_0` going to zero is the cleanest confirmation of the mechanism:
+those were the partially-applied method closures of the same rebuilt
+dictionaries, and nothing rebuilds them now.
+
+The scale benchmark improved too rather than regressing: 271.8 B/instance
+against the 328 B/instance previously recorded.
+
+### API
+
+The class heads of `CompSrc` and `CompSink` gain superclasses, which is
+visible in haddock. **No instance author writes anything new** — every added
+constraint is discharged automatically from the `IsCompFlowData
+(CompSrcKey s)` / `(CompSrcVer s)` / `(CompSinkOut s)` constraints authors
+already supply, because the wrappers are newtypes of exactly those types.
+Verified across every instance in the repo: `FileSrc`, `TimeSrc`,
+`SqliteSrc`, `HashMapFlow`, `FileSink`, `IOSink`, `FileStoreSink`,
+`CompLogging` and the demo/bench sources all compiled untouched. Existing
+signatures written as `CompSrc s => ...` keep working; they gain
+superclasses, never lose them.
+
+`CompSink.hs` needed `UndecidableInstances`, which `CompSrc.hs` already
+had — the standard requirement for a GND standalone-deriving instance whose
+context mentions a type family. No `UndecidableSuperClasses` was needed
+anywhere.
+
+### What this says about the previous two stages
+
+Stage 8 guessed `THUNK_1_0` was `ForAnyCompFlow`-rewrapping residue and was
+wrong. Stage 16 identified the real site but proposed two fixes that were
+both more invasive than the problem warranted, because it framed the cost
+as "dictionaries are stored per value" when the accurate framing is
+"dictionaries are *rebuilt* per value." Storing a pointer to a shared
+dictionary was never the expensive part; one word per value is nothing
+against 811 MB. Getting the framing right shrank the fix from a redesign to
+eleven lines.

@@ -141,7 +141,38 @@ data FlowConcurrency = FlowSerial | FlowConcurrent
 data SrcFetch s
   = forall a. SrcFetch (CompSrcReq s a) (Either SomeException (CompSrcDeps s, Fail a) -> IO ())
 
-class (Typeable s, IsCompFlowData (CompSrcKey s), IsCompFlowData (CompSrcVer s)) => CompSrc s where
+{- | The 'SomeCompSrcKey'\/'SomeCompSrcVer'\/'SomeCompSrcDep' superclasses
+ below are redundant for *correctness* with the 'CompSrcKey'\/'CompSrcVer'
+ ones right next to them -- the newtype's 'Show'\/'Eq'\/'Hashable' instances
+ (declared further down via @deriving newtype@) hold precisely when the
+ underlying type's do. They are not redundant for *performance*, and that
+ is the only reason they exist: see docs/benchmark-notes.md Stage 16.
+
+ Without them, the only way to prove 'IsCompFlowData (SomeCompSrcKey s)' at
+ a use site such as 'ForAnyCompFlow'\'s constructor (reached via
+ 'wrapCompSrcDepWithId') is to apply the @deriving newtype@ dictionary
+ function to the 'CompSrc s' dictionary that's already in scope there. That
+ application can't float to top level -- the dictionary it's applied to is
+ a lambda-bound argument, not a CAF -- so it reruns at every wrap site, and
+ GeneralizedNewtypeDeriving builds its result record one method at a time,
+ leaving one unforced thunk per class method behind on every call. Declaring
+ the constraint as a superclass instead turns it into a dictionary *field*:
+ resolving it is a single record selection returning the same shared object
+ every time, built once when the concrete @instance CompSrc Foo@ dictionary
+ CAF itself is built. A future reader who sees these next to the
+ 'CompSrcKey'\/'CompSrcVer' superclasses and assumes they're duplicates
+ should delete them only after re-reading Stage 16.
+-}
+class
+  ( Typeable s
+  , IsCompFlowData (CompSrcKey s)
+  , IsCompFlowData (CompSrcVer s)
+  , IsCompFlowData (SomeCompSrcKey s)
+  , IsCompFlowData (SomeCompSrcVer s)
+  , IsCompFlowData (SomeCompSrcDep s)
+  ) =>
+  CompSrc s
+  where
   type CompSrcReq s :: Type -> Type
   type CompSrcKey s :: Type
   type CompSrcVer s :: Type
@@ -253,25 +284,25 @@ unsafeMkTypedCompSrcId p instId =
    in TypedCompSrcId i
 
 newtype SomeCompSrcDep s = SomeCompSrcDep {unSomeCompSrcDep :: (CompSrcDep s)}
-deriving newtype instance CompSrc s => Show (SomeCompSrcDep s)
-deriving newtype instance CompSrc s => Eq (SomeCompSrcDep s)
-deriving newtype instance CompSrc s => Hashable (SomeCompSrcDep s)
+deriving newtype instance Show (CompSrcDep s) => Show (SomeCompSrcDep s)
+deriving newtype instance Eq (CompSrcDep s) => Eq (SomeCompSrcDep s)
+deriving newtype instance Hashable (CompSrcDep s) => Hashable (SomeCompSrcDep s)
 
 -- deriving newtype instance CompSrc s => LH.LargeHashable (SomeCompSrcDep s)
 type AnyCompSrcDep = ForAnyCompFlow CompSrc CompSrcId SomeCompSrcDep
 
 newtype SomeCompSrcKey s = SomeCompSrcKey {unSomeCompSrcKey :: (CompSrcKey s)}
-deriving newtype instance CompSrc s => Show (SomeCompSrcKey s)
-deriving newtype instance CompSrc s => Eq (SomeCompSrcKey s)
-deriving newtype instance CompSrc s => Hashable (SomeCompSrcKey s)
+deriving newtype instance Show (CompSrcKey s) => Show (SomeCompSrcKey s)
+deriving newtype instance Eq (CompSrcKey s) => Eq (SomeCompSrcKey s)
+deriving newtype instance Hashable (CompSrcKey s) => Hashable (SomeCompSrcKey s)
 
 -- deriving newtype instance CompSrc s => LH.LargeHashable (SomeCompSrcKey s)
 type AnyCompSrcKey = ForAnyCompFlow CompSrc CompSrcId SomeCompSrcKey
 
 newtype SomeCompSrcVer s = SomeCompSrcVer {unSomeCompSrcVer :: (CompSrcVer s)}
-deriving newtype instance CompSrc s => Show (SomeCompSrcVer s)
-deriving newtype instance CompSrc s => Eq (SomeCompSrcVer s)
-deriving newtype instance CompSrc s => Hashable (SomeCompSrcVer s)
+deriving newtype instance Show (CompSrcVer s) => Show (SomeCompSrcVer s)
+deriving newtype instance Eq (CompSrcVer s) => Eq (SomeCompSrcVer s)
+deriving newtype instance Hashable (CompSrcVer s) => Hashable (SomeCompSrcVer s)
 
 -- deriving newtype instance CompSrc s => LH.LargeHashable (SomeCompSrcVer s)
 type AnyCompSrcVer = ForAnyCompFlow CompSrc CompSrcId SomeCompSrcVer

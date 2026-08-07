@@ -9,6 +9,22 @@ and this project adheres to the
 ## Unreleased
 
 ### Added
+- `CompSrc` and `CompSink` gained superclasses: `IsCompFlowData` for the
+  `SomeCompSrcKey`/`SomeCompSrcVer`/`SomeCompSrcDep` and `SomeCompSinkOuts`
+  newtype wrappers, alongside the `CompSrcKey`/`CompSrcVer`/`CompSinkOut`
+  ones already there. Visible in the class heads and so in haddock, but
+  **no instance author writes anything new** — the added constraints are
+  discharged automatically from the ones instances already supply, since
+  the wrappers are newtypes of exactly those types. Every instance in this
+  repository compiled untouched. Purely a performance change: it lets the
+  engine resolve those dictionaries by superclass selection (one record
+  read, shared) instead of re-applying a `deriving newtype` dictionary
+  function at every wrap site, which rebuilt the record one method at a
+  time and left an unforced thunk per method behind on every call. Cuts
+  Hospital's peak live heap 3,909 -> 2,168 MB (4,005 -> 2,221 B/instance,
+  -44.5%) and cold-eval allocation 5.0%. See `docs/benchmark-notes.md`
+  Stages 16-17.
+
 
 - `FlowConcurrency(..)` and a defaulted `compSrcConcurrency :: s ->
   FlowConcurrency` method on `CompSrc`, so a source can declare that the

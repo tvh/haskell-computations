@@ -2,6 +2,7 @@
 {-# LANGUAGE ExistentialQuantification #-}
 {-# LANGUAGE Rank2Types #-}
 {-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE UndecidableInstances #-}
 {-# OPTIONS_GHC -Wno-redundant-constraints #-}
 
 module Control.Computations.CompEngine.CompSink (
@@ -74,7 +75,30 @@ instance LH.LargeHashable CompSinkInstanceId
 instance IsString CompSinkInstanceId where
   fromString = CompSinkInstanceId . T.pack
 
-class (Typeable s, IsCompFlowData (CompSinkOut s)) => CompSink s where
+{- | The 'SomeCompSinkOuts' superclass below is redundant for *correctness*
+ with the 'CompSinkOut' one right next to it -- 'SomeCompSinkOuts'\'s
+ 'Show'\/'Eq'\/'Hashable' instances (declared further down via
+ @deriving newtype@) hold precisely when 'CompSinkOuts'\'s do. It is not
+ redundant for *performance*, and that is the only reason it exists: see
+ docs/benchmark-notes.md Stage 16, which diagnosed the identical shape in
+ "Control.Computations.CompEngine.CompSrc" and fixed it the same way.
+
+ Without it, the only way to prove 'IsCompFlowData (SomeCompSinkOuts s)' at
+ a use site such as 'ForAnyCompFlow'\'s constructor (reached via
+ 'wrapCompSinkOuts') is to apply the @deriving newtype@ dictionary function
+ to the 'CompSink s' dictionary already in scope there. That application
+ can't float to top level -- it's applied to a lambda-bound argument, not a
+ CAF -- so it reruns at every wrap site, and GeneralizedNewtypeDeriving
+ builds its result record one method at a time, leaving one unforced thunk
+ per class method behind on every call. Declaring the constraint as a
+ superclass instead turns it into a dictionary *field*: resolving it is a
+ single record selection returning the same shared object every time,
+ built once when the concrete @instance CompSink Foo@ dictionary CAF
+ itself is built. A future reader who sees this next to the 'CompSinkOut'
+ superclass and assumes it's a duplicate should delete it only after
+ re-reading Stage 16.
+-}
+class (Typeable s, IsCompFlowData (CompSinkOut s), IsCompFlowData (SomeCompSinkOuts s)) => CompSink s where
   type CompSinkReq s :: Type -> Type
   type CompSinkOut s :: Type
   compSinkInstanceId :: s -> CompSinkInstanceId
@@ -171,9 +195,9 @@ instTextFromTypedCompSinkId = unCompSinkInstanceId . instanceIdFromTypedCompSink
 data AnyCompSink = forall s. CompSink s => AnyCompSink s
 
 newtype SomeCompSinkOuts s = SomeCompSinkOuts {unSomeCompSinkOut :: (CompSinkOuts s)}
-deriving newtype instance CompSink s => Show (SomeCompSinkOuts s)
-deriving newtype instance CompSink s => Eq (SomeCompSinkOuts s)
-deriving newtype instance CompSink s => Hashable (SomeCompSinkOuts s)
+deriving newtype instance Show (CompSinkOuts s) => Show (SomeCompSinkOuts s)
+deriving newtype instance Eq (CompSinkOuts s) => Eq (SomeCompSinkOuts s)
+deriving newtype instance Hashable (CompSinkOuts s) => Hashable (SomeCompSinkOuts s)
 
 map2SomeCompSinkOuts
   :: (CompSinkOuts s -> CompSinkOuts s -> CompSinkOuts s)
