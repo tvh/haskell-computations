@@ -742,14 +742,34 @@ namedSrcs srcs =
   , ("notes", hsrc_notes srcs)
   ]
 
-initHospitalSrcs :: Int -> IO HospitalSrcs
-initHospitalSrcs latencyUs =
+{- | @batchingEnabled@ mirrors "Control.Computations.Demos.Bench.Tiered"'s
+ @TIERED_BENCH_BUNDLING@ knob, which this benchmark previously had no
+ counterpart for: 'initSystemSrc' hardwires
+ 'Control.Computations.Demos.Bench.SystemSrc.ssc_batchingEnabled' to 'True',
+ so every Hospital run always bundled and there was no way to ask for the
+ unbundled latency model. Defaults to 'True', so a plain @HOSPITAL_BENCH=1
+ stack bench@ is byte-for-byte the run it always was.
+
+ It exists so this benchmark can be compared against an engine that has no
+ 'Control.Computations.CompEngine.CompSrc.compSrcExecuteBatch' at all -- see
+ @docs\/benchmark-notes.md@ Stage 20. Without it there is no matched pair:
+ bundling changes how many simulated round trips a batch pays for (one per
+ call rather than one per request), so a bundled run and an unbundled one
+ are measuring different workloads, not different engines.
+-}
+initHospitalSrcs :: Int -> Bool -> IO HospitalSrcs
+initHospitalSrcs latencyUs batchingEnabled =
   HospitalSrcs
-    <$> initSystemSrc (instTextFromTypedCompSrcId adtSrcId) latencyUs
-    <*> initSystemSrc (instTextFromTypedCompSrcId vitalsSrcId) latencyUs
-    <*> initSystemSrc (instTextFromTypedCompSrcId labsSrcId) latencyUs
-    <*> initSystemSrc (instTextFromTypedCompSrcId pharmacySrcId) latencyUs
-    <*> initSystemSrc (instTextFromTypedCompSrcId notesSrcId) latencyUs
+    <$> mk adtSrcId
+    <*> mk vitalsSrcId
+    <*> mk labsSrcId
+    <*> mk pharmacySrcId
+    <*> mk notesSrcId
+ where
+  mk sid =
+    initSystemSrcWith
+      (instTextFromTypedCompSrcId sid)
+      (defaultSystemSrcConfig latencyUs){ssc_batchingEnabled = batchingEnabled}
 
 totalSystemCallCount :: HospitalSrcs -> IO Int
 totalSystemCallCount srcs = sum <$> traverse (sysCallCount . snd) (namedSrcs srcs)
@@ -914,6 +934,9 @@ hospitalBenchDriver counterRef runVar withRegisteredFlows wireComps = do
 readEnvDouble :: String -> Double -> IO Double
 readEnvDouble name def = maybe def id . (>>= readMaybe) <$> lookupEnv name
 
+readEnvBool :: String -> Bool -> IO Bool
+readEnvBool name def = maybe def (`notElem` ["", "0"]) <$> lookupEnv name
+
 readEnvIntAtLeast :: Int -> String -> Int -> IO Int
 readEnvIntAtLeast lowerBound name def =
   maybe def (max lowerBound) . (>>= readMaybe) <$> lookupEnv name
@@ -953,6 +976,7 @@ hospitalBenchMain :: IO ()
 hospitalBenchMain = do
   scale <- readEnvDouble "HOSPITAL_BENCH_SCALE" 1.0
   latencyUs <- readEnvIntAtLeast 0 "HOSPITAL_BENCH_SRC_LATENCY_US" 0
+  batchingEnabled <- readEnvBool "HOSPITAL_BENCH_BUNDLING" True
   let patientCount = scaledPatientCount scale
       wardCount = scaledWardCount scale patientCount
       histogram = depthHistogram wardCount patientCount
@@ -966,9 +990,10 @@ hospitalBenchMain = do
   -- benchmark ends up with -N (all cores) rather than the single capability
   -- earlier baselines in docs/benchmark-notes.md silently ran on.
   printf
-    "HOSPITAL_BENCH_SCALE=%.4f HOSPITAL_BENCH_SRC_LATENCY_US=%d capabilities: %d\n"
+    "HOSPITAL_BENCH_SCALE=%.4f HOSPITAL_BENCH_SRC_LATENCY_US=%d HOSPITAL_BENCH_BUNDLING=%s capabilities: %d\n"
     scale
     latencyUs
+    (show batchingEnabled)
     caps
   printf
     "patients: %d, wards: %d (avg %.1f patients/ward), target instances (analytic): %d\n"
@@ -980,7 +1005,7 @@ hospitalBenchMain = do
   forM_ (Map.toAscList histogram) $ \(lvl, n) -> printf "  level %2d: %d\n" lvl n
   putStrLn ""
 
-  srcs <- initHospitalSrcs latencyUs
+  srcs <- initHospitalSrcs latencyUs batchingEnabled
   sink <- initHashMapFlow (instTextFromTypedCompSinkId outSinkId)
 
   runVar <- newTVarIO None

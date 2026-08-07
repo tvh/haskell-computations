@@ -3482,3 +3482,89 @@ concurrency-1 port that does work.
 Current HEAD figures for those two, recorded here as state rather than as
 comparison: hospital 10.805 s cold, 2,168.1 MB (2,221.3 B/instance); tiered
 61.190 s at eval width 1 and 4.786 s at width 64, 472.7 MB.
+
+## Stage 20 — hospital and tiered against the fork point, at concurrency 1
+
+Stage 19 could not port these two: they exercise engine features the fork
+point lacks entirely. Restricting them to **concurrency 1** removes that
+obstacle, because every blocking feature has a documented no-op setting that
+is exactly what the fork's engine does natively:
+
+| feature | HEAD setting that matches the fork |
+|---|---|
+| `compSrcConcurrency` | `FlowSerial` (HEAD's default) |
+| `compSrcExecuteBatch` | bundling off — HEAD's default implementation is "run each request in turn via `compSrcExecute`" |
+| `setCompEvalConcurrency` | width 1 (HEAD's default) |
+
+So the fork port simply drops those three overrides, and HEAD is run with
+settings that reproduce them. This measures the *rest* of the engine work —
+everything that is not concurrency — on these two graph shapes.
+
+**Hospital needed a new knob to make the pair matched at all.** It had no
+bundling toggle: `initHospitalSrcs` called `initSystemSrc`, which hardwires
+`ssc_batchingEnabled = True`, so every Hospital run always bundled.
+`HOSPITAL_BENCH_BUNDLING` (default `True`, so the pre-existing run is
+unchanged) mirrors `TIERED_BENCH_BUNDLING`. Without it any Hospital
+fork-vs-HEAD figure compares "fork, unbundled" against "HEAD, bundled" —
+different workloads, not different engines.
+
+Matched invocations:
+
+    # hospital
+    fork: HOSPITAL_BENCH=1 stack bench --ghc-options="-Wwarn -O2"
+    HEAD: HOSPITAL_BENCH=1 HOSPITAL_BENCH_BUNDLING=0 stack bench
+
+    # tiered
+    fork: TIERED_BENCH=1 stack bench --ghc-options="-Wwarn -O2"
+    HEAD: TIERED_BENCH=1 TIERED_BENCH_BUNDLING=0 TIERED_BENCH_EVAL_CONCURRENCY=1 stack bench
+
+### Hospital — 976,063 instances, latency 0
+
+| | fork `-O2` | HEAD | ratio |
+|---|---|---|---|
+| cold eval | 17.717 s | 10.611 s | **1.67x** |
+| `max_live_bytes` | 3,994.6 MB | 2,168.1 MB | **1.84x** |
+| B/instance | 4,092.6 | 2,221.3 | 1.84x |
+| allocated, cold | 42,718.6 MB | 34,243.9 MB | 1.25x |
+
+### Tiered — 175,695 instances, real per-source latency
+
+| | fork `-O2` | HEAD | ratio |
+|---|---|---|---|
+| cold eval | 111.124 s | 108.806 s | **1.02x** |
+| `max_live_bytes` | 806.7 MB | 426.2 MB | **1.89x** |
+| B/instance | 4,591.3 | 2,426.0 | 1.89x |
+| allocated, cold | 7,045.0 MB | 6,310.4 MB | 1.12x |
+
+### Reading these three benchmarks together
+
+The speed column varies enormously across the three — 3.74x (persist), 1.67x
+(hospital), 1.02x (tiered) — and the reason is not that some engine work
+only helps some graphs. It is **how much of each benchmark's wall time is
+engine work at all**:
+
+- persist has no source latency, so it is nearly all engine, and the engine
+  work shows up nearly in full;
+- hospital runs at latency 0 but a much wider, deeper graph, so more of its
+  time sits in bookkeeping the rewrite touched less;
+- tiered holds ~56 seconds of deliberate source sleep. At concurrency 1 that
+  is serialized, so the benchmark is measuring `usleep`, not the engine.
+  1.02x is the correct and expected answer, and it is the clearest possible
+  restatement of Stages 13-15: on this workload the only thing that ever
+  mattered was overlapping the I/O, which is exactly the feature this
+  comparison deliberately turns off.
+
+The memory column tells the opposite, steadier story: 5.67x on persist
+against ~1.85x on both of the others. That split is Stage 8's finding
+restated — persist shares source keys, so the columnar `DefTable` design
+dominates and its improvements dominate with it; hospital and tiered have
+genuinely unshared keys, where the boxed existential identity
+representation dominates instead. Stage 17 cut that representation nearly in
+half, which is where both 1.85x figures come from.
+
+### The practical number
+
+Not a controlled comparison, but the one a user actually experiences: tiered
+at the fork point takes **111.124 s**; at HEAD with its own defaults
+(bundling on, eval width 64) it takes **4.786 s**. **23.2x.** Most of that
+gap is the concurrency work this stage's methodology deliberately excludes.
