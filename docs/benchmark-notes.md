@@ -3339,3 +3339,68 @@ as "dictionaries are stored per value" when the accurate framing is
 dictionary was never the expensive part; one word per value is nothing
 against 811 MB. Getting the framing right shrank the fix from a redesign to
 eleven lines.
+
+## Stage 18 — `ForAnyCompFlow` cannot be shrunk this way (negative result)
+
+After Stage 17, `ForAnyCompFlow` is the largest *identified* heap item:
+26.7 MB of a 115.2 MB peak census (23.2%). The plan was to replace its
+three stored dictionary pointers with one explicitly-built `CompFlowOps`
+record shared per instance, and to drop the `Proxy s` field — nominally
+7 words to 4. **Both halves failed, for different reasons. Reverted, nothing
+committed.**
+
+### The main lever is blocked: `c s` is genuinely needed
+
+`c s` (`CompSrc s` / `CompSink s`) is not a Show/Eq/Hashable bundle that an
+ops record could stand in for. Four consumers unpack it from the existential
+and use it as a real class dictionary:
+
+- `Run.hs`'s `withCompSinkForOuts` needs it to satisfy a rank-2 continuation
+  `forall s. CompSink s => s -> CompSinkOuts s -> IO a` that calls
+  `compSinkDeleteOutputs`;
+- `CompSink.hs`'s `mapAnyOutsMap` / `anyOutsMap` / `filterAnyOutsMap` (all
+  public) take callbacks of type `forall s. CompSink s => ...`;
+- `OutputsMap.hs`'s `outputKeyHash` needs `Hashable (CompSinkOut s)` — a
+  constraint on a *component* of the wrapped type, not on `k s` itself, so
+  an ops record scoped to `k s` cannot supply it;
+- `AnyCompSrcDepByKey`'s `Eq`/`Hashable` compare `dep_key :: CompSrcKey s`,
+  same problem.
+
+Dropping `c s` therefore requires the registry-keyed-dictionary refactor
+Stage 16 floated and Stage 17 avoided — genuinely large, and not justified
+by what remains.
+
+### The secondary lever was already done by the compiler
+
+Removing the `Proxy s` field (implemented, measured, reverted) changed
+nothing at all:
+
+| | before | after |
+|---|---|---|
+| `allocated_bytes` | 33,308,592,544 | 33,308,592,544 (identical) |
+| `max_live_bytes` | 2,168,133,944 | 2,168,133,000 (944 B apart on 2.17 GB) |
+
+`Proxy` is a nullary constructor and `StrictData` makes the field strict, so
+`-funbox-small-strict-fields` — on by default at `-O` — had already erased
+it. The constructor was **6 words, not 7**, before this stage started, and
+the arithmetic that motivated the work was wrong from the first line.
+
+Worth keeping in mind generally: strict fields of small nullary types are
+free already, so counting them when estimating a constructor's width
+overstates the available saving.
+
+The one incidental positive: implementing the removal behind a bidirectional
+pattern synonym with a view pattern cost **zero** extra allocation
+(byte-identical), so that technique is available for preserving a public
+constructor shape elsewhere without a runtime penalty.
+
+### Where this leaves memory
+
+`ForAnyCompFlow` stays at 6 words: header, `i`, `Typeable s`, `c s`, the
+`IsCompFlowData` tuple, and the payload. Of those, only `Typeable s` is
+plausibly removable — both `CompSrc` and `CompSink` already declare it as a
+superclass of `c`, so `QuantifiedConstraints` (`forall s. c s => Typeable
+s`) threaded through `CompFlow.hs` would let it be selected rather than
+stored. One word of six, against a module that is 23.2% of the census: about
+3.9% of peak, for a constraint-kind change touching every function in the
+module. Recorded, not recommended.
