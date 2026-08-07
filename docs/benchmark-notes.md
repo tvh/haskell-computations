@@ -3404,3 +3404,81 @@ s`) threaded through `CompFlow.hs` would let it be selected rather than
 stored. One word of six, against a module that is 23.2% of the census: about
 3.9% of peak, for a constraint-kind change touching every function in the
 module. Recorded, not recommended.
+
+## Stage 19 — measured against the fork point: 3.7x faster, 5.7x smaller
+
+The first measurement in these notes against `e0bec07` (Aug 2023), the
+commit this repository forked Stefan Wehr's `incremental-computations`
+from — 161 commits and a substantially rewritten engine ago.
+
+### Method, and why the fork was rebuilt on today's toolchain
+
+The fork pinned `nightly-2023-05-08`; HEAD pins `lts-24.51` / GHC 9.10.3.
+Measuring each on its own compiler would have confounded five major GHC
+versions with the engine work, so the **fork's source was built on HEAD's
+toolchain**. It very nearly compiles unchanged: four import fixes for
+`base`/`mtl` re-export churn (`>=>`, `MonadFix`, `mfix`, `liftM`, all of
+which older `Control.Monad.Reader` used to re-export), plus `-Wwarn` so
+`-Werror=unused-imports` doesn't fail on imports newer `base` made
+redundant. No engine logic touched.
+
+Two other things checked before trusting the comparison:
+
+- **`-O2` is a fork-introduced change.** HEAD's library carries `-O2`; the
+  fork used cabal's `-O1` default. So the baseline was measured both ways.
+- **`StrictData` was already on at the fork**, so it is not a confounder.
+
+The benchmark source is HEAD's, unmodified in what it measures — graph
+shape constants (`levelsCount = 10`, `defsPerLevel = 5`) verified identical,
+and the two required shims audited: `typedCompSrcIdOf` (same construction,
+different argument shape) and `waitForRunAtLeast`/`waitForFullSettle`
+(HEAD's `Driver.hs` is the fork's plus 63 lines of pure addition, no
+modifications, so relocating them into bench code computes the same thing).
+
+### Persist / scale benchmark, 1,000,000 instances
+
+| | fork `-O1` | fork `-O2` | HEAD | vs fork `-O2` |
+|---|---|---|---|---|
+| cold eval | 23.452 s | 24.356 s | **6.514 s** | **3.74x** |
+| live update | 12.121 s | 12.688 s | **0.791 s** | **16.0x** |
+| allocated, cold | 35,585.9 MB | 35,586.3 MB | 22,547.1 MB | 1.58x |
+| allocated, live | 39,791 MB | 40,692 MB | **2,681 MB** | **15.2x** |
+| `max_live_bytes` | 1,683.6 MB | 1,541.8 MB | **271.7 MB** | **5.67x** |
+| B/instance (`max_live`) | 1,684.0 | 1,542.2 | **271.8** | 5.67x |
+| B/instance (RSS) | 3,855.0 | 3,857.0 | 1,455.4 | 2.65x |
+
+Against the fork exactly as it was (`-O1`): 3.60x cold, 15.3x live update,
+6.20x less peak memory.
+
+**`-O2` is not the story.** On the fork it moves wall time not at all (24.36
+vs 23.45 s is within this benchmark's noise, and the direction is
+meaningless) and peak memory 8.4%. Everything else is engine work.
+
+**The live-update row is the one that matters most.** 12.1 s -> 0.79 s with
+15.2x less allocation, on the incremental rerun path — which is the entire
+reason this library exists. It is a far larger win than the cold-eval
+number, and cold eval is what most of these notes have spent their time on.
+
+### Single rep, and why that is enough here
+
+One run per cell. Every difference is 3.6x-16x, one to two orders of
+magnitude above the ~5% wall-time noise floor documented in Stage 12a and
+re-confirmed at 16% in `d11efc4`. The only figure in the table that noise
+could plausibly account for is the fork's own `-O1` vs `-O2` wall time, and
+nothing is concluded from it.
+
+### Hospital and tiered have no fork baseline
+
+Not a portability problem that was worked around — those two benchmarks
+measure engine features the fork point does not have. The fork's `CompSrc`
+class has exactly four methods: `compSrcInstanceId`, `compSrcExecute`,
+`compSrcUnregister`, `compSrcWaitChanges`. Hospital and tiered need
+`compSrcExecuteBatch`/`SrcFetch`, `compSrcConcurrency`/`FlowConcurrency`,
+and (tiered) `setCompEvalConcurrency`. Measuring those *is their purpose*,
+so there is no faithful shim — only adding the features to the old engine,
+which would stop it being a baseline. See Stage 20 for the restricted,
+concurrency-1 port that does work.
+
+Current HEAD figures for those two, recorded here as state rather than as
+comparison: hospital 10.805 s cold, 2,168.1 MB (2,221.3 B/instance); tiered
+61.190 s at eval width 1 and 4.786 s at width 64, 472.7 MB.
